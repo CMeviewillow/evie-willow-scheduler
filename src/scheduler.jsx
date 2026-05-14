@@ -1,9 +1,8 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
-import { Plus, Trash2, AlertTriangle, Calendar, Settings, Download, Upload, X } from "lucide-react";
+import { Plus, Trash2, AlertTriangle, Calendar, Settings, Download, Upload, X, Truck } from "lucide-react";
 import "./storage.js"; // installs window.storage backed by Supabase
 
 // Read-only mode: append ?readonly=1 to the URL to disable all edits.
-// Useful for the workshop tablet — staff can view but not change the schedule.
 const IS_READONLY = typeof window !== "undefined"
   && new URLSearchParams(window.location.search).get("readonly") === "1";
 
@@ -264,6 +263,7 @@ function newJob() {
     installDaysOverride: 0,  // manual override of install duration (0 = use formula)
     teamInstall: false,      // if true, all 3 fitters on site for this install (rare, e.g. distant jobs needing a hotel)
     secondaryInstaller: "",  // optional second fitter on the same install (empty = solo)
+    deliveryDate: "",        // ISO date of when the van delivers (empty = day 1 of install)
     installer: "auto",       // "auto" | "Steve" | "Thompson" | "Chris"
     machiningDays: 3,        // default machining duration
     notes: "",
@@ -745,7 +745,18 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     // Van conflict?
     const dels = deliveriesForJob(cabCount);
     let vanClash = null;
-    let vanCur = new Date(exactDate.getTime());
+    // Van clash check should use the actual delivery date, not the install date.
+    // If user set a custom deliveryDate, check from there; otherwise check from install start.
+    let vanCheckStart;
+    if (job.deliveryDate) {
+      const parsed = parseISO(job.deliveryDate);
+      vanCheckStart = (isWeekend(parsed) || holidays.has(dayKey(parsed)))
+        ? nextWorkingDay(parsed, holidays)
+        : parsed;
+    } else {
+      vanCheckStart = exactDate;
+    }
+    let vanCur = new Date(vanCheckStart.getTime());
     let dChecked = 0;
     while (dChecked < dels && !vanClash) {
       while (isWeekend(vanCur) || holidays.has(dayKey(vanCur))) vanCur = addDays(vanCur, 1);
@@ -764,7 +775,7 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
         jobId: job.id,
         jobName: job.name,
         type: "installer_conflict",
-        message: `Van clash on ${fmtUK(exactDate)} with ${vanClash.jobName}`,
+        message: `Van clash on ${fmtUK(vanCheckStart)} with ${vanClash.jobName}`,
       });
     }
     // Fitter conflict?
@@ -1315,6 +1326,16 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
 
   const installSeq = workingDaysSeq(proposedStart, Math.ceil(installDays), holidays);
   const installEnd = addDays(installSeq[installSeq.length - 1], 1);
+  // Resolve actual delivery date: user-set if provided (snapped to working day), else day 1 of install
+  let deliveryDate;
+  if (job.deliveryDate) {
+    const parsed = parseISO(job.deliveryDate);
+    deliveryDate = (isWeekend(parsed) || holidays.has(dayKey(parsed)))
+      ? nextWorkingDay(parsed, holidays)
+      : parsed;
+  } else {
+    deliveryDate = installSeq[0];
+  }
   tasks.push({
     stage: "install",
     start: installSeq[0],
@@ -1323,6 +1344,7 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     installer,
     secondaryInstaller: secondaryInstaller || null,
     siblingOf: sibling ? sibling.jobName : null,
+    deliveryDate,
   });
 
   // Buffer check: count working days between reassembly end and install start.
@@ -1371,7 +1393,19 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
   // Record van bookings (deliveries). Jobs >25 cabs = 2 deliveries over 2 working days.
   const vanBookings = [];
   const numDeliveries = deliveriesForJob(jobCabCount);
-  let vanDay = installSeq[0];
+  // Delivery starts on the user-set deliveryDate if provided, otherwise day 1 of install
+  let vanDay;
+  if (job.deliveryDate) {
+    const parsed = parseISO(job.deliveryDate);
+    // Snap to working day if user picked a weekend/holiday
+    if (isWeekend(parsed) || holidays.has(dayKey(parsed))) {
+      vanDay = nextWorkingDay(parsed, holidays);
+    } else {
+      vanDay = parsed;
+    }
+  } else {
+    vanDay = installSeq[0];
+  }
   for (let d = 0; d < numDeliveries; d++) {
     vanBookings.push({
       date: new Date(vanDay.getTime()),
@@ -1631,50 +1665,47 @@ function App() {
   const [updateFeedback, setUpdateFeedback] = useState(null); // { ok, message, updates, unparsed, offset }
   const [loading, setLoading] = useState(true);
 
-  // Load from storage. Pulled into a function so we can call it again
-  // when realtime notifies us another device has changed something.
-  const reloadFromStorage = async () => {
-    try {
-      const j = await window.storage.get("ew-jobs");
-      if (j?.value) setJobs(JSON.parse(j.value));
-    } catch (e) { /* no jobs yet */ }
-    try {
-      const s = await window.storage.get("ew-settings");
-      if (s?.value) setSettings(JSON.parse(s.value));
-    } catch (e) { /* defaults */ }
-    try {
-      const r = await window.storage.get("ew-dismissed-reminders");
-      if (r?.value) setDismissedReminders(JSON.parse(r.value));
-    } catch (e) { /* none yet */ }
-    try {
-      const w = await window.storage.get("ew-dismissed-warnings");
-      if (w?.value) setDismissedWarnings(JSON.parse(w.value));
-    } catch (e) { /* none yet */ }
-  };
-
-  // Initial load
+  // Load from storage
   useEffect(() => {
     (async () => {
-      await reloadFromStorage();
+      try {
+        const j = await window.storage.get("ew-jobs");
+        if (j?.value) setJobs(JSON.parse(j.value));
+      } catch (e) { /* no jobs yet */ }
+      try {
+        const s = await window.storage.get("ew-settings");
+        if (s?.value) setSettings(JSON.parse(s.value));
+      } catch (e) { /* defaults */ }
+      try {
+        const r = await window.storage.get("ew-dismissed-reminders");
+        if (r?.value) setDismissedReminders(JSON.parse(r.value));
+      } catch (e) { /* none yet */ }
+      try {
+        const w = await window.storage.get("ew-dismissed-warnings");
+        if (w?.value) setDismissedWarnings(JSON.parse(w.value));
+      } catch (e) { /* none yet */ }
       setLoading(false);
     })();
   }, []);
 
-  // Realtime sync: when ANY device changes data, all other devices reload.
-  // This is what makes the workshop tablet stay in sync with the editor.
+  // Load again — pulled into a reusable function for realtime sync
+  const reloadFromStorage = async () => {
+    try { const j = await window.storage.get("ew-jobs"); if (j?.value) setJobs(JSON.parse(j.value)); } catch {}
+    try { const s = await window.storage.get("ew-settings"); if (s?.value) setSettings(JSON.parse(s.value)); } catch {}
+    try { const r = await window.storage.get("ew-dismissed-reminders"); if (r?.value) setDismissedReminders(JSON.parse(r.value)); } catch {}
+    try { const w = await window.storage.get("ew-dismissed-warnings"); if (w?.value) setDismissedWarnings(JSON.parse(w.value)); } catch {}
+  };
+
+  // Realtime sync — when another device changes data, reload
   useEffect(() => {
     if (loading) return;
     if (!window.storage.subscribe) return;
     let debounceTimer = null;
     const unsubscribe = window.storage.subscribe(() => {
-      // Debounce so a burst of writes from one device triggers just one reload
       clearTimeout(debounceTimer);
       debounceTimer = setTimeout(() => { reloadFromStorage(); }, 250);
     });
-    return () => {
-      clearTimeout(debounceTimer);
-      unsubscribe();
-    };
+    return () => { clearTimeout(debounceTimer); unsubscribe(); };
   }, [loading]);
 
   // Save to storage when changed (only if not in read-only mode)
@@ -2000,15 +2031,29 @@ function App() {
     }
   };
 
+  const [exportText, setExportText] = useState(null); // when set, shows export modal with raw JSON
+
   const exportData = () => {
     const data = JSON.stringify({ jobs, settings }, null, 2);
-    const blob = new Blob([data], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `evie-willow-schedule-${fmtISO(new Date())}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+    // Try the download route first
+    try {
+      const blob = new Blob([data], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `evie-willow-schedule-${fmtISO(new Date())}.json`;
+      // Must be in the DOM to be clickable in some browsers / sandboxes
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      // Give browsers a moment, then revoke
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      console.error("Download failed:", err);
+    }
+    // ALWAYS also open the export modal as a guaranteed fallback —
+    // user can copy from there if the download didn't actually trigger.
+    setExportText(data);
   };
 
   const importData = (e) => {
@@ -2215,6 +2260,9 @@ function App() {
               });
             }
           }}
+          onDeliveryDrag={(jobId, isoDate) => {
+            updateJob(jobId, { deliveryDate: isoDate });
+          }}
         />
       </div>
 
@@ -2261,6 +2309,10 @@ function App() {
           }}
           onClose={() => setShowWeeklyUpdate(false)}
         />
+      )}
+
+      {exportText !== null && (
+        <ExportTextModal text={exportText} onClose={() => setExportText(null)} />
       )}
 
       {showSettings && (
@@ -2350,6 +2402,104 @@ function Header({ onAddJob, onSettings, onWhatIf, onExport, onImport, jobCount, 
         </button>
       </div>
     </header>
+  );
+}
+
+function ExportTextModal({ text, onClose }) {
+  const [copied, setCopied] = useState(false);
+  const textareaRef = useRef(null);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      // Fallback: select all and let user Ctrl+C
+      if (textareaRef.current) {
+        textareaRef.current.select();
+        try {
+          document.execCommand("copy");
+          setCopied(true);
+          setTimeout(() => setCopied(false), 2000);
+        } catch (e) { /* user will copy manually */ }
+      }
+    }
+  };
+
+  const handleDownload = () => {
+    try {
+      const blob = new Blob([text], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `evie-willow-schedule.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      alert("Download failed. Use Copy to clipboard instead.");
+    }
+  };
+
+  return (
+    <div style={styles.modalOverlay} onClick={onClose}>
+      <div style={{ ...styles.modal, width: 640, maxHeight: "85vh" }} onClick={e => e.stopPropagation()}>
+        <div style={styles.modalHeader}>
+          <span>Export schedule data</span>
+          <button style={styles.iconBtn} onClick={onClose}><X size={14} /></button>
+        </div>
+        <div style={{ ...styles.modalBody, paddingTop: 12 }}>
+          <div style={{ fontSize: 11, color: "#7a6a55", marginBottom: 12, lineHeight: 1.6 }}>
+            Below is your full schedule as JSON. Three ways to use it:
+            <br /><br />
+            <strong>1.</strong> Click <strong>Copy to clipboard</strong>, then paste into a text file
+            (Notepad → File → Save As → name it <em>eviewillow.json</em> → set "Save as type" to <em>All files</em>).
+            <br />
+            <strong>2.</strong> Click <strong>Download file</strong> to save directly (if your browser allows it).
+            <br />
+            <strong>3.</strong> Or paste this JSON straight into the Vercel scheduler's import dialog if it accepts pasted text.
+          </div>
+          <textarea
+            ref={textareaRef}
+            value={text}
+            readOnly
+            onClick={e => e.target.select()}
+            style={{
+              width: "100%",
+              height: 280,
+              fontFamily: "ui-monospace, 'SF Mono', Menlo, monospace",
+              fontSize: 10,
+              padding: 10,
+              border: "1px solid #d9cfba",
+              borderRadius: 3,
+              background: "#fffefb",
+              color: "#3a342c",
+              resize: "vertical",
+              boxSizing: "border-box",
+            }}
+          />
+          <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+            <button
+              style={{ ...styles.btnPrimary, flex: 1, justifyContent: "center" }}
+              onClick={handleCopy}
+            >
+              {copied ? "✓ Copied!" : "📋 Copy to clipboard"}
+            </button>
+            <button
+              style={{ ...styles.btnSecondary, flex: 1, justifyContent: "center" }}
+              onClick={handleDownload}
+            >
+              <Download size={13} style={{ marginRight: 4 }} /> Download file
+            </button>
+            <button style={{ ...styles.btnGhost, justifyContent: "center", padding: "9px 14px" }} onClick={onClose}>
+              Close
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -2936,7 +3086,7 @@ function JobEditor({ job, onUpdate, onDelete }) {
 // GANTT VIEW
 // ============================================================
 
-function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, onClearOverride, onInstallResize, onToggleLock }) {
+function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, onClearOverride, onInstallResize, onToggleLock, onDeliveryDrag }) {
   const COL_WIDTH = 36;       // wider so day numbers are readable
   const HALF_WIDTH = COL_WIDTH / 2;
   const ROW_HEIGHT = 64;
@@ -2948,6 +3098,10 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, o
   // Resize state for install bar duration adjustment
   const [resizeState, setResizeState] = useState(null);
   // resizeState: { jobId, currentLeft, currentWidth, currentDays }
+
+  // Drag state for delivery icon
+  const [deliveryDragState, setDeliveryDragState] = useState(null);
+  // deliveryDragState: { jobId, currentLeft, currentDate }
 
   // Determine date range
   const allDates = jobs.flatMap(j => (j.tasks || []).flatMap(t => [t.start, t.end]));
@@ -3558,6 +3712,83 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, o
                       );
                     }
                   });
+
+                  // Truck delivery icon (only for install tasks).
+                  // Positioned at the deliveryDate; draggable anywhere along the Gantt.
+                  if (isInstall && t.deliveryDate) {
+                    const isDraggingThisDel = deliveryDragState && deliveryDragState.jobId === job.id;
+                    const delDayIdx = diffDays(t.deliveryDate, ganttStart);
+                    const liveDelLeft = isDraggingThisDel
+                      ? deliveryDragState.currentLeft
+                      : delDayIdx * COL_WIDTH;
+                    const delDate = isDraggingThisDel
+                      ? parseISO(deliveryDragState.currentDate)
+                      : t.deliveryDate;
+                    const delTooltip = `Delivery: ${delDate.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })} · drag to reschedule`;
+                    out.push(
+                      <div
+                        key={`${ti}-truck`}
+                        title={delTooltip}
+                        style={{
+                          position: "absolute",
+                          left: liveDelLeft + 4,
+                          top: getStageRowOffset(t.stage) - 9,
+                          width: 22,
+                          height: 22,
+                          borderRadius: "50%",
+                          background: "#3a342c",
+                          color: "#faf6ec",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          cursor: "grab",
+                          zIndex: 6,
+                          boxShadow: "0 1px 3px rgba(58,52,44,0.4)",
+                          border: "1.5px solid #faf6ec",
+                          opacity: isDraggingThisDel ? 0.85 : 1,
+                        }}
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          const startX = e.clientX;
+                          const startLeft = delDayIdx * COL_WIDTH;
+                          let lastDate = null;
+                          const onMove = (ev) => {
+                            const dx = ev.clientX - startX;
+                            const newLeft = startLeft + dx;
+                            const snappedDayIdx = Math.round(newLeft / COL_WIDTH);
+                            if (snappedDayIdx < 0 || snappedDayIdx >= days.length) return;
+                            let snappedDate = days[snappedDayIdx];
+                            // Snap weekend/holiday days to next working day
+                            while (isWeekend(snappedDate) || holidays.has(dayKey(snappedDate))) {
+                              snappedDate = addDays(snappedDate, 1);
+                              if (diffDays(snappedDate, ganttStart) >= days.length) break;
+                            }
+                            const snappedLeft = diffDays(snappedDate, ganttStart) * COL_WIDTH;
+                            lastDate = dayKey(snappedDate);
+                            setDeliveryDragState({
+                              jobId: job.id,
+                              currentLeft: snappedLeft,
+                              currentDate: lastDate,
+                            });
+                          };
+                          const onUp = () => {
+                            window.removeEventListener("mousemove", onMove);
+                            window.removeEventListener("mouseup", onUp);
+                            setDeliveryDragState(null);
+                            if (lastDate && lastDate !== dayKey(t.deliveryDate)) {
+                              onDeliveryDrag && onDeliveryDrag(job.id, lastDate);
+                            }
+                          };
+                          window.addEventListener("mousemove", onMove);
+                          window.addEventListener("mouseup", onUp);
+                        }}
+                      >
+                        <Truck size={12} strokeWidth={2.2} />
+                      </div>
+                    );
+                  }
+
                   return out;
                 })}
                 {/* Job label overlay */}
@@ -4257,7 +4488,6 @@ const styles = {
     display: "flex",
     alignItems: "center",
     gap: 6,
-    fontSize: 11,
     color: "#7a6a55",
     letterSpacing: "0.04em",
     flexShrink: 0,
