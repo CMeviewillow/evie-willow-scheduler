@@ -1665,36 +1665,18 @@ function App() {
   const [updateFeedback, setUpdateFeedback] = useState(null); // { ok, message, updates, unparsed, offset }
   const [loading, setLoading] = useState(true);
 
-  // Load from storage
-  useEffect(() => {
-    (async () => {
-      try {
-        const j = await window.storage.get("ew-jobs");
-        if (j?.value) setJobs(JSON.parse(j.value));
-      } catch (e) { /* no jobs yet */ }
-      try {
-        const s = await window.storage.get("ew-settings");
-        if (s?.value) setSettings(JSON.parse(s.value));
-      } catch (e) { /* defaults */ }
-      try {
-        const r = await window.storage.get("ew-dismissed-reminders");
-        if (r?.value) setDismissedReminders(JSON.parse(r.value));
-      } catch (e) { /* none yet */ }
-      try {
-        const w = await window.storage.get("ew-dismissed-warnings");
-        if (w?.value) setDismissedWarnings(JSON.parse(w.value));
-      } catch (e) { /* none yet */ }
-      setLoading(false);
-    })();
-  }, []);
-
-  // Load again — pulled into a reusable function for realtime sync
+  // Load from storage (reusable function so realtime can re-call it)
   const reloadFromStorage = async () => {
     try { const j = await window.storage.get("ew-jobs"); if (j?.value) setJobs(JSON.parse(j.value)); } catch {}
     try { const s = await window.storage.get("ew-settings"); if (s?.value) setSettings(JSON.parse(s.value)); } catch {}
     try { const r = await window.storage.get("ew-dismissed-reminders"); if (r?.value) setDismissedReminders(JSON.parse(r.value)); } catch {}
     try { const w = await window.storage.get("ew-dismissed-warnings"); if (w?.value) setDismissedWarnings(JSON.parse(w.value)); } catch {}
   };
+
+  // Initial load
+  useEffect(() => {
+    (async () => { await reloadFromStorage(); setLoading(false); })();
+  }, []);
 
   // Realtime sync — when another device changes data, reload
   useEffect(() => {
@@ -1963,12 +1945,24 @@ function App() {
         actualDate = new Date(today.getTime());
       }
 
+      // Detect whether the clause refers to the START or END of the stage.
+      // Default = start. Words like "finish/finishes/ends/completes/done" → end.
+      let boundary = "start";
+      if (/\bfinish(?:es|ed|ing)?\b/i.test(clause)
+          || /\bends?\b/i.test(clause)
+          || /\bcompletes?\b/i.test(clause)
+          || /\bdone\b/i.test(clause)
+          || /\boff\s+the\s+bench\b/i.test(clause)) {
+        boundary = "end";
+      }
+
       if (matchedJob && stage && actualDate) {
         updates.push({
           jobId: matchedJob.id,
           jobName: matchedJob.name,
           stage,
           actualDate,
+          boundary,
         });
       } else {
         unparsed.push({
@@ -1994,11 +1988,39 @@ function App() {
     if (!anchorJob) return null;
     const anchorTask = anchorJob.tasks?.find(t => t.stage === anchor.stage);
     if (!anchorTask) return null;
-    const scheduledStart = new Date(anchorTask.start.getTime());
-    scheduledStart.setHours(0, 0, 0, 0);
-    const actualStart = new Date(anchor.actualDate.getTime());
-    actualStart.setHours(0, 0, 0, 0);
-    const offset = diffDays(actualStart, scheduledStart);
+
+    // Pick the scheduled point to compare against, depending on whether the
+    // user described the START or END of the stage.
+    //   start  → scheduled = anchorTask.start (first day of work)
+    //   end    → scheduled = last working day of work (anchorTask.end minus 1)
+    let scheduledPoint;
+    if (anchor.boundary === "end") {
+      // anchorTask.end is the day AFTER the last working day, so subtract 1
+      scheduledPoint = new Date(anchorTask.end.getTime());
+      scheduledPoint.setDate(scheduledPoint.getDate() - 1);
+    } else {
+      scheduledPoint = new Date(anchorTask.start.getTime());
+    }
+    scheduledPoint.setHours(0, 0, 0, 0);
+
+    const actualPoint = new Date(anchor.actualDate.getTime());
+    actualPoint.setHours(0, 0, 0, 0);
+    // Snap to next working day if the user mentioned a weekend or bank holiday.
+    // Workshop doesn't operate on those days, so the user almost certainly means
+    // the nearest working day.
+    if (isWeekend(actualPoint) || holidaySet.has(dayKey(actualPoint))) {
+      let snapped = nextWorkingDay(actualPoint, holidaySet);
+      // For "end" boundary, snap to the most recent past working day instead
+      // (because "finished on Saturday" means "actually finished by end of Friday").
+      if (anchor.boundary === "end") {
+        snapped = new Date(actualPoint.getTime());
+        while (isWeekend(snapped) || holidaySet.has(dayKey(snapped))) {
+          snapped = addDays(snapped, -1);
+        }
+      }
+      actualPoint.setTime(snapped.getTime());
+    }
+    const offset = diffDays(actualPoint, scheduledPoint);
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     if (offset === 0) {
@@ -2202,7 +2224,7 @@ function App() {
           {updateFeedback.updates && updateFeedback.updates.length > 0 && (
             <span style={{ marginLeft: 10, color: "#7a6a55" }}>
               Updated: {updateFeedback.updates.map(u =>
-                `${u.jobName} → ${u.stage} ${fmtUK(u.actualDate)}`
+                `${u.jobName} → ${u.stage} ${u.boundary === "end" ? "ends" : "starts"} ${fmtUK(u.actualDate)}`
               ).join(" · ")}
             </span>
           )}
