@@ -264,6 +264,8 @@ function newJob() {
     teamInstall: false,      // if true, all 3 fitters on site for this install (rare, e.g. distant jobs needing a hotel)
     secondaryInstaller: "",  // optional second fitter on the same install (empty = solo)
     deliveryDate: "",        // ISO date of when the van delivers (empty = day 1 of install)
+    machiningOverride: "",   // ISO date — manual machining start, overrides auto-calc
+    machiningDaysOverride: 0,// manual machining duration in days (0 = use auto-calc)
     installer: "auto",       // "auto" | "Steve" | "Thompson" | "Chris"
     machiningDays: 3,        // default machining duration
     notes: "",
@@ -873,27 +875,59 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
   //   - Jobs under 9 cabinets: machining = bench duration (rounded up to whole days)
   //     — tiny jobs don't need a separate machining run, just match bench
   //   - Jobs 9+ cabinets: max(bench days rounded up, machining days field)
+  //
+  // Both start date and duration can be MANUALLY OVERRIDDEN via:
+  //   job.machiningOverride (ISO date) — explicit start date
+  //   job.machiningDaysOverride (number) — explicit duration in days
+  // When set, the auto-calc is replaced. Bench stays where it is regardless.
   const cabCountForMach = totalCabinets(job);
-  const machDays = (cabCountForMach < 9)
+  const autoMachDays = (cabCountForMach < 9)
     ? Math.max(1, Math.ceil(benchDays))
     : Math.max(Math.ceil(benchDays), job.machiningDays || 0);
-  let machiningStartActual = benchStartSlot.date;
-  for (let i = 0; i < 3; i++) {
-    machiningStartActual = addDays(machiningStartActual, -1);
-    while (isWeekend(machiningStartActual) || holidays.has(dayKey(machiningStartActual))) {
+  const machDays = (job.machiningDaysOverride && job.machiningDaysOverride > 0)
+    ? job.machiningDaysOverride
+    : autoMachDays;
+
+  let machiningStartActual;
+  if (job.machiningOverride) {
+    const parsed = parseISO(job.machiningOverride);
+    machiningStartActual = (isWeekend(parsed) || holidays.has(dayKey(parsed)))
+      ? nextWorkingDay(parsed, holidays)
+      : parsed;
+  } else {
+    // Auto: 3 working days before bench start
+    machiningStartActual = benchStartSlot.date;
+    for (let i = 0; i < 3; i++) {
       machiningStartActual = addDays(machiningStartActual, -1);
+      while (isWeekend(machiningStartActual) || holidays.has(dayKey(machiningStartActual))) {
+        machiningStartActual = addDays(machiningStartActual, -1);
+      }
     }
+    // Don't allow machining to start before today (or settings.startDate)
+    const earliestMach = nextWorkingDay(parseISO(settings.startDate), holidays);
+    if (machiningStartActual < earliestMach) machiningStartActual = earliestMach;
   }
-  // Don't allow machining to start before today (or settings.startDate)
-  const earliestMach = nextWorkingDay(parseISO(settings.startDate), holidays);
-  if (machiningStartActual < earliestMach) machiningStartActual = earliestMach;
+
   const machiningSeq = workingDaysSeq(machiningStartActual, machDays, holidays);
   const machiningEnd = addDays(machiningSeq[machiningSeq.length - 1], 1);
+
+  // Sanity warning: if user has manually positioned machining such that it ends
+  // AFTER bench has started, flag it (production order broken)
+  if (job.machiningOverride && machiningEnd > benchStartSlot.date) {
+    warnings.push({
+      jobId: job.id,
+      jobName: job.name,
+      type: "buffer_too_tight",
+      message: `Machining ends ${fmtUK(addDays(machiningEnd, -1))} but bench starts ${fmtUK(benchStartSlot.date)} — production order broken`,
+    });
+  }
+
   tasks.push({
     stage: "machining",
     start: machiningSeq[0],
     end: machiningEnd,
     days: machDays,
+    isOverridden: !!(job.machiningOverride || (job.machiningDaysOverride && job.machiningDaysOverride > 0)),
   });
 
   // Finishing - starts 1 working day after bench begins, half-slot precision.
@@ -1665,7 +1699,7 @@ function App() {
   const [updateFeedback, setUpdateFeedback] = useState(null); // { ok, message, updates, unparsed, offset }
   const [loading, setLoading] = useState(true);
 
-  // Load from storage (reusable function so realtime can re-call it)
+  // Load from storage (reusable function for realtime sync)
   const reloadFromStorage = async () => {
     try { const j = await window.storage.get("ew-jobs"); if (j?.value) setJobs(JSON.parse(j.value)); } catch {}
     try { const s = await window.storage.get("ew-settings"); if (s?.value) setSettings(JSON.parse(s.value)); } catch {}
@@ -1673,7 +1707,6 @@ function App() {
     try { const w = await window.storage.get("ew-dismissed-warnings"); if (w?.value) setDismissedWarnings(JSON.parse(w.value)); } catch {}
   };
 
-  // Initial load
   useEffect(() => {
     (async () => { await reloadFromStorage(); setLoading(false); })();
   }, []);
@@ -1945,24 +1978,12 @@ function App() {
         actualDate = new Date(today.getTime());
       }
 
-      // Detect whether the clause refers to the START or END of the stage.
-      // Default = start. Words like "finish/finishes/ends/completes/done" → end.
-      let boundary = "start";
-      if (/\bfinish(?:es|ed|ing)?\b/i.test(clause)
-          || /\bends?\b/i.test(clause)
-          || /\bcompletes?\b/i.test(clause)
-          || /\bdone\b/i.test(clause)
-          || /\boff\s+the\s+bench\b/i.test(clause)) {
-        boundary = "end";
-      }
-
       if (matchedJob && stage && actualDate) {
         updates.push({
           jobId: matchedJob.id,
           jobName: matchedJob.name,
           stage,
           actualDate,
-          boundary,
         });
       } else {
         unparsed.push({
@@ -1988,39 +2009,11 @@ function App() {
     if (!anchorJob) return null;
     const anchorTask = anchorJob.tasks?.find(t => t.stage === anchor.stage);
     if (!anchorTask) return null;
-
-    // Pick the scheduled point to compare against, depending on whether the
-    // user described the START or END of the stage.
-    //   start  → scheduled = anchorTask.start (first day of work)
-    //   end    → scheduled = last working day of work (anchorTask.end minus 1)
-    let scheduledPoint;
-    if (anchor.boundary === "end") {
-      // anchorTask.end is the day AFTER the last working day, so subtract 1
-      scheduledPoint = new Date(anchorTask.end.getTime());
-      scheduledPoint.setDate(scheduledPoint.getDate() - 1);
-    } else {
-      scheduledPoint = new Date(anchorTask.start.getTime());
-    }
-    scheduledPoint.setHours(0, 0, 0, 0);
-
-    const actualPoint = new Date(anchor.actualDate.getTime());
-    actualPoint.setHours(0, 0, 0, 0);
-    // Snap to next working day if the user mentioned a weekend or bank holiday.
-    // Workshop doesn't operate on those days, so the user almost certainly means
-    // the nearest working day.
-    if (isWeekend(actualPoint) || holidaySet.has(dayKey(actualPoint))) {
-      let snapped = nextWorkingDay(actualPoint, holidaySet);
-      // For "end" boundary, snap to the most recent past working day instead
-      // (because "finished on Saturday" means "actually finished by end of Friday").
-      if (anchor.boundary === "end") {
-        snapped = new Date(actualPoint.getTime());
-        while (isWeekend(snapped) || holidaySet.has(dayKey(snapped))) {
-          snapped = addDays(snapped, -1);
-        }
-      }
-      actualPoint.setTime(snapped.getTime());
-    }
-    const offset = diffDays(actualPoint, scheduledPoint);
+    const scheduledStart = new Date(anchorTask.start.getTime());
+    scheduledStart.setHours(0, 0, 0, 0);
+    const actualStart = new Date(anchor.actualDate.getTime());
+    actualStart.setHours(0, 0, 0, 0);
+    const offset = diffDays(actualStart, scheduledStart);
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     if (offset === 0) {
@@ -2224,7 +2217,7 @@ function App() {
           {updateFeedback.updates && updateFeedback.updates.length > 0 && (
             <span style={{ marginLeft: 10, color: "#7a6a55" }}>
               Updated: {updateFeedback.updates.map(u =>
-                `${u.jobName} → ${u.stage} ${u.boundary === "end" ? "ends" : "starts"} ${fmtUK(u.actualDate)}`
+                `${u.jobName} → ${u.stage} ${fmtUK(u.actualDate)}`
               ).join(" · ")}
             </span>
           )}
@@ -2284,6 +2277,15 @@ function App() {
           }}
           onDeliveryDrag={(jobId, isoDate) => {
             updateJob(jobId, { deliveryDate: isoDate });
+          }}
+          onMachiningDrag={(jobId, isoDate) => {
+            updateJob(jobId, { machiningOverride: isoDate });
+          }}
+          onMachiningResize={(jobId, days) => {
+            updateJob(jobId, { machiningDaysOverride: days });
+          }}
+          onMachiningReset={(jobId) => {
+            updateJob(jobId, { machiningOverride: "", machiningDaysOverride: 0 });
           }}
         />
       </div>
@@ -2962,6 +2964,32 @@ function JobEditor({ job, onUpdate, onDelete }) {
             />
           </div>
         </div>
+        {(job.machiningOverride || (job.machiningDaysOverride && job.machiningDaysOverride > 0)) && (
+          <div style={{
+            marginTop: 6,
+            padding: "6px 10px",
+            background: "#fdfaf2",
+            border: "1px dashed #c89072",
+            borderRadius: 3,
+            fontSize: 10,
+            color: "#7a6a55",
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+          }}>
+            <span>
+              Machining manually adjusted
+              {job.machiningOverride && ` · starts ${fmtUK(parseISO(job.machiningOverride))}`}
+              {job.machiningDaysOverride > 0 && ` · ${job.machiningDaysOverride} day${job.machiningDaysOverride === 1 ? "" : "s"}`}
+            </span>
+            <button
+              style={{ ...styles.btnGhost, padding: "3px 8px", fontSize: 10 }}
+              onClick={() => onUpdate({ machiningOverride: "", machiningDaysOverride: 0 })}
+            >
+              Reset to auto
+            </button>
+          </div>
+        )}
         <div style={styles.row2}>
           <div style={styles.field}>
             <label style={styles.labelSm}>Installer</label>
@@ -3108,7 +3136,7 @@ function JobEditor({ job, onUpdate, onDelete }) {
 // GANTT VIEW
 // ============================================================
 
-function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, onClearOverride, onInstallResize, onToggleLock, onDeliveryDrag }) {
+function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, onClearOverride, onInstallResize, onToggleLock, onDeliveryDrag, onMachiningDrag, onMachiningResize, onMachiningReset }) {
   const COL_WIDTH = 36;       // wider so day numbers are readable
   const HALF_WIDTH = COL_WIDTH / 2;
   const ROW_HEIGHT = 64;
@@ -3450,8 +3478,12 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, o
                   const isInstall = t.stage === "install";
                   const isTeamInstall = isInstall && t.installer === "Team";
                   const hasSecondary = isInstall && !isTeamInstall && t.secondaryInstaller && FITTER_CONFIG[t.secondaryInstaller];
-                  const isDraggingThis = dragState && dragState.jobId === job.id && isInstall;
-                  const isResizingThis = resizeState && resizeState.jobId === job.id && isInstall;
+                  const isDraggingThis = dragState && dragState.jobId === job.id
+                    && ((isInstall && (dragState.stage === "install" || !dragState.stage))
+                        || (t.stage === "machining" && dragState.stage === "machining"));
+                  const isResizingThis = resizeState && resizeState.jobId === job.id
+                    && ((isInstall && (resizeState.stage === "install" || !resizeState.stage))
+                        || (t.stage === "machining" && resizeState.stage === "machining"));
                   const tooltip = `${STAGE_LABELS[t.stage]}: ${dayKey(t.start)}${t.days ? ` · ${t.days}d` : ""}${t.installer ? ` · ${t.installer === "Team" ? "Steve + Thompson + Chris" : t.installer}${hasSecondary ? " + " + t.secondaryInstaller : ""}` : ""}${t.siblingOf ? ` · parallel w/ ${t.siblingOf}` : ""}${isInstall ? " · drag to move, drag right edge to resize" : ""}`;
                   // Install bars coloured by fitter
                   let barColor;
@@ -3547,6 +3579,8 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, o
                   const isLocked = isInstall && !!job.locked;
                   segs.forEach((seg, si) => {
                     const isLastSeg = si === segs.length - 1;
+                    const isMachiningStage = t.stage === "machining";
+                    const isDraggable = (isInstall && !isLocked) || isMachiningStage;
                     out.push(
                       <div
                         key={`${ti}-${si}`}
@@ -3561,13 +3595,23 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, o
                           boxShadow: isInstall
                             ? "0 1px 2px rgba(58,52,44,0.18)"
                             : "0 1px 0 rgba(58,52,44,0.12)",
-                          cursor: isInstall ? (isLocked ? "default" : "grab") : "default",
+                          cursor: isInstall
+                            ? (isLocked ? "default" : "grab")
+                            : isMachiningStage ? "grab" : "default",
                           outline: (isInstall && job.installOverride && !isLocked)
+                            ? "1px dashed rgba(58,52,44,0.4)"
+                            : (isMachiningStage && t.isOverridden)
                             ? "1px dashed rgba(58,52,44,0.4)"
                             : "none",
                         }}
                         title={tooltip}
-                        onMouseDown={(isInstall && !isLocked) ? (e) => {
+                        onContextMenu={isMachiningStage && t.isOverridden ? (e) => {
+                          e.preventDefault();
+                          if (window.confirm("Reset machining to auto-calculated position and duration?")) {
+                            onMachiningReset && onMachiningReset(job.id);
+                          }
+                        } : undefined}
+                        onMouseDown={isDraggable ? (e) => {
                           e.preventDefault();
                           const startX = e.clientX;
                           const barLeft = barLeftFor(t);
@@ -3590,6 +3634,7 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, o
                               currentLeft: snappedLeft,
                               currentDate: lastDate,
                               width: barW,
+                              stage: t.stage,
                             });
                           };
                           const onUp = () => {
@@ -3597,7 +3642,11 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, o
                             window.removeEventListener("mouseup", onUp);
                             setDragState(null);
                             if (lastDate && lastDate !== dayKey(t.start)) {
-                              onInstallDrag && onInstallDrag(job.id, lastDate);
+                              if (isInstall) {
+                                onInstallDrag && onInstallDrag(job.id, lastDate);
+                              } else if (isMachiningStage) {
+                                onMachiningDrag && onMachiningDrag(job.id, lastDate);
+                              }
                             }
                           };
                           window.addEventListener("mousemove", onMove);
@@ -3644,8 +3693,9 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, o
                       );
                     }
 
-                    // Resize handle on the last segment of an install bar (only when unlocked)
-                    if (isInstall && isLastSeg && !isLocked) {
+                    // Resize handle on the last segment (install when unlocked, OR machining anytime)
+                    const isResizable = (isInstall && !isLocked) || isMachiningStage;
+                    if (isResizable && isLastSeg) {
                       out.push(
                         <div
                           key={`${ti}-${si}-handle`}
@@ -3679,6 +3729,7 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, o
                                 jobId: job.id,
                                 currentDays: newDays,
                                 currentWidth: lastWidth,
+                                stage: t.stage,
                               });
                             };
                             const onUp = () => {
@@ -3686,7 +3737,11 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, o
                               window.removeEventListener("mouseup", onUp);
                               setResizeState(null);
                               if (lastDays !== startDays) {
-                                onInstallResize && onInstallResize(job.id, lastDays);
+                                if (isInstall) {
+                                  onInstallResize && onInstallResize(job.id, lastDays);
+                                } else if (isMachiningStage) {
+                                  onMachiningResize && onMachiningResize(job.id, lastDays);
+                                }
                               }
                             };
                             window.addEventListener("mousemove", onMove);
