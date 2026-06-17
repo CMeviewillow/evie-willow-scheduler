@@ -4810,7 +4810,6 @@ const styles = {
   empty: {
     padding: 28,
     color: "#9b8f7e",
-    fontSize: 12,
     textAlign: "center",
     fontStyle: "italic",
     fontFamily: "'Cormorant Garamond', 'Georgia', serif",
