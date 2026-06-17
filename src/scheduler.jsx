@@ -1832,9 +1832,9 @@ function App() {
   // open the modal whenever you want. Serious warnings DO auto-pop because they
   // need attention: target unreachable, locked-job conflicts, fitter conflicts.
   //
-  // DEBOUNCED: we wait until the user has been quiet for 1.5 seconds before
-  // popping. This stops the modal flashing while someone is actively typing
-  // a job name or picking a date (those create transient "invalid" states).
+  // BUT: NEVER auto-pop while the user is actively editing a job. The editor is
+  // open whenever editingJobId is non-null. Closing the editor (clicking a job
+  // to deselect, or saving) lets the popup fire if there are unresolved warnings.
   const SERIOUS_WARNING_TYPES = new Set([
     "target_unreachable",
     "installer_conflict",
@@ -1852,15 +1852,11 @@ function App() {
     if (loading) return;
     if (seriousActiveSig === "") return;
     if (seriousActiveSig === lastSeenSeriousSig) return;
-    // Wait 1.5 seconds of stability before popping. If user keeps editing
-    // (which re-runs this effect with a new seriousActiveSig), the timer
-    // restarts each time, so popup never fires mid-edit.
-    const t = setTimeout(() => {
-      setShowWarnings(true);
-      setLastSeenSeriousSig(seriousActiveSig);
-    }, 1500);
-    return () => clearTimeout(t);
-  }, [seriousActiveSig, loading]);
+    // Don't pop while user is editing — wait until they close the editor
+    if (editingJobId !== null) return;
+    setShowWarnings(true);
+    setLastSeenSeriousSig(seriousActiveSig);
+  }, [seriousActiveSig, loading, editingJobId]);
 
   // Garbage-collect dismissed warnings whose fingerprint is no longer produced
   // (e.g. job deleted, or warning resolved). Keeps the storage tidy.
@@ -2097,17 +2093,19 @@ function App() {
 
   const addJob = () => {
     const j = newJob();
-    setJobs([...jobs, j]);
+    setJobs(prev => [...prev, j]);
     setEditingJobId(j.id);
   };
 
   const updateJob = (id, patch) => {
-    setJobs(jobs.map(j => j.id === id ? { ...j, ...patch } : j));
+    // Use the functional form so rapid successive updates (e.g. typing into a
+    // text field) always see the latest state, not a stale closure value.
+    setJobs(prev => prev.map(j => j.id === id ? { ...j, ...patch } : j));
   };
 
   const deleteJob = (id) => {
     if (confirm("Delete this job?")) {
-      setJobs(jobs.filter(j => j.id !== id));
+      setJobs(prev => prev.filter(j => j.id !== id));
       if (editingJobId === id) setEditingJobId(null);
     }
   };
