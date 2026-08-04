@@ -47,6 +47,19 @@ const STAGE_LABELS = {
   buffer:         "Buffer / Hold",
 };
 
+// Stages the Gantt can drag (change start date) and resize (change duration).
+// Drag writes dateField, resize writes daysField — both opt-in overrides on
+// the job, empty/0 meaning "auto". One generic pair of Gantt callbacks
+// (onStageDrag/onStageResize/onStageReset) looks stage behavior up here
+// instead of branching on hardcoded stage names.
+const DRAGGABLE_STAGES = {
+  machining:  { dateField: "machiningOverride",  daysField: "machiningDaysOverride" },
+  bench:      { dateField: "benchOverride",      daysField: "benchDaysOverride" },
+  finishing:  { dateField: "finishingOverride",  daysField: "finishingDaysOverride" },
+  reassembly: { dateField: "reassemblyOverride", daysField: "reassemblyDaysOverride" },
+  install:    { dateField: "installOverride",    daysField: "installDaysOverride" },
+};
+
 const FITTERS = ["Steve", "Thompson", "Chris"];
 const NON_FITTERS = ["Callum"];
 
@@ -266,6 +279,12 @@ function newJob() {
     deliveryDate: "",        // ISO date of when the van delivers (empty = day 1 of install)
     machiningOverride: "",   // ISO date — manual machining start, overrides auto-calc
     machiningDaysOverride: 0,// manual machining duration in days (0 = use auto-calc)
+    benchOverride: "",          // ISO date, empty = auto (flows from bench cursor)
+    benchDaysOverride: 0,       // days, 0 = auto (from cabinet counts and rates)
+    finishingOverride: "",
+    finishingDaysOverride: 0,
+    reassemblyOverride: "",
+    reassemblyDaysOverride: 0,
     installer: "auto",       // "auto" | "Steve" | "Thompson" | "Chris"
     machiningDays: 3,        // default machining duration
     notes: "",
@@ -393,6 +412,68 @@ function findEarliestInstallSlot(fitter, earliest, days, state, holidays, fitter
 }
 
 // ============================================================
+// OCCUPIED-INTERVAL HELPERS (bench / finishing capacity)
+// ============================================================
+// Bench and finishing are shared linear resources — only one job can occupy
+// a given half-slot. Pinned jobs (benchOverride / finishingOverride) reserve
+// a fixed interval; unpinned jobs flow around whatever's already reserved,
+// filling gaps rather than just queuing after the last thing scheduled.
+// ============================================================
+
+// Snap a half-slot to a valid working position: bump off weekends/holidays,
+// and off Friday PM (workshop stages don't run Friday afternoons).
+function normalizeToWorkingSlot(slot, holidays) {
+  let { date, halfStart } = slot;
+  if (dayKey(date) !== dayKey(nextWorkingDay(date, holidays))) {
+    date = nextWorkingDay(date, holidays);
+    halfStart = 0;
+  }
+  if (date.getDay() === 5 && halfStart === 1) {
+    date = nextWorkingDay(addDays(date, 1), holidays);
+    halfStart = 0;
+  }
+  return { date, halfStart };
+}
+
+// Do two half-slot intervals [aStart,aEnd) and [bStart,bEnd) overlap?
+function slotsOverlap(aStart, aEnd, bStart, bEnd) {
+  return compareHalfSlot(aStart, bEnd) < 0 && compareHalfSlot(bStart, aEnd) < 0;
+}
+
+// Compute the fixed {startSlot, endSlot} for a pinned (overridden) interval.
+// Pure — depends only on the job's own override fields, never on other jobs'
+// state — so pass 1 (pinning) and pass 2 (scheduling) always agree.
+function computeOverrideInterval(overrideISO, daysOverride, autoDays, holidays) {
+  const parsed = parseISO(overrideISO);
+  const normDate = (isWeekend(parsed) || holidays.has(dayKey(parsed)))
+    ? nextWorkingDay(parsed, holidays)
+    : parsed;
+  const startSlot = normalizeToWorkingSlot({ date: normDate, halfStart: 0 }, holidays);
+  const halves = (daysOverride && daysOverride > 0) ? Math.round(daysOverride * 2) : Math.round(autoDays * 2);
+  const endSlot = advanceHalfSlots(startSlot, halves, holidays);
+  return { startSlot, endSlot };
+}
+
+// Walk forward from afterSlot and return the first half-slot where a run of
+// `halvesNeeded` consecutive working half-slots fits without overlapping
+// anything in `occupied` ([{startSlot, endSlot}, ...]). Generic — reused for
+// both bench and finishing capacity, since both are single shared resources
+// with the same "no overlap, fill gaps" rule.
+function findFreeBenchSlot(afterSlot, halvesNeeded, occupied, holidays) {
+  let candidate = normalizeToWorkingSlot(afterSlot, holidays);
+  const sorted = [...occupied].sort((a, b) => compareHalfSlot(a.startSlot, b.startSlot));
+  for (const block of sorted) {
+    if (compareHalfSlot(block.endSlot, candidate) <= 0) continue; // already behind us
+    const candidateEnd = advanceHalfSlots(candidate, halvesNeeded, holidays);
+    if (compareHalfSlot(candidateEnd, block.startSlot) <= 0) {
+      return candidate; // fits entirely before this block
+    }
+    candidate = normalizeToWorkingSlot(block.endSlot, holidays); // jump past it
+  }
+  return candidate;
+}
+
+// ============================================================
 // SCHEDULER
 // ============================================================
 // Forward-schedules all jobs in order, respecting:
@@ -420,12 +501,9 @@ function scheduleJobs(jobs, holidays, settings) {
     return aDate.localeCompare(bDate);
   });
 
-  // Track bench/finishing free positions as half-slot cursors
-  // (so jobs can flow back-to-back at half-day precision)
-  const startSlot = { date: parseISO(settings.startDate), halfStart: 0 };
   const state = {
-    benchFreeSlot: startSlot,
-    finishingFreeSlot: startSlot,
+    benchOccupied: [],      // [{startSlot, endSlot, jobName, jobId}] — pinned + placed bench blocks
+    finishingOccupied: [],  // same shape, for finishing capacity
     installerSchedules: {},
     installBookings: [],   // [{customer, jobName, start, end, installer, cabCount, weekKey}]
     vanBookings: [],       // [{date, jobName, isSibling}] — 1 van can do 1 delivery per day
@@ -435,6 +513,48 @@ function scheduleJobs(jobs, holidays, settings) {
   const scheduled = [];
   const warnings = [];
 
+  // PASS 1: pin every job with a bench/finishing override into the occupied
+  // arrays before anything else is scheduled. Pinned jobs are fixed points —
+  // unpinned jobs (pass 2) flow tight around them, filling gaps.
+  for (const job of sorted) {
+    const impact = featureImpact(job.features);
+    if (totalCabinets(job) === 0 && impact.holdExtra === 0) continue;
+    const nominalBenchDays = benchDaysForJob(job);
+
+    if (job.benchOverride) {
+      const interval = computeOverrideInterval(job.benchOverride, job.benchDaysOverride, nominalBenchDays, holidays);
+      for (const existing of state.benchOccupied) {
+        if (slotsOverlap(interval.startSlot, interval.endSlot, existing.startSlot, existing.endSlot)) {
+          warnings.push({
+            jobId: job.id,
+            jobName: job.name,
+            type: "buffer_too_tight",
+            message: `Bench pinned to ${fmtUK(interval.startSlot.date)} overlaps ${existing.jobName}'s pinned bench — both left in place, resolve manually`,
+          });
+        }
+      }
+      state.benchOccupied.push({ ...interval, jobName: job.name, jobId: job.id });
+    }
+    if (job.finishingOverride) {
+      const nominalFinishDays = nominalBenchDays + impact.flatExtra;
+      const interval = computeOverrideInterval(job.finishingOverride, job.finishingDaysOverride, nominalFinishDays, holidays);
+      for (const existing of state.finishingOccupied) {
+        if (slotsOverlap(interval.startSlot, interval.endSlot, existing.startSlot, existing.endSlot)) {
+          warnings.push({
+            jobId: job.id,
+            jobName: job.name,
+            type: "buffer_too_tight",
+            message: `Finishing pinned to ${fmtUK(interval.startSlot.date)} overlaps ${existing.jobName}'s pinned finishing — both left in place, resolve manually`,
+          });
+        }
+      }
+      state.finishingOccupied.push({ ...interval, jobName: job.name, jobId: job.id });
+    }
+  }
+
+  // PASS 2: schedule every job in the existing sort order. Pinned bench/
+  // finishing jobs land on their recorded interval; unpinned jobs search for
+  // the earliest free slot, which naturally fills gaps between pinned blocks.
   for (const job of sorted) {
     const impact = featureImpact(job.features);
     if (totalCabinets(job) === 0 && impact.holdExtra === 0) {
@@ -443,8 +563,12 @@ function scheduleJobs(jobs, holidays, settings) {
     }
 
     const result = scheduleSingleJob(job, state, holidays, settings, impact);
-    state.benchFreeSlot = result.newBenchFreeSlot;
-    state.finishingFreeSlot = result.newFinishingFreeSlot;
+    if (!result.benchWasPinned) {
+      state.benchOccupied.push({ ...result.benchInterval, jobName: job.name, jobId: job.id });
+    }
+    if (!result.finishWasPinned) {
+      state.finishingOccupied.push({ ...result.finishingInterval, jobName: job.name, jobId: job.id });
+    }
     if (result.installerBooking) {
       if (result.installer === "Team") {
         // Team install: claim all three fitters' time
@@ -519,6 +643,26 @@ function scheduleJobs(jobs, holidays, settings) {
       });
     }
   });
+
+  // Detect bench gaps caused by pinning: 2+ working days idle between
+  // consecutive bench blocks. This can only happen when a pin creates a hole
+  // in what would otherwise be a wall-to-wall bench queue — routine notice,
+  // bell only, never auto-pops.
+  {
+    const sortedBench = [...state.benchOccupied].sort((a, b) => compareHalfSlot(a.startSlot, b.startSlot));
+    for (let i = 1; i < sortedBench.length; i++) {
+      const prevEnd = sortedBench[i - 1].endSlot;
+      const prevEndDate = prevEnd.halfStart === 0 ? prevEnd.date : addDays(prevEnd.date, 1);
+      const nextStartDate = sortedBench[i].startSlot.date;
+      const gap = workingDaysBetween(prevEndDate, nextStartDate, holidays);
+      if (gap >= 2) {
+        warnings.push({
+          type: "bench_gap",
+          message: `Bench gap of ${gap} working days between ${sortedBench[i - 1].jobName} and ${sortedBench[i].jobName}`,
+        });
+      }
+    }
+  }
 
   return { scheduled, warnings };
 }
@@ -837,38 +981,42 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
   }
 
   // Bench - flows tight, one job after the next. Bench is the constrained
-  // resource; we want it 100% utilised. Each job's bench picks up exactly where
-  // the previous job's bench finished (state.benchFreeSlot is a half-slot cursor,
-  // so back-to-back jobs share days at AM/PM precision).
+  // resource; we want it 100% utilised. Unpinned jobs search for the earliest
+  // free slot across state.benchOccupied (which naturally fills gaps left by
+  // pinned jobs); pinned jobs (job.benchOverride) land on their fixed interval
+  // regardless of what else is going on.
   //
   // Workshop buffer (gap between reassembly end and install) absorbs any slack —
   // if a job's production finishes early relative to its install date, the buffer
-  // just gets bigger. We don't push bench later to "tighten the buffer".
-  let benchStartSlot = { ...state.benchFreeSlot };
-  // Make sure start slot is on a working day
-  if (dayKey(benchStartSlot.date) !== dayKey(nextWorkingDay(benchStartSlot.date, holidays))) {
-    benchStartSlot = { date: nextWorkingDay(benchStartSlot.date, holidays), halfStart: 0 };
+  // just gets bigger. We don't push bench later to "tighten the buffer", and we
+  // never leave bench idle to absorb slack either.
+  const benchHalves = Math.round(benchDays * 2); // nominal cabinet-based duration
+  const benchWasPinned = !!job.benchOverride;
+  // Date and duration overrides are independent — a resize-only drag sets
+  // benchDaysOverride with no benchOverride date, and must still apply.
+  const benchActualHalves = (job.benchDaysOverride && job.benchDaysOverride > 0)
+    ? Math.round(job.benchDaysOverride * 2)
+    : benchHalves;
+  let benchStartSlot, benchEndSlot;
+  if (benchWasPinned) {
+    const interval = computeOverrideInterval(job.benchOverride, job.benchDaysOverride, benchDays, holidays);
+    benchStartSlot = interval.startSlot;
+    benchEndSlot = interval.endSlot;
+  } else {
+    const earliestBenchSlot = { date: parseISO(settings.startDate), halfStart: 0 };
+    benchStartSlot = findFreeBenchSlot(earliestBenchSlot, benchActualHalves, state.benchOccupied, holidays);
+    benchEndSlot = advanceHalfSlots(benchStartSlot, benchActualHalves, holidays);
   }
-  // Make sure start slot is on a working day
-  if (dayKey(benchStartSlot.date) !== dayKey(nextWorkingDay(benchStartSlot.date, holidays))) {
-    benchStartSlot = { date: nextWorkingDay(benchStartSlot.date, holidays), halfStart: 0 };
-  }
-  // Fridays only have AM slot — if bench would start Friday PM, roll to next Mon AM
-  if (benchStartSlot.date.getDay() === 5 && benchStartSlot.halfStart === 1) {
-    const nextDay = nextWorkingDay(addDays(benchStartSlot.date, 1), holidays);
-    benchStartSlot = { date: nextDay, halfStart: 0 };
-  }
-  const benchHalves = Math.round(benchDays * 2);
-  const benchEndSlot = advanceHalfSlots(benchStartSlot, benchHalves, holidays);
+  const benchInterval = { startSlot: benchStartSlot, endSlot: benchEndSlot };
   tasks.push({
     stage: "bench",
     start: benchStartSlot.date,
     end: addDays(benchEndSlot.date, benchEndSlot.halfStart === 0 ? 0 : 1),
     startSlot: benchStartSlot,
     endSlot: benchEndSlot,
-    days: benchDays,
+    days: benchActualHalves / 2,
+    isOverridden: !!(job.benchOverride || (job.benchDaysOverride && job.benchDaysOverride > 0)),
   });
-  const newBenchFreeSlot = benchEndSlot;
 
   // Machining - starts 3 working days BEFORE bench start, runs in parallel.
   // Duration rule:
@@ -912,14 +1060,25 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
   const machiningEnd = addDays(machiningSeq[machiningSeq.length - 1], 1);
 
   // Sanity warning: if user has manually positioned machining such that it ends
-  // AFTER bench has started, flag it (production order broken)
-  if (job.machiningOverride && machiningEnd > benchStartSlot.date) {
-    warnings.push({
-      jobId: job.id,
-      jobName: job.name,
-      type: "buffer_too_tight",
-      message: `Machining ends ${fmtUK(addDays(machiningEnd, -1))} but bench starts ${fmtUK(benchStartSlot.date)} — production order broken`,
-    });
+  // AFTER bench has started, flag it (production order broken). Same physical
+  // problem can be caused from either side — machining pinned too late, or
+  // bench pinned too early — so check both, but only warn once.
+  if (machiningEnd > benchStartSlot.date) {
+    if (job.machiningOverride) {
+      warnings.push({
+        jobId: job.id,
+        jobName: job.name,
+        type: "buffer_too_tight",
+        message: `Machining ends ${fmtUK(addDays(machiningEnd, -1))} but bench starts ${fmtUK(benchStartSlot.date)} — production order broken`,
+      });
+    } else if (benchWasPinned) {
+      warnings.push({
+        jobId: job.id,
+        jobName: job.name,
+        type: "buffer_too_tight",
+        message: `Bench pinned to start ${fmtUK(benchStartSlot.date)} but machining doesn't finish until ${fmtUK(addDays(machiningEnd, -1))} — production order broken`,
+      });
+    }
   }
 
   tasks.push({
@@ -930,47 +1089,96 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     isOverridden: !!(job.machiningOverride || (job.machiningDaysOverride && job.machiningDaysOverride > 0)),
   });
 
-  // Finishing - starts 1 working day after bench begins, half-slot precision.
-  // The "1 day after bench starts" rule means: finishing AM-slot starts the working day
-  // after the day bench began. So if bench starts Mon AM, finishing starts Tue AM.
-  let finishStartSlot = {
+  // Finishing - desired start is 1 working day after bench begins, half-slot
+  // precision. The "1 day after bench starts" rule means: finishing AM-slot
+  // starts the working day after the day bench began. So if bench starts Mon
+  // AM, finishing starts Tue AM — unless finishing capacity (state.finishingOccupied)
+  // is busy there, in which case it's pushed forward to the next free slot.
+  // Pinned jobs (job.finishingOverride) land on their fixed interval instead.
+  const finishHalves = Math.round(finishDays * 2); // nominal duration
+  const finishWasPinned = !!job.finishingOverride;
+  // Date and duration overrides are independent — a resize-only drag sets
+  // finishingDaysOverride with no finishingOverride date, and must still apply.
+  const finishActualHalves = (job.finishingDaysOverride && job.finishingDaysOverride > 0)
+    ? Math.round(job.finishingDaysOverride * 2)
+    : finishHalves;
+  const desiredFinishStart = {
     date: nextWorkingDay(addDays(benchStartSlot.date, 1), holidays),
     halfStart: 0,
   };
+  let finishStartSlot, finishEndSlot;
   let finishingPushed = false;
-  if (compareHalfSlot(finishStartSlot, state.finishingFreeSlot) < 0) {
-    finishingPushed = true;
-    const pushedTo = state.finishingFreeSlot;
-    // Only warn if the push actually moves to a different day
-    if (dayKey(finishStartSlot.date) !== dayKey(pushedTo.date)) {
+  if (finishWasPinned) {
+    const interval = computeOverrideInterval(job.finishingOverride, job.finishingDaysOverride, finishDays, holidays);
+    finishStartSlot = interval.startSlot;
+    finishEndSlot = interval.endSlot;
+    if (compareHalfSlot(finishStartSlot, benchStartSlot) < 0) {
       warnings.push({
         jobId: job.id,
         jobName: job.name,
-        type: "bunching",
-        message: `Finishing capacity overlap: pushed back from ${fmtUK(finishStartSlot.date)} to ${fmtUK(pushedTo.date)}`,
+        type: "buffer_too_tight",
+        message: `Finishing pinned to ${fmtUK(finishStartSlot.date)} but bench doesn't start until ${fmtUK(benchStartSlot.date)} — production order broken`,
       });
     }
-    finishStartSlot = pushedTo;
+  } else {
+    finishStartSlot = findFreeBenchSlot(desiredFinishStart, finishActualHalves, state.finishingOccupied, holidays);
+    if (compareHalfSlot(finishStartSlot, desiredFinishStart) > 0) {
+      finishingPushed = true;
+      // Only warn if the push actually moves to a different day
+      if (dayKey(finishStartSlot.date) !== dayKey(desiredFinishStart.date)) {
+        warnings.push({
+          jobId: job.id,
+          jobName: job.name,
+          type: "bunching",
+          message: `Finishing capacity overlap: pushed back from ${fmtUK(desiredFinishStart.date)} to ${fmtUK(finishStartSlot.date)}`,
+        });
+      }
+    }
+    finishEndSlot = advanceHalfSlots(finishStartSlot, finishActualHalves, holidays);
   }
-  const finishHalves = Math.round(finishDays * 2);
-  const finishEndSlot = advanceHalfSlots(finishStartSlot, finishHalves, holidays);
+  const finishingInterval = { startSlot: finishStartSlot, endSlot: finishEndSlot };
   tasks.push({
     stage: "finishing",
     start: finishStartSlot.date,
     end: addDays(finishEndSlot.date, finishEndSlot.halfStart === 0 ? 0 : 1),
     startSlot: finishStartSlot,
     endSlot: finishEndSlot,
-    days: finishDays,
+    days: finishActualHalves / 2,
+    isOverridden: !!(job.finishingOverride || (job.finishingDaysOverride && job.finishingDaysOverride > 0)),
   });
-  const newFinishingFreeSlot = finishEndSlot;
 
-  // Re-assembly - starts 1 day after finishing starts, runs same length as bench.
-  // Has its own capacity (parallel resource, doesn't gate on others).
-  let reassemblyStartSlot = {
+  // Re-assembly - starts 1 day after finishing starts, runs same length as bench
+  // (its nominal, cabinet-based length — not whatever bench's own override says).
+  // Has its own capacity (parallel resource, doesn't gate on others), so unlike
+  // bench/finishing there's no shared occupied-interval search — pinning just
+  // fixes this one job's own reassembly in place.
+  const reassemblyWasPinned = !!job.reassemblyOverride;
+  // Date and duration overrides are independent — a resize-only drag sets
+  // reassemblyDaysOverride with no reassemblyOverride date, and must still apply.
+  const reassemblyActualHalves = (job.reassemblyDaysOverride && job.reassemblyDaysOverride > 0)
+    ? Math.round(job.reassemblyDaysOverride * 2)
+    : benchHalves;
+  const desiredReassemblyStart = {
     date: nextWorkingDay(addDays(finishStartSlot.date, 1), holidays),
     halfStart: 0,
   };
-  const reassemblyEndSlot = advanceHalfSlots(reassemblyStartSlot, benchHalves, holidays);
+  let reassemblyStartSlot, reassemblyEndSlot;
+  if (reassemblyWasPinned) {
+    const interval = computeOverrideInterval(job.reassemblyOverride, job.reassemblyDaysOverride, benchDays, holidays);
+    reassemblyStartSlot = interval.startSlot;
+    reassemblyEndSlot = interval.endSlot;
+    if (compareHalfSlot(reassemblyStartSlot, finishStartSlot) < 0) {
+      warnings.push({
+        jobId: job.id,
+        jobName: job.name,
+        type: "buffer_too_tight",
+        message: `Re-assembly pinned to ${fmtUK(reassemblyStartSlot.date)} but finishing doesn't start until ${fmtUK(finishStartSlot.date)} — production order broken`,
+      });
+    }
+  } else {
+    reassemblyStartSlot = desiredReassemblyStart;
+    reassemblyEndSlot = advanceHalfSlots(reassemblyStartSlot, reassemblyActualHalves, holidays);
+  }
   // The "fully fitted" date is when re-assembly ends — used as anchor for install
   const reassemblyEndDate = reassemblyEndSlot.halfStart === 0
     ? reassemblyEndSlot.date            // ended at end of previous day, so this is the next day
@@ -981,7 +1189,8 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     end: addDays(reassemblyEndSlot.date, reassemblyEndSlot.halfStart === 0 ? 0 : 1),
     startSlot: reassemblyStartSlot,
     endSlot: reassemblyEndSlot,
-    days: benchDays,
+    days: reassemblyActualHalves / 2,
+    isOverridden: !!(job.reassemblyOverride || (job.reassemblyDaysOverride && job.reassemblyDaysOverride > 0)),
   });
 
   // Cabinet install - starts after re-assembly is done.
@@ -1395,6 +1604,7 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     secondaryInstaller: secondaryInstaller || null,
     siblingOf: sibling ? sibling.jobName : null,
     deliveryDate,
+    isOverridden: !!(job.installOverride || (job.installDaysOverride && job.installDaysOverride > 0)),
   });
 
   // Buffer check: count working days between reassembly end and install start.
@@ -1515,8 +1725,10 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     tasks,
     benchDays,
     finishDays,
-    newBenchFreeSlot,
-    newFinishingFreeSlot,
+    benchInterval,
+    benchWasPinned,
+    finishingInterval,
+    finishWasPinned,
     installer,
     secondaryInstaller,
     installerBooking: { start: installSeq[0], end: installEnd, jobName: job.name },
@@ -1553,10 +1765,9 @@ function findBestSlot(hypoJob, existingJobs, holidays, settings, options = {}) {
   const { scheduled } = scheduleJobs(existingJobs, holidays, settings);
 
   // Build state snapshot from scheduled jobs
-  const startSlot = { date: parseISO(settings.startDate), halfStart: 0 };
   const state = {
-    benchFreeSlot: startSlot,
-    finishingFreeSlot: startSlot,
+    benchOccupied: [],
+    finishingOccupied: [],
     installerSchedules: {},
     installBookings: [],
     vanBookings: [],
@@ -1568,11 +1779,11 @@ function findBestSlot(hypoJob, existingJobs, holidays, settings, options = {}) {
     const benchTask = job.tasks.find(t => t.stage === "bench");
     const finishTask = job.tasks.find(t => t.stage === "finishing");
     const installTask = job.tasks.find(t => t.stage === "install");
-    if (benchTask?.endSlot && compareHalfSlot(benchTask.endSlot, state.benchFreeSlot) > 0) {
-      state.benchFreeSlot = benchTask.endSlot;
+    if (benchTask?.startSlot && benchTask?.endSlot) {
+      state.benchOccupied.push({ startSlot: benchTask.startSlot, endSlot: benchTask.endSlot, jobName: job.name, jobId: job.id });
     }
-    if (finishTask?.endSlot && compareHalfSlot(finishTask.endSlot, state.finishingFreeSlot) > 0) {
-      state.finishingFreeSlot = finishTask.endSlot;
+    if (finishTask?.startSlot && finishTask?.endSlot) {
+      state.finishingOccupied.push({ startSlot: finishTask.startSlot, endSlot: finishTask.endSlot, jobName: job.name, jobId: job.id });
     }
     if (installTask && installTask.installer) {
       state.installerSchedules[installTask.installer].push({
@@ -1657,16 +1868,23 @@ function findBestSlot(hypoJob, existingJobs, holidays, settings, options = {}) {
   };
 }
 
+function cloneSlot(slot) {
+  return { date: new Date(slot.date.getTime()), halfStart: slot.halfStart };
+}
+
+function cloneOccupied(occupied) {
+  return occupied.map(b => ({
+    startSlot: cloneSlot(b.startSlot),
+    endSlot: cloneSlot(b.endSlot),
+    jobName: b.jobName,
+    jobId: b.jobId,
+  }));
+}
+
 function deepCloneState(state) {
   return {
-    benchFreeSlot: {
-      date: new Date(state.benchFreeSlot.date.getTime()),
-      halfStart: state.benchFreeSlot.halfStart,
-    },
-    finishingFreeSlot: {
-      date: new Date(state.finishingFreeSlot.date.getTime()),
-      halfStart: state.finishingFreeSlot.halfStart,
-    },
+    benchOccupied: cloneOccupied(state.benchOccupied),
+    finishingOccupied: cloneOccupied(state.finishingOccupied),
     installerSchedules: Object.fromEntries(
       Object.entries(state.installerSchedules).map(([k, v]) => [
         k,
@@ -2307,14 +2525,20 @@ function App() {
           startDate={parseISO(settings.startDate)}
           holidays={holidaySet}
           fitterHolidays={settings.fitterHolidays || []}
-          onInstallDrag={(jobId, isoDate) => {
-            updateJob(jobId, { installOverride: isoDate });
+          onStageDrag={(jobId, stage, isoDate) => {
+            const cfg = DRAGGABLE_STAGES[stage];
+            if (!cfg) return;
+            updateJob(jobId, { [cfg.dateField]: isoDate });
           }}
-          onClearOverride={(jobId) => {
-            updateJob(jobId, { installOverride: "" });
+          onStageResize={(jobId, stage, days) => {
+            const cfg = DRAGGABLE_STAGES[stage];
+            if (!cfg) return;
+            updateJob(jobId, { [cfg.daysField]: days });
           }}
-          onInstallResize={(jobId, days) => {
-            updateJob(jobId, { installDaysOverride: days });
+          onStageReset={(jobId, stage) => {
+            const cfg = DRAGGABLE_STAGES[stage];
+            if (!cfg) return;
+            updateJob(jobId, { [cfg.dateField]: "", [cfg.daysField]: 0 });
           }}
           onToggleLock={(jobId, scheduledJob) => {
             // When locking: snapshot the current install date, duration, and fitter
@@ -2341,15 +2565,6 @@ function App() {
           }}
           onDeliveryDrag={(jobId, isoDate) => {
             updateJob(jobId, { deliveryDate: isoDate });
-          }}
-          onMachiningDrag={(jobId, isoDate) => {
-            updateJob(jobId, { machiningOverride: isoDate });
-          }}
-          onMachiningResize={(jobId, days) => {
-            updateJob(jobId, { machiningDaysOverride: days });
-          }}
-          onMachiningReset={(jobId) => {
-            updateJob(jobId, { machiningOverride: "", machiningDaysOverride: 0 });
           }}
         />
       </div>
@@ -2899,6 +3114,7 @@ function warningColorFor(type) {
     case "slip":               return "#c44a3a";
     case "buffer_tight":       return "#c47a2a"; // orange — buffer compressed
     case "buffer_too_tight":   return "#c44a3a"; // red — under minimum
+    case "bench_gap":          return "#8a6b3a"; // amber — routine, bell only
     case "load":
     case "install_load":       return "#8a6b3a"; // amber — info
     default:                   return "#555";
@@ -2916,6 +3132,7 @@ function warningLabelFor(type) {
     case "slip":               return "SLIP";
     case "buffer_tight":       return "BUFFER";
     case "buffer_too_tight":   return "BUFFER!";
+    case "bench_gap":          return "GAP";
     case "load":
     case "install_load":       return "LOAD";
     default:                   return "NOTE";
@@ -2964,6 +3181,44 @@ function JobRow({ job, isEditing, onSelect, onUpdate, onDelete }) {
       {isEditing && (
         <JobEditor job={job} onUpdate={onUpdate} onDelete={onDelete} />
       )}
+    </div>
+  );
+}
+
+// "Manually adjusted" panel shown under a stage's schedule fields when that
+// stage has a date and/or duration override set (from a Gantt drag/resize).
+// One "Reset to auto" button clears both fields for the stage. Shared across
+// machining, bench, finishing and reassembly — install has its own two
+// panels further down (differently styled, tied to the lock UI), so it
+// isn't folded in here.
+function OverridePanel({ stageLabel, job, onUpdate, dateField, daysField }) {
+  const dateVal = job[dateField];
+  const daysVal = job[daysField];
+  if (!dateVal && !(daysVal && daysVal > 0)) return null;
+  return (
+    <div style={{
+      marginTop: 6,
+      padding: "6px 10px",
+      background: "#fdfaf2",
+      border: "1px dashed #c89072",
+      borderRadius: 3,
+      fontSize: 10,
+      color: "#7a6a55",
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+    }}>
+      <span>
+        {stageLabel} manually adjusted
+        {dateVal && ` · starts ${fmtUK(parseISO(dateVal))}`}
+        {daysVal > 0 && ` · ${daysVal} day${daysVal === 1 ? "" : "s"}`}
+      </span>
+      <button
+        style={{ ...styles.btnGhost, padding: "3px 8px", fontSize: 10 }}
+        onClick={() => onUpdate({ [dateField]: "", [daysField]: 0 })}
+      >
+        Reset to auto
+      </button>
     </div>
   );
 }
@@ -3028,32 +3283,10 @@ function JobEditor({ job, onUpdate, onDelete }) {
             />
           </div>
         </div>
-        {(job.machiningOverride || (job.machiningDaysOverride && job.machiningDaysOverride > 0)) && (
-          <div style={{
-            marginTop: 6,
-            padding: "6px 10px",
-            background: "#fdfaf2",
-            border: "1px dashed #c89072",
-            borderRadius: 3,
-            fontSize: 10,
-            color: "#7a6a55",
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-          }}>
-            <span>
-              Machining manually adjusted
-              {job.machiningOverride && ` · starts ${fmtUK(parseISO(job.machiningOverride))}`}
-              {job.machiningDaysOverride > 0 && ` · ${job.machiningDaysOverride} day${job.machiningDaysOverride === 1 ? "" : "s"}`}
-            </span>
-            <button
-              style={{ ...styles.btnGhost, padding: "3px 8px", fontSize: 10 }}
-              onClick={() => onUpdate({ machiningOverride: "", machiningDaysOverride: 0 })}
-            >
-              Reset to auto
-            </button>
-          </div>
-        )}
+        <OverridePanel stageLabel="Machining" job={job} onUpdate={onUpdate} dateField="machiningOverride" daysField="machiningDaysOverride" />
+        <OverridePanel stageLabel="Bench" job={job} onUpdate={onUpdate} dateField="benchOverride" daysField="benchDaysOverride" />
+        <OverridePanel stageLabel="Finishing" job={job} onUpdate={onUpdate} dateField="finishingOverride" daysField="finishingDaysOverride" />
+        <OverridePanel stageLabel="Re-assembly" job={job} onUpdate={onUpdate} dateField="reassemblyOverride" daysField="reassemblyDaysOverride" />
         <div style={styles.row2}>
           <div style={styles.field}>
             <label style={styles.labelSm}>Installer</label>
@@ -3200,7 +3433,7 @@ function JobEditor({ job, onUpdate, onDelete }) {
 // GANTT VIEW
 // ============================================================
 
-function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, onClearOverride, onInstallResize, onToggleLock, onDeliveryDrag, onMachiningDrag, onMachiningResize, onMachiningReset }) {
+function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onStageResize, onStageReset, onToggleLock, onDeliveryDrag }) {
   const COL_WIDTH = 36;       // wider so day numbers are readable
   const HALF_WIDTH = COL_WIDTH / 2;
   const ROW_HEIGHT = 64;
@@ -3542,12 +3775,8 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, o
                   const isInstall = t.stage === "install";
                   const isTeamInstall = isInstall && t.installer === "Team";
                   const hasSecondary = isInstall && !isTeamInstall && t.secondaryInstaller && FITTER_CONFIG[t.secondaryInstaller];
-                  const isDraggingThis = dragState && dragState.jobId === job.id
-                    && ((isInstall && (dragState.stage === "install" || !dragState.stage))
-                        || (t.stage === "machining" && dragState.stage === "machining"));
-                  const isResizingThis = resizeState && resizeState.jobId === job.id
-                    && ((isInstall && (resizeState.stage === "install" || !resizeState.stage))
-                        || (t.stage === "machining" && resizeState.stage === "machining"));
+                  const isDraggingThis = dragState && dragState.jobId === job.id && dragState.stage === t.stage;
+                  const isResizingThis = resizeState && resizeState.jobId === job.id && resizeState.stage === t.stage;
                   const tooltip = `${STAGE_LABELS[t.stage]}: ${dayKey(t.start)}${t.days ? ` · ${t.days}d` : ""}${t.installer ? ` · ${t.installer === "Team" ? "Steve + Thompson + Chris" : t.installer}${hasSecondary ? " + " + t.secondaryInstaller : ""}` : ""}${t.siblingOf ? ` · parallel w/ ${t.siblingOf}` : ""}${isInstall ? " · drag to move, drag right edge to resize" : ""}`;
                   // Install bars coloured by fitter
                   let barColor;
@@ -3641,10 +3870,13 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, o
 
                   const out = [];
                   const isLocked = isInstall && !!job.locked;
+                  const stageCfg = DRAGGABLE_STAGES[t.stage];
+                  // Any draggable stage is interactive, except a locked install bar
+                  // (it stays pinned) and everything in read-only mode.
+                  const isDraggable = !IS_READONLY && !!stageCfg && !isLocked;
+                  const isResizable = isDraggable;
                   segs.forEach((seg, si) => {
                     const isLastSeg = si === segs.length - 1;
-                    const isMachiningStage = t.stage === "machining";
-                    const isDraggable = (isInstall && !isLocked) || isMachiningStage;
                     out.push(
                       <div
                         key={`${ti}-${si}`}
@@ -3659,20 +3891,16 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, o
                           boxShadow: isInstall
                             ? "0 1px 2px rgba(58,52,44,0.18)"
                             : "0 1px 0 rgba(58,52,44,0.12)",
-                          cursor: isInstall
-                            ? (isLocked ? "default" : "grab")
-                            : isMachiningStage ? "grab" : "default",
-                          outline: (isInstall && job.installOverride && !isLocked)
-                            ? "1px dashed rgba(58,52,44,0.4)"
-                            : (isMachiningStage && t.isOverridden)
+                          cursor: isDraggable ? "grab" : "default",
+                          outline: (t.isOverridden && !isLocked)
                             ? "1px dashed rgba(58,52,44,0.4)"
                             : "none",
                         }}
                         title={tooltip}
-                        onContextMenu={isMachiningStage && t.isOverridden ? (e) => {
+                        onContextMenu={(isDraggable && t.isOverridden) ? (e) => {
                           e.preventDefault();
-                          if (window.confirm("Reset machining to auto-calculated position and duration?")) {
-                            onMachiningReset && onMachiningReset(job.id);
+                          if (window.confirm(`Reset ${STAGE_LABELS[t.stage]} to auto-calculated position and duration?`)) {
+                            onStageReset && onStageReset(job.id, t.stage);
                           }
                         } : undefined}
                         onMouseDown={isDraggable ? (e) => {
@@ -3706,11 +3934,7 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, o
                             window.removeEventListener("mouseup", onUp);
                             setDragState(null);
                             if (lastDate && lastDate !== dayKey(t.start)) {
-                              if (isInstall) {
-                                onInstallDrag && onInstallDrag(job.id, lastDate);
-                              } else if (isMachiningStage) {
-                                onMachiningDrag && onMachiningDrag(job.id, lastDate);
-                              }
+                              onStageDrag && onStageDrag(job.id, t.stage, lastDate);
                             }
                           };
                           window.addEventListener("mousemove", onMove);
@@ -3757,8 +3981,7 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, o
                       );
                     }
 
-                    // Resize handle on the last segment (install when unlocked, OR machining anytime)
-                    const isResizable = (isInstall && !isLocked) || isMachiningStage;
+                    // Resize handle on the last segment only, for any draggable stage
                     if (isResizable && isLastSeg) {
                       out.push(
                         <div
@@ -3801,11 +4024,7 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, o
                               window.removeEventListener("mouseup", onUp);
                               setResizeState(null);
                               if (lastDays !== startDays) {
-                                if (isInstall) {
-                                  onInstallResize && onInstallResize(job.id, lastDays);
-                                } else if (isMachiningStage) {
-                                  onMachiningResize && onMachiningResize(job.id, lastDays);
-                                }
+                                onStageResize && onStageResize(job.id, t.stage, lastDays);
                               }
                             };
                             window.addEventListener("mousemove", onMove);
@@ -3843,8 +4062,10 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, o
                           title={isLocked
                             ? "Locked — click to unlock"
                             : "Lock this install (date, duration, fitter)"}
+                          disabled={IS_READONLY}
                           onClick={(e) => {
                             e.stopPropagation();
+                            if (IS_READONLY) return;
                             onToggleLock && onToggleLock(job.id, job);
                           }}
                         >
@@ -3882,13 +4103,13 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onInstallDrag, o
                           display: "flex",
                           alignItems: "center",
                           justifyContent: "center",
-                          cursor: "grab",
+                          cursor: IS_READONLY ? "default" : "grab",
                           zIndex: 6,
                           boxShadow: "0 1px 3px rgba(58,52,44,0.4)",
                           border: "1.5px solid #faf6ec",
                           opacity: isDraggingThisDel ? 0.85 : 1,
                         }}
-                        onMouseDown={(e) => {
+                        onMouseDown={IS_READONLY ? undefined : (e) => {
                           e.preventDefault();
                           e.stopPropagation();
                           const startX = e.clientX;
