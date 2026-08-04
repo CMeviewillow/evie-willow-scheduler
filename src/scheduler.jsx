@@ -1786,11 +1786,24 @@ function findBestSlot(hypoJob, existingJobs, holidays, settings, options = {}) {
       state.finishingOccupied.push({ startSlot: finishTask.startSlot, endSlot: finishTask.endSlot, jobName: job.name, jobId: job.id });
     }
     if (installTask && installTask.installer) {
-      state.installerSchedules[installTask.installer].push({
-        start: installTask.start,
-        end: installTask.end,
-        jobName: job.name,
-      });
+      // Team installs claim all three fitters, same as the live scheduling
+      // loop in scheduleJobs — installerSchedules has no "Team" key of its
+      // own, so indexing it directly would throw.
+      if (installTask.installer === "Team") {
+        FITTERS.forEach(f => {
+          state.installerSchedules[f].push({
+            start: installTask.start,
+            end: installTask.end,
+            jobName: job.name + " (team)",
+          });
+        });
+      } else if (state.installerSchedules[installTask.installer]) {
+        state.installerSchedules[installTask.installer].push({
+          start: installTask.start,
+          end: installTask.end,
+          jobName: job.name,
+        });
+      }
       state.installBookings.push({
         customer: customerFromJobName(job.name),
         jobName: job.name,
