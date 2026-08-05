@@ -215,6 +215,30 @@ function endFromStart(start, days, holidays) {
   return advanceHalfSlots(start, Math.round(days * 2), holidays);
 }
 
+// Step one half-slot backward through the same AM/PM sequence advanceHalfSlots
+// walks forward: PM -> AM (same day); AM -> PM of the previous working day,
+// unless that previous day is a Friday, which only has an AM slot.
+function retreatOneHalf(slot, holidays) {
+  if (slot.halfStart === 1) {
+    return { date: slot.date, halfStart: 0 };
+  }
+  let prev = addDays(slot.date, -1);
+  while (isWeekend(prev) || holidays.has(dayKey(prev))) prev = addDays(prev, -1);
+  return { date: prev, halfStart: prev.getDay() === 5 ? 0 : 1 };
+}
+
+// Retreat a fractional cursor by N half-day slots, skipping weekends/holidays.
+// Exact inverse of advanceHalfSlots: retreatHalfSlots(advanceHalfSlots(s, n), n)
+// returns s (for s already on a valid working slot), and vice versa. Used to
+// find the latest possible start for a duration that must END by a given point.
+function retreatHalfSlots(end, halvesToRetreat, holidays) {
+  let slot = { date: end.date, halfStart: end.halfStart };
+  for (let i = 0; i < halvesToRetreat; i++) {
+    slot = retreatOneHalf(slot, holidays);
+  }
+  return slot;
+}
+
 // Compare two half-slot positions: returns negative if a < b, positive if a > b, 0 if equal
 function compareHalfSlot(a, b) {
   const dk = a.date.getTime() - b.date.getTime();
@@ -471,6 +495,46 @@ function findFreeBenchSlot(afterSlot, halvesNeeded, occupied, holidays) {
     candidate = normalizeToWorkingSlot(block.endSlot, holidays); // jump past it
   }
   return candidate;
+}
+
+// Snap a half-slot to a valid working position by moving BACKWARD (earlier)
+// instead of forward — used when searching for the latest available slot at
+// or before a deadline, where snapping forward would violate the deadline.
+function normalizeToWorkingSlotBackward(slot, holidays) {
+  let { date, halfStart } = slot;
+  while (isWeekend(date) || holidays.has(dayKey(date))) {
+    date = addDays(date, -1);
+    halfStart = 0;
+  }
+  if (date.getDay() === 5 && halfStart === 1) halfStart = 0; // no Friday PM slot
+  return { date, halfStart };
+}
+
+// Backward mirror of findFreeBenchSlot: walk backward from beforeSlot and
+// return the LATEST half-slot at or before it where a run of `halvesNeeded`
+// consecutive working half-slots fits without overlapping anything in
+// `occupied`. Used to schedule jobs with slack "as late as safely possible"
+// instead of "as early as possible", so jobs with a distant deadline don't
+// needlessly claim near-term capacity that more urgent work could use.
+function findLatestFreeBenchSlot(beforeSlot, halvesNeeded, occupied, holidays) {
+  let candidateStart = normalizeToWorkingSlotBackward(beforeSlot, holidays);
+  // Descending by end: the block reaching latest into the future is checked
+  // first — clearing it also clears any block nested inside its range, and
+  // any block starting after it must have an even later end (so it would
+  // already have been sorted, and checked, before it).
+  const sorted = [...occupied].sort((a, b) => compareHalfSlot(b.endSlot, a.endSlot));
+  for (const block of sorted) {
+    const candidateEnd = advanceHalfSlots(candidateStart, halvesNeeded, holidays);
+    if (compareHalfSlot(block.startSlot, candidateEnd) >= 0) continue; // entirely ahead of us
+    if (compareHalfSlot(candidateStart, block.endSlot) >= 0) {
+      return candidateStart; // fits entirely after this block ends
+    }
+    // Overlaps — retreat so our window ends exactly when this block starts.
+    candidateStart = normalizeToWorkingSlotBackward(
+      retreatHalfSlots(block.startSlot, halvesNeeded, holidays), holidays
+    );
+  }
+  return candidateStart;
 }
 
 // ============================================================
@@ -839,7 +903,7 @@ function backwardFromInstall(installDate, benchDays, machiningDays, impact, holi
       if (!isWeekend(machiningStart) && !holidays.has(dayKey(machiningStart))) h--;
     }
   }
-  return machiningStart;
+  return { machiningStart, benchStart };
 }
 
 // Schedule a single job into the current state. Returns the tasks and updated state.
@@ -980,16 +1044,19 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     curStart = nextWorkingDay(curStart, holidays);
   }
 
-  // Bench - flows tight, one job after the next. Bench is the constrained
-  // resource; we want it 100% utilised. Unpinned jobs search for the earliest
-  // free slot across state.benchOccupied (which naturally fills gaps left by
-  // pinned jobs); pinned jobs (job.benchOverride) land on their fixed interval
-  // regardless of what else is going on.
+  // Bench - the constrained shared resource. Pinned jobs (job.benchOverride)
+  // land on their fixed interval regardless of what else is going on.
   //
-  // Workshop buffer (gap between reassembly end and install) absorbs any slack —
-  // if a job's production finishes early relative to its install date, the buffer
-  // just gets bigger. We don't push bench later to "tighten the buffer", and we
-  // never leave bench idle to absorb slack either.
+  // Everyone else claims the EARLIEST free slot by default — that's the safe,
+  // predictable behaviour, and it's what keeps every job's workshop buffer as
+  // generous as possible. The one exception: a job with a deadline that's
+  // MONTHS away doesn't need to claim near-term capacity just because it's
+  // next in the queue — that's capacity more urgent or flexible work could
+  // use. So we only defer to a backward/just-in-time slot when the job has
+  // SUBSTANTIAL slack (comfortably more than the ideal buffer needs); a job
+  // with only a few days of slack stays on the safe ASAP path unchanged,
+  // since eating into a small buffer for no real benefit just makes targets
+  // more fragile.
   const benchHalves = Math.round(benchDays * 2); // nominal cabinet-based duration
   const benchWasPinned = !!job.benchOverride;
   // Date and duration overrides are independent — a resize-only drag sets
@@ -997,16 +1064,34 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
   const benchActualHalves = (job.benchDaysOverride && job.benchDaysOverride > 0)
     ? Math.round(job.benchDaysOverride * 2)
     : benchHalves;
+  const earliestBenchSlot = { date: parseISO(settings.startDate), halfStart: 0 };
+  const SLACK_THRESHOLD_WORKING_DAYS = 15; // ~3 working weeks before deferral kicks in
   let benchStartSlot, benchEndSlot;
   if (benchWasPinned) {
     const interval = computeOverrideInterval(job.benchOverride, job.benchDaysOverride, benchDays, holidays);
     benchStartSlot = interval.startSlot;
     benchEndSlot = interval.endSlot;
   } else {
-    const earliestBenchSlot = { date: parseISO(settings.startDate), halfStart: 0 };
-    benchStartSlot = findFreeBenchSlot(earliestBenchSlot, benchActualHalves, state.benchOccupied, holidays);
-    benchEndSlot = advanceHalfSlots(benchStartSlot, benchActualHalves, holidays);
+    const asapSlot = findFreeBenchSlot(earliestBenchSlot, benchActualHalves, state.benchOccupied, holidays);
+    benchStartSlot = asapSlot;
+    if (pinnedInstallDate) {
+      const { benchStart: latestBenchStartDate } = backwardFromInstall(
+        pinnedInstallDate, benchDays, job.machiningDays || 1, impact, holidays, settings
+      );
+      const desiredLatestBenchStart = { date: latestBenchStartDate, halfStart: 0 };
+      const slackWorkingDays = workingDaysBetween(asapSlot.date, desiredLatestBenchStart.date, holidays);
+      if (slackWorkingDays >= SLACK_THRESHOLD_WORKING_DAYS) {
+        const latestSlot = findLatestFreeBenchSlot(desiredLatestBenchStart, benchActualHalves, state.benchOccupied, holidays);
+        // Only actually defer if the backward search landed later than ASAP —
+        // if congestion pushed it back to (or before) the ASAP slot anyway,
+        // there's no benefit, just use ASAP.
+        if (compareHalfSlot(latestSlot, asapSlot) > 0) {
+          benchStartSlot = latestSlot;
+        }
+      }
+    }
   }
+  benchEndSlot = advanceHalfSlots(benchStartSlot, benchActualHalves, holidays);
   const benchInterval = { startSlot: benchStartSlot, endSlot: benchEndSlot };
   tasks.push({
     stage: "bench",
