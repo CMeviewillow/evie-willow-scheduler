@@ -1923,11 +1923,7 @@ function deepCloneState(state) {
 function App() {
   const [jobs, setJobs] = useState([]);
   const [settings, setSettings] = useState({
-    // Scheduling anchor is always "today" plus this offset — never a frozen
-    // calendar date — so it self-corrects every day instead of going stale.
-    // Check-ins adjust the offset to reflect real production running ahead
-    // or behind plan; left alone, it just tracks today (offset 0).
-    startDateOffsetDays: 0,
+    startDate: fmtISO(new Date()),
     installDays: 5,
     dispatchGapDays: 1,
     templateDaysAfterInstall: 7,
@@ -2046,18 +2042,9 @@ function App() {
     return set;
   }, [settings.holidays]);
 
-  // The actual scheduling anchor: today plus the persisted offset, recomputed
-  // fresh every render so it never freezes at a stale date. This is what
-  // scheduleJobs/GanttView/WhatIfModal all use — never settings.startDate
-  // directly (that field is legacy and no longer read for scheduling).
-  const effectiveSettings = useMemo(() => ({
-    ...settings,
-    startDate: fmtISO(addDays(new Date(), settings.startDateOffsetDays || 0)),
-  }), [settings]);
-
   const { scheduled, warnings } = useMemo(
-    () => scheduleJobs(jobs, holidaySet, effectiveSettings),
-    [jobs, holidaySet, effectiveSettings]
+    () => scheduleJobs(jobs, holidaySet, settings),
+    [jobs, holidaySet, settings]
   );
 
   // Build warning fingerprints. A warning's identity = type + job + message,
@@ -2155,10 +2142,8 @@ function App() {
 
   // Apply a weekly real-world check-in. Given today's date and the job that's
   // currently on the bench, compute the offset between where the scheduler had
-  // that job and reality, then adjust startDateOffsetDays by that amount so
-  // every job slides forward (or back) by the same amount. The anchor still
-  // tracks today's real date every day after this — this just adds a
-  // persistent correction on top, it doesn't freeze anything.
+  // that job and reality, then shift the global startDate by that offset so
+  // every job slides forward (or back) by the same amount.
   const applyWeeklyUpdate = ({ benchJobId, machiningJobId }) => {
     if (!benchJobId && !machiningJobId) return;
     // Anchor on the bench job if given (more reliable), otherwise machining.
@@ -2183,9 +2168,10 @@ function App() {
       setSettings({ ...settings, lastUpdateDate: fmtISO(today) });
       return;
     }
+    const newStartDate = addDays(parseISO(settings.startDate), offset);
     setSettings({
       ...settings,
-      startDateOffsetDays: (settings.startDateOffsetDays || 0) + offset,
+      startDate: fmtISO(newStartDate),
       lastUpdateDate: fmtISO(today),
     });
   };
@@ -2304,7 +2290,7 @@ function App() {
     return { updates, unparsed };
   };
 
-  // Take parsed updates and apply them as a startDateOffsetDays adjustment.
+  // Take parsed updates and apply them as a startDate shift.
   // We use the FIRST update as the anchor (bench preferred, then machining).
   const applyParsedUpdates = (updates) => {
     if (!updates || updates.length === 0) return null;
@@ -2327,9 +2313,10 @@ function App() {
       setSettings({ ...settings, lastUpdateDate: fmtISO(today) });
       return { offset: 0, anchor };
     }
+    const newStartDate = addDays(parseISO(settings.startDate), offset);
     setSettings({
       ...settings,
-      startDateOffsetDays: (settings.startDateOffsetDays || 0) + offset,
+      startDate: fmtISO(newStartDate),
       lastUpdateDate: fmtISO(today),
     });
     return { offset, anchor };
@@ -2548,7 +2535,7 @@ function App() {
         />
         <GanttView
           jobs={scheduled}
-          startDate={parseISO(effectiveSettings.startDate)}
+          startDate={parseISO(settings.startDate)}
           holidays={holidaySet}
           fitterHolidays={settings.fitterHolidays || []}
           onStageDrag={(jobId, stage, isoDate) => {
@@ -2656,7 +2643,7 @@ function App() {
         <WhatIfModal
           existingJobs={jobs}
           holidays={holidaySet}
-          settings={effectiveSettings}
+          settings={settings}
           onClose={() => setShowWhatIf(false)}
           onConvertToJob={(hypoJob) => {
             setJobs([...jobs, hypoJob]);
@@ -4579,20 +4566,9 @@ function SettingsModal({ settings, setSettings, onClose }) {
             <input
               type="date"
               style={styles.input}
-              value={fmtISO(addDays(new Date(), settings.startDateOffsetDays || 0))}
-              onChange={e => {
-                const picked = parseISO(e.target.value);
-                const today = new Date();
-                today.setHours(0, 0, 0, 0);
-                picked.setHours(0, 0, 0, 0);
-                setSettings({ ...settings, startDateOffsetDays: diffDays(picked, today) });
-              }}
+              value={settings.startDate}
+              onChange={e => setSettings({ ...settings, startDate: e.target.value })}
             />
-            <div style={{ fontSize: 10, color: "#888", marginTop: 4 }}>
-              Always tracks today automatically — this only sets a one-off adjustment
-              on top (e.g. if production is running behind). Check-ins update this
-              same adjustment for you.
-            </div>
           </div>
           <div style={{ ...styles.field, padding: 8, background: "#0f0f0f", border: "1px solid #2a2a2a", fontSize: 10, color: "#888" }}>
             Install duration by cabinet count:<br/>
