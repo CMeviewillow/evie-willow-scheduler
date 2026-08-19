@@ -131,6 +131,19 @@ const diffDays = (a, b) => Math.round((a - b) / MS_DAY);
 const isWeekend = (d) => d.getDay() === 0 || d.getDay() === 6;
 const dayKey = (d) => fmtISO(d);
 
+// The most recent Monday-6:30am checkpoint at or before `now` — the weekly
+// gate for the floor board variance review. Monday itself before 6:30am
+// still resolves to the PREVIOUS week's checkpoint, since that week's hasn't
+// opened yet.
+function mostRecentMondayGate(now) {
+  const gate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 6, 30, 0, 0);
+  const dow = gate.getDay(); // 0 = Sun
+  const daysSinceMonday = dow === 0 ? 6 : dow - 1;
+  gate.setDate(gate.getDate() - daysSinceMonday);
+  if (gate > now) gate.setDate(gate.getDate() - 7);
+  return gate;
+}
+
 // Format a date as dd/mm/yy for UK display.
 const fmtUK = (d) => {
   if (!d) return "";
@@ -2452,8 +2465,20 @@ function App() {
   // recorded day). That job becomes the "anchor" for the SAME offset math
   // applyWeeklyUpdate already uses for the manual check-in — today vs. where
   // the scheduler currently has that job's bench start.
+  //
+  // Gated to once a week (Monday 6:30am) rather than continuous: a single
+  // rough day on the floor shouldn't nudge the whole schedule mid-week — this
+  // gives the workshop the rest of the week to catch back up on its own, and
+  // only asks "where are we" once, at the start of the next week.
   const varianceReview = useMemo(() => {
     const empty = { unreviewedDays: 0, anchorJobId: null, anchorJobName: "", offsetDays: 0, latestDate: null };
+    // Compare as plain ISO date strings (lastVarianceReviewDate has no time
+    // component) so a review actioned any time Monday closes the gate for
+    // the rest of that week, rather than re-opening later the same day.
+    const gateDate = fmtISO(mostRecentMondayGate(new Date()));
+    const gateOpen = !settings.lastVarianceReviewDate || settings.lastVarianceReviewDate < gateDate;
+    if (!gateOpen) return empty;
+
     const floorDates = Object.keys(floorActuals).sort();
     if (!floorDates.length) return empty;
     const unreviewed = floorDates.filter(d => !settings.lastVarianceReviewDate || d > settings.lastVarianceReviewDate);
@@ -3020,15 +3045,18 @@ function App() {
           review={varianceReview}
           preview={variancePreview}
           onAccept={() => {
+            // lastVarianceReviewDate records WHEN this week's check was
+            // actioned (closing the weekly gate) — asOfDate keeps the offset
+            // math anchored to the floor data actually being reviewed.
             applyWeeklyUpdate({
               benchJobId: varianceReview.anchorJobId,
               asOfDate: parseISO(varianceReview.latestDate),
-              extraSettings: { lastVarianceReviewDate: varianceReview.latestDate },
+              extraSettings: { lastVarianceReviewDate: fmtISO(new Date()) },
             });
             setShowVarianceReview(false);
           }}
           onDismiss={() => {
-            setSettings({ ...settings, lastVarianceReviewDate: varianceReview.latestDate });
+            setSettings({ ...settings, lastVarianceReviewDate: fmtISO(new Date()) });
             setShowVarianceReview(false);
           }}
           onClose={() => setShowVarianceReview(false)}
@@ -3097,7 +3125,7 @@ function Header({ onAddJob, onSettings, onWhatIf, onExport, onImport, jobCount, 
           </button>
         )}
         {varianceCount > 0 && (
-          <button style={styles.btnReminder} onClick={onShowVarianceReview} title="Floor board data to review">
+          <button style={styles.btnReminder} onClick={onShowVarianceReview} title="Weekly floor board review">
             <span style={{ fontSize: 13 }}>📊</span>
             <span style={{ marginLeft: 4 }}>{varianceCount}</span>
           </button>
