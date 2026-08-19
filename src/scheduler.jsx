@@ -6,6 +6,12 @@ import "./storage.js"; // installs window.storage backed by Supabase
 const IS_READONLY = typeof window !== "undefined"
   && new URLSearchParams(window.location.search).get("readonly") === "1";
 
+// Workshop floor board: a wall-mounted touchscreen view reached with
+// ?board=1 on the same URL, same pattern as ?readonly=1. No router here — it
+// isn't worth adding one for a second view.
+const IS_BOARD = typeof window !== "undefined"
+  && new URLSearchParams(window.location.search).get("board") === "1";
+
 // ============================================================
 // EVIE WILLOW WORKSHOP SCHEDULER
 // ============================================================
@@ -166,90 +172,126 @@ function workingDaysSeq(start, n, holidays) {
   return out;
 }
 
-// HALF-DAY MODEL
-// Bench/finishing/reassembly use half-day precision. We represent a fractional
-// position as { date: Date, halfStart: 0|1 } where 0 = AM (morning), 1 = PM (afternoon).
-// Each working day has 2 half-days. A 1.5-day job starting AM Monday occupies
-// Monday AM, Monday PM, Tuesday AM — and the next job can start Tuesday PM.
+// FRACTIONAL-DAY MODEL
+// Bench/finishing use continuous fractional-day precision. A position is
+// { date: Date, used: number }, where `used` is how much of that day's
+// capacity is already consumed (0 up to that day's capacity). A working day
+// is Mon-Thu 07:00-16:30 less 1h of breaks = 8.5h ("1.0" of a day); Friday is
+// 07:00-11:00 less the 10:00 break = 3.75h, i.e. a day with LESS capacity, not
+// a day that gets truncated in half. This lets two different jobs share the
+// same day at arbitrary fractions (4 oak cabinets at 0.8 of a day, then 2
+// painted cabinets filling the remaining 0.2) instead of rounding a job up to
+// the next half-day and leaving the remainder idle.
+const FULL_DAY_HOURS = 8.5;
+const FRIDAY_DAY_HOURS = 3.75;
+const FRIDAY_DAY_FRACTION = FRIDAY_DAY_HOURS / FULL_DAY_HOURS;
+const DAY_EPSILON = 1e-9;
 
-// Round a fractional day count to the nearest half-day (minimum 0.5)
-function roundToHalf(days) {
-  return Math.max(0.5, Math.round(days * 2) / 2);
+function dayCapacity(date) {
+  return date.getDay() === 5 ? FRIDAY_DAY_FRACTION : 1;
+}
+// Floating point add/subtract of day-fractions (cabinets/rate) drifts over a
+// long chain of jobs — round to a fixed precision after every arithmetic step
+// so that drift can't accumulate into a wrong day.
+function roundDay(x) {
+  return Math.round(x * 1e9) / 1e9;
 }
 
-// Advance a fractional cursor by N half-day slots, skipping weekends/holidays.
-// Fridays only have an AM slot (PM is not worked). Returns { date, halfStart }
-// representing the SLOT that starts after N halves.
-function advanceHalfSlots(start, halvesToAdvance, holidays) {
-  let date = nextWorkingDay(start.date, holidays);
-  let half = start.halfStart;
-  // If the start date itself was non-working, reset half to AM
-  if (dayKey(date) !== dayKey(start.date)) half = 0;
-  // If Friday and starting at PM, that's invalid — bump to next working day AM
-  if (date.getDay() === 5 && half === 1) {
-    date = addDays(date, 1);
-    date = nextWorkingDay(date, holidays);
-    half = 0;
+// Snap a position forward onto a valid working day, and roll over to the next
+// working day if `used` has already reached (or exceeded) capacity there.
+function normalizeToWorkingDay(slot, holidays) {
+  let { date, used } = slot;
+  const nwd = nextWorkingDay(date, holidays);
+  if (dayKey(nwd) !== dayKey(date)) {
+    date = nwd;
+    used = 0;
   }
-  for (let i = 0; i < halvesToAdvance; i++) {
-    if (half === 0) {
-      // From AM to PM — unless it's Friday (no PM slot), jump to next working day AM
-      if (date.getDay() === 5) {
-        date = addDays(date, 1);
-        date = nextWorkingDay(date, holidays);
-        half = 0;
-      } else {
-        half = 1;
-      }
+  if (used >= dayCapacity(date) - DAY_EPSILON) {
+    date = nextWorkingDay(addDays(date, 1), holidays);
+    used = 0;
+  }
+  return { date, used: roundDay(used) };
+}
+
+// Snap a position BACKWARD onto a valid working day — used when a desired
+// "latest start" lands on a weekend/holiday, where moving earlier is always
+// safe (never violates a deadline) but moving later would defeat the point.
+function normalizeToWorkingDayBackward(slot, holidays) {
+  let { date, used } = slot;
+  while (isWeekend(date) || holidays.has(dayKey(date))) {
+    date = addDays(date, -1);
+    used = 0;
+  }
+  return { date, used: roundDay(Math.min(used, dayCapacity(date))) };
+}
+
+// Advance a fractional cursor forward by `daysToAdvance` days of work,
+// skipping weekends/holidays and respecting Friday's reduced capacity.
+function advanceFractionalDay(start, daysToAdvance, holidays) {
+  let { date, used } = normalizeToWorkingDay(start, holidays);
+  let remaining = daysToAdvance;
+  while (remaining > DAY_EPSILON) {
+    const cap = dayCapacity(date);
+    const availableToday = cap - used;
+    if (availableToday <= DAY_EPSILON) {
+      date = nextWorkingDay(addDays(date, 1), holidays);
+      used = 0;
+      continue;
+    }
+    if (remaining <= availableToday + DAY_EPSILON) {
+      used = roundDay(used + remaining);
+      remaining = 0;
     } else {
-      half = 0;
-      date = addDays(date, 1);
-      date = nextWorkingDay(date, holidays);
+      remaining = roundDay(remaining - availableToday);
+      date = nextWorkingDay(addDays(date, 1), holidays);
+      used = 0;
     }
   }
-  return { date, halfStart: half };
+  return { date, used: roundDay(used) };
 }
 
-// Compute the fractional end position from a start, given a duration in days (0.5 increments)
+// Compute the fractional end position from a start, given a duration in days.
 function endFromStart(start, days, holidays) {
-  return advanceHalfSlots(start, Math.round(days * 2), holidays);
+  return advanceFractionalDay(start, days, holidays);
 }
 
-// Step one half-slot backward through the same AM/PM sequence advanceHalfSlots
-// walks forward: PM -> AM (same day); AM -> PM of the previous working day,
-// unless that previous day is a Friday, which only has an AM slot.
-function retreatOneHalf(slot, holidays) {
-  if (slot.halfStart === 1) {
-    return { date: slot.date, halfStart: 0 };
+// Retreat a fractional cursor backward by `daysToRetreat` days of work. Exact
+// inverse of advanceFractionalDay. Used to find the latest possible start for
+// a duration that must END by a given point (just-in-time / backward scheduling).
+function retreatFractionalDay(end, daysToRetreat, holidays) {
+  let { date, used } = end;
+  let remaining = daysToRetreat;
+  while (remaining > DAY_EPSILON) {
+    if (used <= DAY_EPSILON) {
+      date = addDays(date, -1);
+      while (isWeekend(date) || holidays.has(dayKey(date))) date = addDays(date, -1);
+      used = dayCapacity(date);
+      continue;
+    }
+    if (remaining <= used + DAY_EPSILON) {
+      used = roundDay(used - remaining);
+      remaining = 0;
+    } else {
+      remaining = roundDay(remaining - used);
+      used = 0;
+    }
   }
-  let prev = addDays(slot.date, -1);
-  while (isWeekend(prev) || holidays.has(dayKey(prev))) prev = addDays(prev, -1);
-  return { date: prev, halfStart: prev.getDay() === 5 ? 0 : 1 };
-}
-
-// Retreat a fractional cursor by N half-day slots, skipping weekends/holidays.
-// Exact inverse of advanceHalfSlots: retreatHalfSlots(advanceHalfSlots(s, n), n)
-// returns s (for s already on a valid working slot), and vice versa. Used to
-// find the latest possible start for a duration that must END by a given point.
-function retreatHalfSlots(end, halvesToRetreat, holidays) {
-  let slot = { date: end.date, halfStart: end.halfStart };
-  for (let i = 0; i < halvesToRetreat; i++) {
-    slot = retreatOneHalf(slot, holidays);
+  // Canonicalize: landing exactly at this day's full capacity is the same
+  // instant as the start of the next working day at used=0 — advance never
+  // returns the "full capacity" form, so retreat can't either, or the two
+  // would compare as different positions for what is really the same instant.
+  if (used >= dayCapacity(date) - DAY_EPSILON) {
+    date = nextWorkingDay(addDays(date, 1), holidays);
+    used = 0;
   }
-  return slot;
+  return { date, used: roundDay(used) };
 }
 
-// Compare two half-slot positions: returns negative if a < b, positive if a > b, 0 if equal
-function compareHalfSlot(a, b) {
+// Compare two fractional positions: negative if a < b, positive if a > b, 0 if equal.
+function compareFractionalSlot(a, b) {
   const dk = a.date.getTime() - b.date.getTime();
   if (dk !== 0) return dk;
-  return a.halfStart - b.halfStart;
-}
-
-// Convert a half-slot position to a Date for legacy code that needs it
-// (start of the AM if halfStart=0, midday if halfStart=1)
-function slotToDate(slot) {
-  return new Date(slot.date.getTime());
+  return a.used - b.used;
 }
 
 // Get the Monday of the week containing date d, formatted as ISO date string
@@ -314,6 +356,8 @@ function newJob() {
     notes: "",
     locked: false,           // if true, scheduler won't move it
     manualStart: "",         // optional manual start date (ISO)
+    colour: { name: "", hex: "" }, // paint/finish colour — floor board groups booth runs by this
+    boothRunId: "",          // jobs sprayed together to save a colour changeover (see booth-run warnings)
   };
 }
 
@@ -337,8 +381,9 @@ function featureImpact(features) {
 }
 
 // Convert cabinet mix into bench-days using each type's own rate.
-// Each cabinet type takes (count / rate) days. Mixed jobs add up.
-// Result is rounded to nearest half-day (minimum 0.5).
+// Each cabinet type takes (count / rate) days. Mixed jobs add up. Returns the
+// true fractional day count — no rounding to a half-day minimum, so a small
+// job doesn't force capacity to be wasted rounding it up.
 function benchDaysForJob(job) {
   let days = 0;
   for (const [type, count] of Object.entries(job.cabinets)) {
@@ -346,11 +391,163 @@ function benchDaysForJob(job) {
   }
   const impact = featureImpact(job.features);
   days += impact.perCabExtra;
-  return roundToHalf(days);
+  return roundDay(days);
 }
 
 function totalCabinets(job) {
   return Object.values(job.cabinets).reduce((a, b) => a + b, 0);
+}
+
+// ============================================================
+// DAY LAYOUT
+// ============================================================
+// The scheduler positions each stage as one interval per job — a start, an
+// end, a duration. That can't answer "what's on the bench Tuesday", which is
+// the question the floor board asks. The day layout is a by-product of the
+// same fractional-day fill used to position bench/finishing: walking each
+// job's cabinet mix, style by style, across the calendar produces exactly
+// the day-by-day breakdown the board needs, batches included for free (a
+// batch is simply whatever landed on one day).
+//
+// Padding only touches painted finishes — painted shaker and beaded shaker.
+// Oak and fluted/reeded pass straight through with no padding days at all.
+const PADDED_STYLES = ["painted_shaker", "beaded_shaker"];
+
+function cabinetEntriesFor(job) {
+  return Object.keys(CABINET_TYPES)
+    .map(style => ({ style, count: job.cabinets[style] || 0, rate: CABINET_TYPES[style].rate }))
+    .filter(e => e.count > 0);
+}
+
+// Walk a job's cabinet mix, style by style at that style's own rate, across a
+// fractional-day interval starting at `startSlot`. Returns
+// Map<dateKey, [{style, cabinets}]> — used for bench, finishing and
+// reassembly, which all run at real per-style rates and can share a day
+// across two different jobs.
+function dayLayoutForRatedInterval(startSlot, cabinetEntries, holidays) {
+  const byDate = new Map();
+  let cursor = normalizeToWorkingDay(startSlot, holidays);
+  for (const { style, count, rate } of cabinetEntries) {
+    let remaining = count;
+    while (remaining > DAY_EPSILON) {
+      const availableToday = dayCapacity(cursor.date) - cursor.used;
+      if (availableToday <= DAY_EPSILON) {
+        cursor = normalizeToWorkingDay({ date: nextWorkingDay(addDays(cursor.date, 1), holidays), used: 0 }, holidays);
+        continue;
+      }
+      const daysForRemaining = remaining / rate;
+      const daysConsumedToday = Math.min(daysForRemaining, availableToday);
+      const cabinetsToday = roundDay(daysConsumedToday * rate);
+      const k = dayKey(cursor.date);
+      if (!byDate.has(k)) byDate.set(k, []);
+      byDate.get(k).push({ style, cabinets: cabinetsToday });
+      remaining = roundDay(remaining - cabinetsToday);
+      cursor = advanceFractionalDay(cursor, daysConsumedToday, holidays);
+    }
+  }
+  return byDate;
+}
+
+// Machining has no per-style rate in the domain model — its duration is
+// matched to bench days or set by hand, not derived from cabinet counts. So
+// its day-by-day breakdown is simpler: divide the job's total cabinets evenly
+// across the block's whole days, carrying the same style mix each day.
+function dayLayoutForMachining(task, job, holidays) {
+  const byDate = new Map();
+  const entries = cabinetEntriesFor(job);
+  const totalCabs = entries.reduce((a, e) => a + e.count, 0);
+  if (totalCabs <= 0 || !task.days) return byDate;
+  const days = workingDaysSeq(addDays(task.start, -1), Math.ceil(task.days), holidays);
+  const perDayTotal = totalCabs / days.length;
+  days.forEach(d => {
+    byDate.set(dayKey(d), entries.map(e => ({
+      style: e.style,
+      cabinets: roundDay(perDayTotal * (e.count / totalCabs)),
+    })));
+  });
+  return byDate;
+}
+
+function mixFromEntries(entries) {
+  const mix = {};
+  (entries || []).forEach(e => { mix[e.style] = roundDay((mix[e.style] || 0) + e.cabinets); });
+  return mix;
+}
+
+// Build the full day layout: { dateKey: { stage: [{jobId,jobName,batch,cabinets,colour,mix}] } }.
+// Machining is split into "cnc" and "prep" for display (prep is the last
+// working day, leading into bench, exactly mirroring machining's own 3-day
+// lead on bench) and finishing into "spray" and "pad" (pad is whichever
+// painted-family cabinets land on a given finishing day) — both splits are
+// display-only, the scheduler itself still has one machining stage and one
+// finishing stage.
+function computeDayLayout(scheduled, holidays) {
+  const layout = {};
+  const addEntry = (dateKey, stage, entry) => {
+    if (!layout[dateKey]) layout[dateKey] = {};
+    if (!layout[dateKey][stage]) layout[dateKey][stage] = [];
+    layout[dateKey][stage].push(entry);
+  };
+
+  scheduled.forEach(job => {
+    if (!job.tasks?.length) return;
+    const entries = cabinetEntriesFor(job);
+    if (!entries.length) return;
+    const colour = job.colour || { name: "", hex: "" };
+
+    const benchTask = job.tasks.find(t => t.stage === "bench");
+    if (benchTask?.startSlot) {
+      const dl = dayLayoutForRatedInterval(benchTask.startSlot, entries, holidays);
+      let batch = 0;
+      [...dl.keys()].sort().forEach(k => {
+        batch++;
+        const dayEntries = dl.get(k);
+        const cabinets = Math.round(dayEntries.reduce((a, e) => a + e.cabinets, 0));
+        if (cabinets > 0) addEntry(k, "bench", { jobId: job.id, jobName: job.name, batch, cabinets, colour, mix: mixFromEntries(dayEntries) });
+      });
+    }
+
+    const machTask = job.tasks.find(t => t.stage === "machining");
+    if (machTask) {
+      const mdl = dayLayoutForMachining(machTask, job, holidays);
+      const keys = [...mdl.keys()].sort();
+      keys.forEach((k, i) => {
+        const isPrep = i === keys.length - 1; // last day leads into bench, umbrella'd under machining
+        const dayEntries = mdl.get(k);
+        const cabinets = Math.round(dayEntries.reduce((a, e) => a + e.cabinets, 0));
+        if (cabinets > 0) addEntry(k, isPrep ? "prep" : "cnc", { jobId: job.id, jobName: job.name, batch: i + 1, cabinets, colour, mix: mixFromEntries(dayEntries) });
+      });
+    }
+
+    const finishTask = job.tasks.find(t => t.stage === "finishing");
+    if (finishTask?.startSlot) {
+      const fdl = dayLayoutForRatedInterval(finishTask.startSlot, entries, holidays);
+      let batch = 0;
+      [...fdl.keys()].sort().forEach(k => {
+        batch++;
+        const dayEntries = fdl.get(k);
+        const padEntries = dayEntries.filter(e => PADDED_STYLES.includes(e.style));
+        const sprayCabinets = Math.round(dayEntries.reduce((a, e) => a + e.cabinets, 0));
+        const padCabinets = Math.round(padEntries.reduce((a, e) => a + e.cabinets, 0));
+        if (sprayCabinets > 0) addEntry(k, "spray", { jobId: job.id, jobName: job.name, batch, cabinets: sprayCabinets, colour, mix: mixFromEntries(dayEntries) });
+        if (padCabinets > 0) addEntry(k, "pad", { jobId: job.id, jobName: job.name, batch, cabinets: padCabinets, colour, mix: mixFromEntries(padEntries) });
+      });
+    }
+
+    const reasmTask = job.tasks.find(t => t.stage === "reassembly");
+    if (reasmTask?.startSlot) {
+      const rdl = dayLayoutForRatedInterval(reasmTask.startSlot, entries, holidays);
+      let batch = 0;
+      [...rdl.keys()].sort().forEach(k => {
+        batch++;
+        const dayEntries = rdl.get(k);
+        const cabinets = Math.round(dayEntries.reduce((a, e) => a + e.cabinets, 0));
+        if (cabinets > 0) addEntry(k, "reasm", { jobId: job.id, jobName: job.name, batch, cabinets, colour, mix: mixFromEntries(dayEntries) });
+      });
+    }
+  });
+
+  return layout;
 }
 
 // Extract customer name from a job name by stripping common trailing room-name suffixes.
@@ -444,94 +641,68 @@ function findEarliestInstallSlot(fitter, earliest, days, state, holidays, fitter
 // filling gaps rather than just queuing after the last thing scheduled.
 // ============================================================
 
-// Snap a half-slot to a valid working position: bump off weekends/holidays,
-// and off Friday PM (workshop stages don't run Friday afternoons).
-function normalizeToWorkingSlot(slot, holidays) {
-  let { date, halfStart } = slot;
-  if (dayKey(date) !== dayKey(nextWorkingDay(date, holidays))) {
-    date = nextWorkingDay(date, holidays);
-    halfStart = 0;
-  }
-  if (date.getDay() === 5 && halfStart === 1) {
-    date = nextWorkingDay(addDays(date, 1), holidays);
-    halfStart = 0;
-  }
-  return { date, halfStart };
-}
-
-// Do two half-slot intervals [aStart,aEnd) and [bStart,bEnd) overlap?
+// Do two fractional intervals [aStart,aEnd) and [bStart,bEnd) overlap?
 function slotsOverlap(aStart, aEnd, bStart, bEnd) {
-  return compareHalfSlot(aStart, bEnd) < 0 && compareHalfSlot(bStart, aEnd) < 0;
+  return compareFractionalSlot(aStart, bEnd) < 0 && compareFractionalSlot(bStart, aEnd) < 0;
 }
 
 // Compute the fixed {startSlot, endSlot} for a pinned (overridden) interval.
 // Pure — depends only on the job's own override fields, never on other jobs'
-// state — so pass 1 (pinning) and pass 2 (scheduling) always agree.
+// state — so pass 1 (pinning) and pass 2 (scheduling) always agree. An
+// override date always pins the START of a working day (used: 0) — you can
+// pin which day a stage starts, not which fraction of it it starts at.
 function computeOverrideInterval(overrideISO, daysOverride, autoDays, holidays) {
   const parsed = parseISO(overrideISO);
   const normDate = (isWeekend(parsed) || holidays.has(dayKey(parsed)))
     ? nextWorkingDay(parsed, holidays)
     : parsed;
-  const startSlot = normalizeToWorkingSlot({ date: normDate, halfStart: 0 }, holidays);
-  const halves = (daysOverride && daysOverride > 0) ? Math.round(daysOverride * 2) : Math.round(autoDays * 2);
-  const endSlot = advanceHalfSlots(startSlot, halves, holidays);
+  const startSlot = normalizeToWorkingDay({ date: normDate, used: 0 }, holidays);
+  const days = (daysOverride && daysOverride > 0) ? daysOverride : autoDays;
+  const endSlot = advanceFractionalDay(startSlot, days, holidays);
   return { startSlot, endSlot };
 }
 
-// Walk forward from afterSlot and return the first half-slot where a run of
-// `halvesNeeded` consecutive working half-slots fits without overlapping
-// anything in `occupied` ([{startSlot, endSlot}, ...]). Generic — reused for
-// both bench and finishing capacity, since both are single shared resources
-// with the same "no overlap, fill gaps" rule.
-function findFreeBenchSlot(afterSlot, halvesNeeded, occupied, holidays) {
-  let candidate = normalizeToWorkingSlot(afterSlot, holidays);
-  const sorted = [...occupied].sort((a, b) => compareHalfSlot(a.startSlot, b.startSlot));
+// Walk forward from afterSlot and return the first position where `daysNeeded`
+// days of work fit without overlapping anything in `occupied`
+// ([{startSlot, endSlot}, ...]). Generic — reused for both bench and finishing
+// capacity, since both are single shared resources with the same "no overlap,
+// fill gaps" rule.
+function findFreeBenchSlot(afterSlot, daysNeeded, occupied, holidays) {
+  let candidate = normalizeToWorkingDay(afterSlot, holidays);
+  const sorted = [...occupied].sort((a, b) => compareFractionalSlot(a.startSlot, b.startSlot));
   for (const block of sorted) {
-    if (compareHalfSlot(block.endSlot, candidate) <= 0) continue; // already behind us
-    const candidateEnd = advanceHalfSlots(candidate, halvesNeeded, holidays);
-    if (compareHalfSlot(candidateEnd, block.startSlot) <= 0) {
+    if (compareFractionalSlot(block.endSlot, candidate) <= 0) continue; // already behind us
+    const candidateEnd = advanceFractionalDay(candidate, daysNeeded, holidays);
+    if (compareFractionalSlot(candidateEnd, block.startSlot) <= 0) {
       return candidate; // fits entirely before this block
     }
-    candidate = normalizeToWorkingSlot(block.endSlot, holidays); // jump past it
+    candidate = normalizeToWorkingDay(block.endSlot, holidays); // jump past it
   }
   return candidate;
 }
 
-// Snap a half-slot to a valid working position by moving BACKWARD (earlier)
-// instead of forward — used when searching for the latest available slot at
-// or before a deadline, where snapping forward would violate the deadline.
-function normalizeToWorkingSlotBackward(slot, holidays) {
-  let { date, halfStart } = slot;
-  while (isWeekend(date) || holidays.has(dayKey(date))) {
-    date = addDays(date, -1);
-    halfStart = 0;
-  }
-  if (date.getDay() === 5 && halfStart === 1) halfStart = 0; // no Friday PM slot
-  return { date, halfStart };
-}
-
 // Backward mirror of findFreeBenchSlot: walk backward from beforeSlot and
-// return the LATEST half-slot at or before it where a run of `halvesNeeded`
-// consecutive working half-slots fits without overlapping anything in
-// `occupied`. Used to schedule jobs with slack "as late as safely possible"
-// instead of "as early as possible", so jobs with a distant deadline don't
-// needlessly claim near-term capacity that more urgent work could use.
-function findLatestFreeBenchSlot(beforeSlot, halvesNeeded, occupied, holidays) {
-  let candidateStart = normalizeToWorkingSlotBackward(beforeSlot, holidays);
+// return the LATEST position at or before it where `daysNeeded` days of work
+// fit without overlapping anything in `occupied`. Used to schedule jobs with
+// slack "as late as safely possible" instead of "as early as possible", so
+// jobs with a distant deadline don't needlessly claim near-term capacity that
+// more urgent work could use.
+function findLatestFreeBenchSlot(beforeSlot, daysNeeded, occupied, holidays) {
+  let candidateStart = normalizeToWorkingDayBackward(beforeSlot, holidays);
   // Descending by end: the block reaching latest into the future is checked
   // first — clearing it also clears any block nested inside its range, and
   // any block starting after it must have an even later end (so it would
   // already have been sorted, and checked, before it).
-  const sorted = [...occupied].sort((a, b) => compareHalfSlot(b.endSlot, a.endSlot));
+  const sorted = [...occupied].sort((a, b) => compareFractionalSlot(b.endSlot, a.endSlot));
   for (const block of sorted) {
-    const candidateEnd = advanceHalfSlots(candidateStart, halvesNeeded, holidays);
-    if (compareHalfSlot(block.startSlot, candidateEnd) >= 0) continue; // entirely ahead of us
-    if (compareHalfSlot(candidateStart, block.endSlot) >= 0) {
+    const candidateEnd = advanceFractionalDay(candidateStart, daysNeeded, holidays);
+    if (compareFractionalSlot(block.startSlot, candidateEnd) >= 0) continue; // entirely ahead of us
+    if (compareFractionalSlot(candidateStart, block.endSlot) >= 0) {
       return candidateStart; // fits entirely after this block ends
     }
     // Overlaps — retreat so our window ends exactly when this block starts.
-    candidateStart = normalizeToWorkingSlotBackward(
-      retreatHalfSlots(block.startSlot, halvesNeeded, holidays), holidays
+    candidateStart = normalizeToWorkingDayBackward(
+      retreatFractionalDay(block.startSlot, daysNeeded, holidays), holidays
     );
   }
   return candidateStart;
@@ -713,10 +884,10 @@ function scheduleJobs(jobs, holidays, settings) {
   // in what would otherwise be a wall-to-wall bench queue — routine notice,
   // bell only, never auto-pops.
   {
-    const sortedBench = [...state.benchOccupied].sort((a, b) => compareHalfSlot(a.startSlot, b.startSlot));
+    const sortedBench = [...state.benchOccupied].sort((a, b) => compareFractionalSlot(a.startSlot, b.startSlot));
     for (let i = 1; i < sortedBench.length; i++) {
       const prevEnd = sortedBench[i - 1].endSlot;
-      const prevEndDate = prevEnd.halfStart === 0 ? prevEnd.date : addDays(prevEnd.date, 1);
+      const prevEndDate = prevEnd.used <= DAY_EPSILON ? prevEnd.date : addDays(prevEnd.date, 1);
       const nextStartDate = sortedBench[i].startSlot.date;
       const gap = workingDaysBetween(prevEndDate, nextStartDate, holidays);
       if (gap >= 2) {
@@ -728,7 +899,45 @@ function scheduleJobs(jobs, holidays, settings) {
     }
   }
 
-  return { scheduled, warnings };
+  // Booth runs: jobs sprayed together to save a colour changeover. Warn if
+  // the grouping doesn't actually make sense — mismatched colours defeat the
+  // point, and installs too far apart just delays the earlier job for no
+  // reason. Routine notice, bell only, never auto-pops.
+  {
+    const boothGroups = {};
+    scheduled.forEach(job => {
+      if (job.boothRunId) {
+        (boothGroups[job.boothRunId] = boothGroups[job.boothRunId] || []).push(job);
+      }
+    });
+    Object.entries(boothGroups).forEach(([boothRunId, members]) => {
+      if (members.length < 2) return;
+      const colourKeys = new Set(members.map(j => `${j.colour?.hex || ""}|${j.colour?.name || ""}`));
+      if (colourKeys.size > 1) {
+        warnings.push({
+          type: "booth_run_mismatch",
+          message: `Booth run "${boothRunId}" pairs jobs with different colours: ${members.map(j => `${j.name} (${j.colour?.name || "no colour set"})`).join(", ")}`,
+        });
+      }
+      const installStarts = members
+        .map(j => j.tasks?.find(t => t.stage === "install"))
+        .filter(Boolean)
+        .map(t => t.start);
+      if (installStarts.length >= 2) {
+        const minD = new Date(Math.min(...installStarts.map(d => d.getTime())));
+        const maxD = new Date(Math.max(...installStarts.map(d => d.getTime())));
+        const spreadDays = workingDaysBetween(minD, maxD, holidays);
+        if (spreadDays > 14) {
+          warnings.push({
+            type: "booth_run_mismatch",
+            message: `Booth run "${boothRunId}" installs are ${spreadDays} working days apart (${members.map(j => j.name).join(", ")}) — more than the 14-day pairing window`,
+          });
+        }
+      }
+    });
+  }
+
+  return { scheduled, warnings, dayLayout: computeDayLayout(scheduled, holidays) };
 }
 
 // Given a target install ISO date, return the Monday of that week.
@@ -864,19 +1073,12 @@ function backwardFromInstall(installDate, benchDays, machiningDays, impact, holi
     d = addDays(d, -1);
     if (!isWeekend(d) && !holidays.has(dayKey(d))) stepped++;
   }
-  // d is now the reassembly-end date. Reassembly takes benchDays (in half-days).
-  // Step back benchDays working days (approximating half-days as partial days, but
-  // for scheduling the machining start day we can treat it in whole-day increments).
+  // d is now the reassembly-end date. Reassembly takes benchDays (fractional,
+  // at bench's own pace) — retreat that far using the same fractional-day
+  // stepping the real schedule uses, so this stays exact instead of
+  // approximating fractional days as whole ones.
   const reassemblyEndDate = d;
-  let reassemblyStart = d;
-  let halvesBack = Math.round(benchDays * 2);
-  while (halvesBack > 0) {
-    reassemblyStart = addDays(reassemblyStart, -1);
-    if (!isWeekend(reassemblyStart) && !holidays.has(dayKey(reassemblyStart))) {
-      // Each working day contributes 2 halves (Fri only 1)
-      halvesBack -= (reassemblyStart.getDay() === 5 ? 1 : 2);
-    }
-  }
+  const reassemblyStart = retreatFractionalDay({ date: d, used: 0 }, benchDays, holidays).date;
   // Reassembly starts 1 working day after finishing starts → finishing starts 1 WD earlier
   let finishStart = reassemblyStart;
   finishStart = addDays(finishStart, -1);
@@ -1057,14 +1259,13 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
   // with only a few days of slack stays on the safe ASAP path unchanged,
   // since eating into a small buffer for no real benefit just makes targets
   // more fragile.
-  const benchHalves = Math.round(benchDays * 2); // nominal cabinet-based duration
   const benchWasPinned = !!job.benchOverride;
   // Date and duration overrides are independent — a resize-only drag sets
   // benchDaysOverride with no benchOverride date, and must still apply.
-  const benchActualHalves = (job.benchDaysOverride && job.benchDaysOverride > 0)
-    ? Math.round(job.benchDaysOverride * 2)
-    : benchHalves;
-  const earliestBenchSlot = { date: parseISO(settings.startDate), halfStart: 0 };
+  const benchActualDays = (job.benchDaysOverride && job.benchDaysOverride > 0)
+    ? job.benchDaysOverride
+    : benchDays;
+  const earliestBenchSlot = { date: parseISO(settings.startDate), used: 0 };
   const SLACK_THRESHOLD_WORKING_DAYS = 15; // ~3 working weeks before deferral kicks in
   let benchStartSlot, benchEndSlot;
   if (benchWasPinned) {
@@ -1072,34 +1273,34 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     benchStartSlot = interval.startSlot;
     benchEndSlot = interval.endSlot;
   } else {
-    const asapSlot = findFreeBenchSlot(earliestBenchSlot, benchActualHalves, state.benchOccupied, holidays);
+    const asapSlot = findFreeBenchSlot(earliestBenchSlot, benchActualDays, state.benchOccupied, holidays);
     benchStartSlot = asapSlot;
     if (pinnedInstallDate) {
       const { benchStart: latestBenchStartDate } = backwardFromInstall(
         pinnedInstallDate, benchDays, job.machiningDays || 1, impact, holidays, settings
       );
-      const desiredLatestBenchStart = { date: latestBenchStartDate, halfStart: 0 };
+      const desiredLatestBenchStart = { date: latestBenchStartDate, used: 0 };
       const slackWorkingDays = workingDaysBetween(asapSlot.date, desiredLatestBenchStart.date, holidays);
       if (slackWorkingDays >= SLACK_THRESHOLD_WORKING_DAYS) {
-        const latestSlot = findLatestFreeBenchSlot(desiredLatestBenchStart, benchActualHalves, state.benchOccupied, holidays);
+        const latestSlot = findLatestFreeBenchSlot(desiredLatestBenchStart, benchActualDays, state.benchOccupied, holidays);
         // Only actually defer if the backward search landed later than ASAP —
         // if congestion pushed it back to (or before) the ASAP slot anyway,
         // there's no benefit, just use ASAP.
-        if (compareHalfSlot(latestSlot, asapSlot) > 0) {
+        if (compareFractionalSlot(latestSlot, asapSlot) > 0) {
           benchStartSlot = latestSlot;
         }
       }
     }
   }
-  benchEndSlot = advanceHalfSlots(benchStartSlot, benchActualHalves, holidays);
+  benchEndSlot = advanceFractionalDay(benchStartSlot, benchActualDays, holidays);
   const benchInterval = { startSlot: benchStartSlot, endSlot: benchEndSlot };
   tasks.push({
     stage: "bench",
     start: benchStartSlot.date,
-    end: addDays(benchEndSlot.date, benchEndSlot.halfStart === 0 ? 0 : 1),
+    end: addDays(benchEndSlot.date, benchEndSlot.used <= DAY_EPSILON ? 0 : 1),
     startSlot: benchStartSlot,
     endSlot: benchEndSlot,
-    days: benchActualHalves / 2,
+    days: benchActualDays,
     isOverridden: !!(job.benchOverride || (job.benchDaysOverride && job.benchDaysOverride > 0)),
   });
 
@@ -1180,16 +1381,15 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
   // AM, finishing starts Tue AM — unless finishing capacity (state.finishingOccupied)
   // is busy there, in which case it's pushed forward to the next free slot.
   // Pinned jobs (job.finishingOverride) land on their fixed interval instead.
-  const finishHalves = Math.round(finishDays * 2); // nominal duration
   const finishWasPinned = !!job.finishingOverride;
   // Date and duration overrides are independent — a resize-only drag sets
   // finishingDaysOverride with no finishingOverride date, and must still apply.
-  const finishActualHalves = (job.finishingDaysOverride && job.finishingDaysOverride > 0)
-    ? Math.round(job.finishingDaysOverride * 2)
-    : finishHalves;
+  const finishActualDays = (job.finishingDaysOverride && job.finishingDaysOverride > 0)
+    ? job.finishingDaysOverride
+    : finishDays;
   const desiredFinishStart = {
     date: nextWorkingDay(addDays(benchStartSlot.date, 1), holidays),
-    halfStart: 0,
+    used: 0,
   };
   let finishStartSlot, finishEndSlot;
   let finishingPushed = false;
@@ -1197,7 +1397,7 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     const interval = computeOverrideInterval(job.finishingOverride, job.finishingDaysOverride, finishDays, holidays);
     finishStartSlot = interval.startSlot;
     finishEndSlot = interval.endSlot;
-    if (compareHalfSlot(finishStartSlot, benchStartSlot) < 0) {
+    if (compareFractionalSlot(finishStartSlot, benchStartSlot) < 0) {
       warnings.push({
         jobId: job.id,
         jobName: job.name,
@@ -1206,8 +1406,8 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
       });
     }
   } else {
-    finishStartSlot = findFreeBenchSlot(desiredFinishStart, finishActualHalves, state.finishingOccupied, holidays);
-    if (compareHalfSlot(finishStartSlot, desiredFinishStart) > 0) {
+    finishStartSlot = findFreeBenchSlot(desiredFinishStart, finishActualDays, state.finishingOccupied, holidays);
+    if (compareFractionalSlot(finishStartSlot, desiredFinishStart) > 0) {
       finishingPushed = true;
       // Only warn if the push actually moves to a different day
       if (dayKey(finishStartSlot.date) !== dayKey(desiredFinishStart.date)) {
@@ -1219,40 +1419,40 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
         });
       }
     }
-    finishEndSlot = advanceHalfSlots(finishStartSlot, finishActualHalves, holidays);
+    finishEndSlot = advanceFractionalDay(finishStartSlot, finishActualDays, holidays);
   }
   const finishingInterval = { startSlot: finishStartSlot, endSlot: finishEndSlot };
   tasks.push({
     stage: "finishing",
     start: finishStartSlot.date,
-    end: addDays(finishEndSlot.date, finishEndSlot.halfStart === 0 ? 0 : 1),
+    end: addDays(finishEndSlot.date, finishEndSlot.used <= DAY_EPSILON ? 0 : 1),
     startSlot: finishStartSlot,
     endSlot: finishEndSlot,
-    days: finishActualHalves / 2,
+    days: finishActualDays,
     isOverridden: !!(job.finishingOverride || (job.finishingDaysOverride && job.finishingDaysOverride > 0)),
   });
 
-  // Re-assembly - starts 1 day after finishing starts, runs same length as bench
-  // (its nominal, cabinet-based length — not whatever bench's own override says).
-  // Has its own capacity (parallel resource, doesn't gate on others), so unlike
-  // bench/finishing there's no shared occupied-interval search — pinning just
-  // fixes this one job's own reassembly in place.
+  // Re-assembly - starts 1 day after finishing starts, runs at the same pace
+  // as bench (its nominal, cabinet-based length — not whatever bench's own
+  // override says). Has its own capacity (parallel resource, doesn't gate on
+  // others), so unlike bench/finishing there's no shared occupied-interval
+  // search — pinning just fixes this one job's own reassembly in place.
   const reassemblyWasPinned = !!job.reassemblyOverride;
   // Date and duration overrides are independent — a resize-only drag sets
   // reassemblyDaysOverride with no reassemblyOverride date, and must still apply.
-  const reassemblyActualHalves = (job.reassemblyDaysOverride && job.reassemblyDaysOverride > 0)
-    ? Math.round(job.reassemblyDaysOverride * 2)
-    : benchHalves;
+  const reassemblyActualDays = (job.reassemblyDaysOverride && job.reassemblyDaysOverride > 0)
+    ? job.reassemblyDaysOverride
+    : benchDays;
   const desiredReassemblyStart = {
     date: nextWorkingDay(addDays(finishStartSlot.date, 1), holidays),
-    halfStart: 0,
+    used: 0,
   };
   let reassemblyStartSlot, reassemblyEndSlot;
   if (reassemblyWasPinned) {
     const interval = computeOverrideInterval(job.reassemblyOverride, job.reassemblyDaysOverride, benchDays, holidays);
     reassemblyStartSlot = interval.startSlot;
     reassemblyEndSlot = interval.endSlot;
-    if (compareHalfSlot(reassemblyStartSlot, finishStartSlot) < 0) {
+    if (compareFractionalSlot(reassemblyStartSlot, finishStartSlot) < 0) {
       warnings.push({
         jobId: job.id,
         jobName: job.name,
@@ -1262,19 +1462,19 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     }
   } else {
     reassemblyStartSlot = desiredReassemblyStart;
-    reassemblyEndSlot = advanceHalfSlots(reassemblyStartSlot, reassemblyActualHalves, holidays);
+    reassemblyEndSlot = advanceFractionalDay(reassemblyStartSlot, reassemblyActualDays, holidays);
   }
   // The "fully fitted" date is when re-assembly ends — used as anchor for install
-  const reassemblyEndDate = reassemblyEndSlot.halfStart === 0
+  const reassemblyEndDate = reassemblyEndSlot.used <= DAY_EPSILON
     ? reassemblyEndSlot.date            // ended at end of previous day, so this is the next day
-    : addDays(reassemblyEndSlot.date, 1); // ended PM, so next day is when it's complete
+    : addDays(reassemblyEndSlot.date, 1); // still occupies part of this day, so next day is when it's complete
   tasks.push({
     stage: "reassembly",
     start: reassemblyStartSlot.date,
-    end: addDays(reassemblyEndSlot.date, reassemblyEndSlot.halfStart === 0 ? 0 : 1),
+    end: addDays(reassemblyEndSlot.date, reassemblyEndSlot.used <= DAY_EPSILON ? 0 : 1),
     startSlot: reassemblyStartSlot,
     endSlot: reassemblyEndSlot,
-    days: reassemblyActualHalves / 2,
+    days: reassemblyActualDays,
     isOverridden: !!(job.reassemblyOverride || (job.reassemblyDaysOverride && job.reassemblyDaysOverride > 0)),
   });
 
@@ -1967,7 +2167,7 @@ function findBestSlot(hypoJob, existingJobs, holidays, settings, options = {}) {
 }
 
 function cloneSlot(slot) {
-  return { date: new Date(slot.date.getTime()), halfStart: slot.halfStart };
+  return { date: new Date(slot.date.getTime()), used: slot.used };
 }
 
 function cloneOccupied(occupied) {
@@ -2018,7 +2218,10 @@ function App() {
     holidays: [], // array of ISO dates (workshop closures - all fitters/workshop)
     fitterHolidays: [], // array of { id, fitter, start, end, note? }
     lastUpdateDate: "", // ISO date of last weekly real-world check-in
+    lastVarianceReviewDate: "", // ISO date the floor-board variance was last reviewed/accepted
   });
+  const [floorActuals, setFloorActuals] = useState({}); // { "YYYY-MM-DD": {stage: {jobId: count}, offPlan: [...]} }
+  const [showVarianceReview, setShowVarianceReview] = useState(false);
   const [editingJobId, setEditingJobId] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showWhatIf, setShowWhatIf] = useState(false);
@@ -2042,6 +2245,24 @@ function App() {
     try { const s = await window.storage.get("ew-settings"); if (s?.value) setSettings(JSON.parse(s.value)); } catch {}
     try { const r = await window.storage.get("ew-dismissed-reminders"); if (r?.value) setDismissedReminders(JSON.parse(r.value)); } catch {}
     try { const w = await window.storage.get("ew-dismissed-warnings"); if (w?.value) setDismissedWarnings(JSON.parse(w.value)); } catch {}
+    await loadFloorActuals();
+  };
+
+  // Pull every floor:YYYY-MM-DD record (the floor board's daily tap counts) —
+  // excluding the floor:wtd: week-to-date keys, which aren't per-day actuals.
+  const loadFloorActuals = async () => {
+    try {
+      const listing = await window.storage.list("floor:");
+      const dayKeys = (listing?.keys || []).filter(k => k.startsWith("floor:") && !k.startsWith("floor:wtd:"));
+      const entries = {};
+      for (const k of dayKeys) {
+        try {
+          const r = await window.storage.get(k);
+          if (r?.value) entries[k.slice("floor:".length)] = JSON.parse(r.value);
+        } catch {}
+      }
+      setFloorActuals(entries);
+    } catch {}
   };
 
   // Wrap window.storage.set so it always records lastWriteAt (used by realtime
@@ -2127,7 +2348,7 @@ function App() {
     return set;
   }, [settings.holidays]);
 
-  const { scheduled, warnings } = useMemo(
+  const { scheduled, warnings, dayLayout } = useMemo(
     () => scheduleJobs(jobs, holidaySet, settings),
     [jobs, holidaySet, settings]
   );
@@ -2225,17 +2446,92 @@ function App() {
     }
   }, [loading, activeReminders.length]);
 
+  // Figure out whether the floor board has recorded anything since the last
+  // variance review, and if so, which job it says was actually on the bench
+  // most recently (the one with the most tapped cabinets on the latest
+  // recorded day). That job becomes the "anchor" for the SAME offset math
+  // applyWeeklyUpdate already uses for the manual check-in — today vs. where
+  // the scheduler currently has that job's bench start.
+  const varianceReview = useMemo(() => {
+    const empty = { unreviewedDays: 0, anchorJobId: null, anchorJobName: "", offsetDays: 0, latestDate: null };
+    const floorDates = Object.keys(floorActuals).sort();
+    if (!floorDates.length) return empty;
+    const unreviewed = floorDates.filter(d => !settings.lastVarianceReviewDate || d > settings.lastVarianceReviewDate);
+    if (!unreviewed.length) return empty;
+
+    const latestDate = unreviewed[unreviewed.length - 1];
+    const benchTaps = floorActuals[latestDate]?.bench || {};
+    let anchorJobId = null, anchorCount = -1;
+    Object.entries(benchTaps).forEach(([jobId, count]) => {
+      if (count > anchorCount) { anchorCount = count; anchorJobId = jobId; }
+    });
+    if (!anchorJobId) return { ...empty, unreviewedDays: unreviewed.length, latestDate };
+
+    const anchorJob = scheduled.find(j => j.id === anchorJobId);
+    const benchTask = anchorJob?.tasks?.find(t => t.stage === "bench");
+    if (!benchTask) return { ...empty, unreviewedDays: unreviewed.length, latestDate };
+
+    const latest = parseISO(latestDate);
+    latest.setHours(0, 0, 0, 0);
+    const schedOnly = new Date(benchTask.start.getTime());
+    schedOnly.setHours(0, 0, 0, 0);
+    const offsetDays = diffDays(latest, schedOnly);
+
+    return { unreviewedDays: unreviewed.length, anchorJobId, anchorJobName: anchorJob.name, offsetDays, latestDate };
+  }, [floorActuals, settings.lastVarianceReviewDate, scheduled]);
+
+  // Only worth surfacing if there's an actual mismatch to look at — floor
+  // data that matches the plan exactly needs no review.
+  const varianceCount = (varianceReview.anchorJobId && varianceReview.offsetDays !== 0)
+    ? varianceReview.unreviewedDays
+    : 0;
+
+  // Dry-run preview of what accepting the variance would change: which jobs'
+  // install dates would move, and whether any NEW serious warnings would
+  // appear. Nothing here touches real state — it's a hypothetical scheduleJobs
+  // run purely for display, computed only while the review modal is open.
+  const variancePreview = useMemo(() => {
+    if (!showVarianceReview) return null;
+    if (!varianceReview.anchorJobId || varianceReview.offsetDays === 0) return null;
+    const newStartDate = fmtISO(addDays(parseISO(settings.startDate), varianceReview.offsetDays));
+    const hypothetical = scheduleJobs(jobs, holidaySet, { ...settings, startDate: newStartDate });
+
+    const moved = [];
+    hypothetical.scheduled.forEach(job => {
+      const before = scheduled.find(j => j.id === job.id);
+      const installBefore = before?.tasks?.find(t => t.stage === "install");
+      const installAfter = job.tasks?.find(t => t.stage === "install");
+      if (!installBefore || !installAfter) return;
+      const days = diffDays(installAfter.start, installBefore.start);
+      if (days !== 0) {
+        moved.push({ jobId: job.id, jobName: job.name, days, before: installBefore.start, after: installAfter.start });
+      }
+    });
+    moved.sort((a, b) => Math.abs(b.days) - Math.abs(a.days));
+
+    const beforeFP = new Set(warnings.filter(w => SERIOUS_WARNING_TYPES.has(w.type)).map(fingerprintFor));
+    const newSerious = hypothetical.warnings.filter(w =>
+      SERIOUS_WARNING_TYPES.has(w.type) && !beforeFP.has(fingerprintFor(w))
+    );
+
+    return { moved, newSerious, newStartDate };
+  }, [showVarianceReview, varianceReview, jobs, holidaySet, settings, scheduled, warnings]);
+
   // Apply a weekly real-world check-in. Given today's date and the job that's
   // currently on the bench, compute the offset between where the scheduler had
   // that job and reality, then shift the global startDate by that offset so
   // every job slides forward (or back) by the same amount.
-  const applyWeeklyUpdate = ({ benchJobId, machiningJobId }) => {
+  const applyWeeklyUpdate = ({ benchJobId, machiningJobId, asOfDate, extraSettings }) => {
     if (!benchJobId && !machiningJobId) return;
     // Anchor on the bench job if given (more reliable), otherwise machining.
     const anchorJobId = benchJobId || machiningJobId;
     const anchorJob = scheduled.find(j => j.id === anchorJobId);
     if (!anchorJob) return;
-    const today = new Date();
+    // "Today" defaults to right now (the manual check-in flow) — but the
+    // variance review passes the actual floor-board date it previewed
+    // against, so Accept applies exactly the offset that was shown, even if
+    // the review happens a day or two after the floor data was recorded.
+    const today = asOfDate ? new Date(asOfDate.getTime()) : new Date();
     today.setHours(0, 0, 0, 0);
     let scheduledStart;
     if (benchJobId) {
@@ -2250,7 +2546,7 @@ function App() {
     scheduledStart.setHours(0, 0, 0, 0);
     const offset = diffDays(today, scheduledStart);
     if (offset === 0) {
-      setSettings({ ...settings, lastUpdateDate: fmtISO(today) });
+      setSettings({ ...settings, lastUpdateDate: fmtISO(today), ...extraSettings });
       return;
     }
     const newStartDate = addDays(parseISO(settings.startDate), offset);
@@ -2258,6 +2554,7 @@ function App() {
       ...settings,
       startDate: fmtISO(newStartDate),
       lastUpdateDate: fmtISO(today),
+      ...extraSettings,
     });
   };
 
@@ -2469,6 +2766,10 @@ function App() {
     return <div style={styles.loading}>Loading workshop schedule…</div>;
   }
 
+  if (IS_BOARD) {
+    return <FloorBoard scheduled={scheduled} dayLayout={dayLayout} jobs={jobs} />;
+  }
+
   return (
     <div style={styles.app}>
       <Header
@@ -2484,6 +2785,8 @@ function App() {
         onShowReminders={() => setShowReminders(true)}
         onWeeklyUpdate={() => setShowWeeklyUpdate(true)}
         lastUpdateDate={settings.lastUpdateDate}
+        varianceCount={varianceCount}
+        onShowVarianceReview={() => setShowVarianceReview(true)}
       />
 
       {IS_READONLY && (
@@ -2712,6 +3015,26 @@ function App() {
         />
       )}
 
+      {showVarianceReview && (
+        <VarianceReviewModal
+          review={varianceReview}
+          preview={variancePreview}
+          onAccept={() => {
+            applyWeeklyUpdate({
+              benchJobId: varianceReview.anchorJobId,
+              asOfDate: parseISO(varianceReview.latestDate),
+              extraSettings: { lastVarianceReviewDate: varianceReview.latestDate },
+            });
+            setShowVarianceReview(false);
+          }}
+          onDismiss={() => {
+            setSettings({ ...settings, lastVarianceReviewDate: varianceReview.latestDate });
+            setShowVarianceReview(false);
+          }}
+          onClose={() => setShowVarianceReview(false)}
+        />
+      )}
+
       {exportText !== null && (
         <ExportTextModal text={exportText} onClose={() => setExportText(null)} />
       )}
@@ -2741,7 +3064,7 @@ function App() {
   );
 }
 
-function Header({ onAddJob, onSettings, onWhatIf, onExport, onImport, jobCount, warningCount, onShowWarnings, reminderCount, onShowReminders, onWeeklyUpdate, lastUpdateDate }) {
+function Header({ onAddJob, onSettings, onWhatIf, onExport, onImport, jobCount, warningCount, onShowWarnings, reminderCount, onShowReminders, onWeeklyUpdate, lastUpdateDate, varianceCount, onShowVarianceReview }) {
   const fileRef = useRef(null);
   // Show "needs check-in" hint if the last update was more than 7 days ago, or never
   const needsCheckin = (() => {
@@ -2771,6 +3094,12 @@ function Header({ onAddJob, onSettings, onWhatIf, onExport, onImport, jobCount, 
           <button style={styles.btnReminder} onClick={onShowReminders} title="Survey reminders">
             <span style={{ fontSize: 13 }}>📋</span>
             <span style={{ marginLeft: 4 }}>{reminderCount}</span>
+          </button>
+        )}
+        {varianceCount > 0 && (
+          <button style={styles.btnReminder} onClick={onShowVarianceReview} title="Floor board data to review">
+            <span style={{ fontSize: 13 }}>📊</span>
+            <span style={{ marginLeft: 4 }}>{varianceCount}</span>
           </button>
         )}
         {warningCount > 0 && (
@@ -2897,6 +3226,95 @@ function ExportTextModal({ text, onClose }) {
             <button style={{ ...styles.btnGhost, justifyContent: "center", padding: "9px 14px" }} onClick={onClose}>
               Close
             </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function VarianceReviewModal({ review, preview, onAccept, onDismiss, onClose }) {
+  const fmtShort = (d) => d ? d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }) : "—";
+  const latestLabel = review.latestDate ? fmtShort(parseISO(review.latestDate)) : "—";
+
+  return (
+    <div style={styles.modalOverlay} onClick={onClose}>
+      <div style={{ ...styles.modal, width: 560, maxHeight: "85vh" }} onClick={e => e.stopPropagation()}>
+        <div style={styles.modalHeader}>
+          <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 14 }}>📊</span>
+            Floor board variance
+          </span>
+          <button style={styles.iconBtn} onClick={onClose}><X size={14} /></button>
+        </div>
+        <div style={{ ...styles.modalBody, paddingTop: 12 }}>
+          {!review.anchorJobId ? (
+            <div style={{ fontSize: 12, color: "#7a6a55", lineHeight: 1.6 }}>
+              The floor board has recorded activity as of {latestLabel}, but nothing in it points to a specific job on the bench to compare against. Nothing to review.
+            </div>
+          ) : review.offsetDays === 0 ? (
+            <div style={{ fontSize: 12, color: "#7a6a55", lineHeight: 1.6 }}>
+              As of {latestLabel}, the floor board shows <strong>{review.anchorJobName}</strong> on the bench — exactly where the schedule already has it. No change needed.
+            </div>
+          ) : (
+            <>
+              <div style={{ fontSize: 12, color: "#3a342c", marginBottom: 10, lineHeight: 1.6 }}>
+                As of <strong>{latestLabel}</strong>, the floor board shows <strong>{review.anchorJobName}</strong> was the main job on the bench that day. The schedule has that job's bench starting{" "}
+                {review.offsetDays > 0
+                  ? <>{review.offsetDays} day{review.offsetDays === 1 ? "" : "s"} earlier than that</>
+                  : <>{Math.abs(review.offsetDays)} day{review.offsetDays === -1 ? "" : "s"} later than that</>}.
+              </div>
+              <div style={{ fontSize: 11, color: "#7a6a55", marginBottom: 16, lineHeight: 1.55 }}>
+                Accepting will shift the whole schedule {review.offsetDays > 0 ? "forward" : "back"} by {Math.abs(review.offsetDays)} day{Math.abs(review.offsetDays) === 1 ? "" : "s"} — same as a manual check-in, just anchored on what the floor actually taped in. Nothing changes until you press Accept.
+              </div>
+
+              {preview && (
+                <>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: "#3a342c", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                    What would move
+                  </div>
+                  {preview.moved.length === 0 ? (
+                    <div style={{ fontSize: 12, color: "#5a6e50", marginBottom: 14 }}>No install dates would move.</div>
+                  ) : (
+                    <div style={{ marginBottom: 14, maxHeight: 180, overflowY: "auto" }}>
+                      {preview.moved.map(m => (
+                        <div key={m.jobId} style={styles.warningItemRow}>
+                          <span style={{ flex: 1, fontSize: 12, color: "#3a342c" }}>{m.jobName}</span>
+                          <span style={{ fontSize: 11, color: "#7a6a55" }}>
+                            {fmtShort(m.before)} → {fmtShort(m.after)} ({m.days > 0 ? "+" : ""}{m.days}d)
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {preview.newSerious.length > 0 && (
+                    <div style={{ marginBottom: 14 }}>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: "#a5614f", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                        New warnings this would introduce
+                      </div>
+                      {preview.newSerious.map((w, i) => (
+                        <div key={i} style={styles.warningItemRow}>
+                          <span style={{ ...styles.warningTypeTag, background: warningColorFor(w.type) }}>
+                            {warningLabelFor(w.type)}
+                          </span>
+                          <span style={{ flex: 1, fontSize: 12, color: "#3a342c", lineHeight: 1.5 }}>{w.message}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
+            </>
+          )}
+
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 8 }}>
+            <button style={styles.btnGhost} onClick={onDismiss}>
+              {review.anchorJobId && review.offsetDays !== 0 ? "Not now" : "OK"}
+            </button>
+            {review.anchorJobId && review.offsetDays !== 0 && (
+              <button style={styles.btnPrimary} onClick={onAccept}>Accept &amp; shift schedule</button>
+            )}
           </div>
         </div>
       </div>
@@ -3213,6 +3631,7 @@ function warningColorFor(type) {
     case "buffer_tight":       return "#c47a2a"; // orange — buffer compressed
     case "buffer_too_tight":   return "#c44a3a"; // red — under minimum
     case "bench_gap":          return "#8a6b3a"; // amber — routine, bell only
+    case "booth_run_mismatch": return "#8a6b3a"; // amber — routine, bell only
     case "load":
     case "install_load":       return "#8a6b3a"; // amber — info
     default:                   return "#555";
@@ -3231,6 +3650,7 @@ function warningLabelFor(type) {
     case "buffer_tight":       return "BUFFER";
     case "buffer_too_tight":   return "BUFFER!";
     case "bench_gap":          return "GAP";
+    case "booth_run_mismatch": return "BOOTH";
     case "load":
     case "install_load":       return "LOAD";
     default:                   return "NOTE";
@@ -3352,6 +3772,39 @@ function JobEditor({ job, onUpdate, onDelete }) {
             />
           </div>
         ))}
+      </div>
+
+      <div style={styles.fieldGroup}>
+        <div style={styles.fieldGroupLabel}>Colour</div>
+        <div style={styles.row2}>
+          <div style={styles.field}>
+            <label style={styles.labelSm}>Name</label>
+            <input
+              style={styles.input}
+              value={job.colour?.name || ""}
+              onChange={e => onUpdate({ colour: { ...(job.colour || {}), name: e.target.value } })}
+              placeholder="e.g. Mizzle"
+            />
+          </div>
+          <div style={styles.field}>
+            <label style={styles.labelSm}>Swatch</label>
+            <input
+              type="color"
+              style={{ ...styles.input, padding: 2, height: 34 }}
+              value={job.colour?.hex || "#c9a961"}
+              onChange={e => onUpdate({ colour: { ...(job.colour || {}), hex: e.target.value } })}
+            />
+          </div>
+        </div>
+        <div style={styles.field}>
+          <label style={styles.labelSm}>Booth run (optional — jobs sprayed together)</label>
+          <input
+            style={styles.input}
+            value={job.boothRunId || ""}
+            onChange={e => onUpdate({ boothRunId: e.target.value })}
+            placeholder="e.g. same reference on both jobs to pair them"
+          />
+        </div>
       </div>
 
       <FeaturesEditor
@@ -3533,7 +3986,6 @@ function JobEditor({ job, onUpdate, onDelete }) {
 
 function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onStageResize, onStageReset, onToggleLock, onDeliveryDrag }) {
   const COL_WIDTH = 36;       // wider so day numbers are readable
-  const HALF_WIDTH = COL_WIDTH / 2;
   const ROW_HEIGHT = 64;
 
   // Drag state for install bar adjustment
@@ -3602,11 +4054,14 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
 
   const xFor = (date) => diffDays(date, ganttStart) * COL_WIDTH;
 
-  // Position bars using half-slot precision when available
+  // Position bars using fractional-day precision when available. `used` is a
+  // fraction of the FULL day (0 to that day's capacity), so it maps directly
+  // onto a proportional slice of the day's column width — a Friday bar simply
+  // never fills past ~0.44 of the column, reflecting its shorter capacity.
   const barLeftFor = (task) => {
     if (task.startSlot) {
       const dayOffset = diffDays(task.startSlot.date, ganttStart);
-      return dayOffset * COL_WIDTH + (task.startSlot.halfStart * HALF_WIDTH);
+      return dayOffset * COL_WIDTH + (task.startSlot.used * COL_WIDTH);
     }
     return xFor(task.start);
   };
@@ -3615,7 +4070,7 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
     if (task.startSlot && task.endSlot) {
       const left = barLeftFor(task);
       const endDayOffset = diffDays(task.endSlot.date, ganttStart);
-      const right = endDayOffset * COL_WIDTH + (task.endSlot.halfStart * HALF_WIDTH);
+      const right = endDayOffset * COL_WIDTH + (task.endSlot.used * COL_WIDTH);
       return Math.max(right - left - 1, 6);
     }
     // Whole-day tasks: use start→end span
@@ -3647,8 +4102,6 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
       const isFriday = cur.getDay() === 5 && !isNonWorking;
       const dayIdx = diffDays(cur, ganttStart);
       const dayLeft = dayIdx * COL_WIDTH;
-      const dayMid = dayLeft + COL_WIDTH / 2;
-      const dayRight = dayLeft + COL_WIDTH;
 
       if (isNonWorking) {
         // End any open segment just before this day
@@ -3660,12 +4113,11 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
           segStart = null;
         }
       } else if (isFriday && isWorkshop) {
-        // Workshop stages run Friday AM only. Open segment if needed, close at midday.
+        // Workshop stages close Friday at 11am (0.44 of a day), not midday.
         if (segStart === null) {
           segStart = Math.max(dayLeft, fullLeft);
         }
-        // Cap segment at Friday's mid-point (or fullRight if task ends earlier in AM)
-        const segEnd = Math.min(dayMid, fullRight);
+        const segEnd = Math.min(dayLeft + COL_WIDTH * FRIDAY_DAY_FRACTION, fullRight);
         if (segEnd > segStart) {
           segments.push({
             left: segStart,
@@ -5655,5 +6107,479 @@ const styles = {
     fontSize: 11,
   },
 };
+
+// ============================================================
+// WORKSHOP FLOOR BOARD (?board=1)
+// ============================================================
+// Reads today's plan from the day layout the scheduler already produces.
+// The floor taps a counter as cabinets clear each stage; those actuals write
+// straight to storage (debounced, shared) for the office to see, but never
+// touch a schedule date directly — see Part E (variance review) in the App
+// component for the reviewed, person-in-the-loop path back into production
+// dates. Install weeks are never touched by this board, full stop.
+
+// Build the morning brief the board reads: today's slice of the day layout,
+// renamed to the shape the board expects (`planned`, not `cabinets`), plus
+// the full job list for the "add another job" (off-plan) picker.
+function buildMorningBrief(scheduled, dayLayout, todayKey) {
+  const today = dayLayout[todayKey] || {};
+  const mapEntries = (arr) => (arr || []).map(e => ({
+    jobId: e.jobId, jobName: e.jobName, batch: e.batch, planned: e.cabinets, colour: e.colour, mix: e.mix,
+  }));
+  const stages = {
+    cnc: mapEntries(today.cnc),
+    prep: mapEntries(today.prep),
+    bench: mapEntries(today.bench),
+    spray: mapEntries(today.spray),
+    pad: mapEntries(today.pad),
+    reasm: mapEntries(today.reasm),
+  };
+  const allJobs = scheduled
+    .filter(j => j.name && totalCabinets(j) > 0)
+    .map(j => ({ jobId: j.id, jobName: j.name, batch: 1, planned: 0, colour: j.colour || { name: "", hex: "" }, mix: j.cabinets }));
+  return { stages, allJobs };
+}
+
+const FLOOR_BOARD_CSS = `
+  .floor-board-root{--linen:#f5f0e6; --panel:#faf6ec; --panel2:#fdfaf2;
+    --ink:#3a342c; --ink2:#7a6a55; --ink3:#9b8f7e;
+    --rule:#d9cfba; --rule2:#e8dfca;
+    --sage:#7a8b6f; --sage-bg:#ecf0e2;
+    --clay:#a5614f; --clay-bg:#f5e3dc;
+    --honey:#c9a961; --honey-bg:#f4ecd9;
+    --slate:#6e8794; --lav:#9c8aaa;
+    background:var(--linen);color:var(--ink);
+    font-family:Inter,-apple-system,'Segoe UI',sans-serif;-webkit-font-smoothing:antialiased;
+    min-height:100vh;}
+  .floor-board-root .serif{font-family:'Cormorant Garamond',Georgia,serif}
+  .floor-board-root .wrap{max-width:1880px;margin:0 auto;padding:20px 28px 32px}
+  .floor-board-root .top{display:flex;justify-content:space-between;align-items:flex-end;
+    border-bottom:1px solid var(--rule);padding-bottom:14px}
+  .floor-board-root .brand{font-size:30px;letter-spacing:.2em;font-weight:400}
+  .floor-board-root .sub{font-size:14px;color:var(--ink3);letter-spacing:.09em;font-style:italic;margin-top:4px}
+  .floor-board-root .today-date{font-size:26px;font-weight:500;text-align:right}
+  .floor-board-root .today-sub{font-size:13px;color:var(--ink2);letter-spacing:.08em;text-transform:uppercase;text-align:right;margin-top:3px}
+  .floor-board-root .pipe{display:flex;align-items:flex-end;gap:10px;margin:22px 0 20px}
+  .floor-board-root .pipe-seg{background:var(--panel);border:1px solid var(--rule);border-radius:4px;
+    padding:11px 13px 13px;flex:1;min-width:0}
+  .floor-board-root .pipe-name{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink2);font-weight:500}
+  .floor-board-root .pipe-cap{font-size:34px;font-weight:500;line-height:1.05;margin-top:5px}
+  .floor-board-root .pipe-cap span{font-size:14px;color:var(--ink2);letter-spacing:.05em;font-weight:400}
+  .floor-board-root .pipe-style{font-size:11px;color:var(--ink3);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .floor-board-root .weekstrip{display:flex;gap:14px;margin-bottom:24px}
+  .floor-board-root .wk{background:var(--panel);border:1px solid var(--rule);border-radius:6px;padding:14px 17px}
+  .floor-board-root .wk-num{font-size:38px;font-weight:500;line-height:1}
+  .floor-board-root .wk-lbl{font-size:13px;color:var(--ink2);margin-top:4px}
+  .floor-board-root .wk-note{font-size:12px;color:var(--ink3);margin-top:3px}
+  .floor-board-root .wk.behind{border-color:var(--clay);background:var(--clay-bg)}
+  .floor-board-root .wk.behind .wk-num{color:var(--clay)}
+  .floor-board-root h2.sec{font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:var(--ink3);
+    font-weight:600;margin:0 0 12px;font-family:Inter,sans-serif}
+  .floor-board-root .stages{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}
+  .floor-board-root .card{background:var(--panel);border:1px solid var(--rule);border-radius:6px;padding:15px 16px 17px}
+  .floor-board-root .card.done{background:var(--sage-bg);border-color:var(--sage)}
+  .floor-board-root .card.behind{background:var(--clay-bg);border-color:var(--clay)}
+  .floor-board-root .card-head{display:flex;justify-content:space-between;align-items:baseline}
+  .floor-board-root .card-name{font-size:16px;font-weight:500;letter-spacing:.02em}
+  .floor-board-root .card-tgt{font-size:12px;color:var(--ink2);letter-spacing:.06em}
+  .floor-board-root .chips{display:flex;flex-wrap:wrap;gap:7px;margin:8px 0 4px;min-height:26px}
+  .floor-board-root .chip{background:var(--panel2);border:1px solid var(--rule2);border-radius:4px;
+    padding:4px 8px;font-size:12px;color:var(--ink2);display:flex;align-items:center;gap:6px;
+    font-family:Inter,sans-serif;cursor:pointer;font-weight:400}
+  .floor-board-root .chip[aria-pressed="true"]{border:2px solid var(--ink);background:#fff;color:var(--ink);padding:3px 7px;font-weight:500}
+  .floor-board-root .chip.offplan{border-style:dashed;border-color:var(--honey)}
+  .floor-board-root .chip-add{border-style:dashed;color:var(--ink3)}
+  .floor-board-root .chip-n{font-weight:500;color:var(--ink)}
+  .floor-board-root .swatch{display:inline-block;width:11px;height:11px;border-radius:2px;
+    border:1px solid rgba(58,52,44,.25);flex:none}
+  .floor-board-root .count-row{display:flex;align-items:flex-end;gap:12px;margin-top:8px}
+  .floor-board-root .count{font-size:56px;font-weight:500;line-height:.9;min-width:64px}
+  .floor-board-root .of{font-size:17px;color:var(--ink2);padding-bottom:6px}
+  .floor-board-root .behind-pill{font-size:11px;letter-spacing:.1em;text-transform:uppercase;padding:3px 8px;
+    border-radius:3px;background:var(--clay-bg);color:var(--clay);font-weight:600;margin-bottom:8px}
+  .floor-board-root .done-pill{font-size:11px;letter-spacing:.1em;text-transform:uppercase;padding:3px 8px;
+    border-radius:3px;background:var(--sage-bg);color:#5a6e50;font-weight:600;margin-bottom:8px}
+  .floor-board-root .bar{height:9px;background:var(--rule2);border-radius:5px;margin-top:13px;position:relative}
+  .floor-board-root .bar-fill{height:9px;background:var(--sage);border-radius:5px;transition:width .25s}
+  .floor-board-root .bar-fill.late{background:var(--clay)}
+  .floor-board-root .bar-fill.over{background:var(--honey)}
+  .floor-board-root .pace{position:absolute;top:-3px;width:2px;height:15px;background:var(--ink2);border-radius:1px}
+  .floor-board-root .btns{display:flex;gap:8px;margin-top:13px}
+  .floor-board-root button{font-family:Inter,sans-serif;cursor:pointer;border-radius:4px;font-weight:500}
+  .floor-board-root .plus{flex:1;background:var(--sage);color:var(--panel);border:none;
+    font-size:26px;padding:14px 0;letter-spacing:.02em;min-height:56px}
+  .floor-board-root .plus:active{background:#68785e}
+  .floor-board-root .minus{width:64px;background:transparent;color:var(--ink2);border:1px solid var(--rule);font-size:22px;min-height:56px}
+  .floor-board-root .plus:focus-visible,.floor-board-root .minus:focus-visible,.floor-board-root .chip:focus-visible{outline:3px solid var(--slate);outline-offset:2px}
+  .floor-board-root .yrow{display:flex;justify-content:space-between;align-items:center;
+    padding:11px 2px;border-bottom:1px solid var(--rule2);font-size:15px}
+  .floor-board-root .ynum{display:flex;align-items:baseline;gap:9px}
+  .floor-board-root .yactual{font-size:22px;font-weight:500;min-width:34px;text-align:right}
+  .floor-board-root .ytgt{font-size:13px;color:var(--ink3)}
+  .floor-board-root .pill{font-size:11px;letter-spacing:.12em;padding:3px 9px;border-radius:3px;font-weight:600;min-width:52px;text-align:center}
+  .floor-board-root .hit{background:var(--sage-bg);color:#5a6e50}
+  .floor-board-root .miss{background:var(--clay-bg);color:var(--clay)}
+  .floor-board-root .notice{margin-top:22px;padding:10px 14px;border:1px dashed var(--rule);border-radius:4px;
+    font-size:12px;color:var(--ink3);line-height:1.6}
+  .floor-board-root .yesterday-wrap{margin-top:30px;max-width:900px}
+  @media (max-width:1100px){.floor-board-root .pipe{flex-wrap:wrap}.floor-board-root .pipe-seg{flex:1 1 30%}}
+  @media (prefers-reduced-motion:reduce){.floor-board-root *{transition:none!important}}
+`;
+
+const FLOOR_STAGES = [
+  { key: "cnc",   name: "CNC",         colour: "#8a9670" },
+  { key: "prep",  name: "Bench prep",  colour: "#7d8a99" },
+  { key: "bench", name: "Bench",       colour: "#6e8794" },
+  { key: "spray", name: "Spray",       colour: "#c9a961" },
+  { key: "pad",   name: "Padding",     colour: "#b9a888" },
+  { key: "reasm", name: "Re-assembly", colour: "#9c8aaa" },
+];
+
+// Mounts the ported board logic against real DOM nodes inside `root`,
+// exactly like embedding a non-React widget — React renders the empty
+// skeleton once and never touches its insides again, so the board can own
+// its own imperative rendering (matching floor_board.html verbatim) without
+// fighting React's virtual DOM.
+function mountFloorBoard(root, planRef, holidaysSet) {
+  const iso = fmtISO;
+  const store = (typeof window !== "undefined" && window.storage) ? window.storage : null;
+  const memory = {};
+
+  async function load(key) {
+    if (!store) return memory[key] ?? null;
+    try { const r = await store.get(key); return r?.value ? JSON.parse(r.value) : null; } catch (e) { return null; }
+  }
+  async function saveNow(key, val) {
+    if (!store) { memory[key] = val; return; }
+    try { await store.set(key, JSON.stringify(val)); } catch (e) { memory[key] = val; }
+  }
+  const pending = {};
+  let flushTimer = null;
+  function queueSave(key, val) {
+    pending[key] = val;
+    clearTimeout(flushTimer);
+    flushTimer = setTimeout(flush, 600);
+  }
+  async function flush() {
+    const keys = Object.keys(pending);
+    for (const k of keys) { const v = pending[k]; delete pending[k]; await saveNow(k, v); }
+  }
+
+  const dayKeyFor = (d) => "floor:" + iso(d);
+  const weekKeyFor = (d) => "floor:wtd:" + iso(mondayOf(d));
+  function mondayOf(d) {
+    const m = new Date(d.getTime());
+    const dow = m.getDay();
+    m.setDate(m.getDate() + (dow === 0 ? -6 : 1 - dow));
+    return m;
+  }
+  function prevWorkingDay(d) {
+    let p = new Date(d.getTime());
+    do { p = addDays(p, -1); } while (isWeekend(p) || holidaysSet.has(iso(p)));
+    return p;
+  }
+
+  function dayLengthHours(d) { return d.getDay() === 5 ? FRIDAY_DAY_HOURS : FULL_DAY_HOURS; }
+  function fractionOfDayElapsed(now) {
+    const start = 7, breaks = [[10, 0.25], [13, 0.5], [15, 0.25]];
+    const h = now.getHours() + now.getMinutes() / 60;
+    if (h <= start) return 0;
+    let worked = Math.min(h, now.getDay() === 5 ? 11 : 16.5) - start;
+    breaks.forEach(([at, len]) => { if (h > at) worked -= Math.min(len, h - at); });
+    return Math.max(0, Math.min(1, worked / dayLengthHours(now)));
+  }
+
+  let today = {}, yesterday = {}, weekToDate = {}, offPlan = [], extraJobs = {}, selected = {};
+
+  function jobsAt(stageKey) {
+    return (planRef.current.stages[stageKey] || []).concat(extraJobs[stageKey] || []);
+  }
+  function countAt(stageKey, jobId) {
+    return (today[stageKey] && today[stageKey][jobId]) || 0;
+  }
+  function totalAt(stageKey) {
+    const m = today[stageKey] || {};
+    return Object.keys(m).reduce((a, k) => a + m[k], 0);
+  }
+  function isOffPlan(stageKey, jobId) {
+    return offPlan.some(o => o.stage === stageKey && o.jobId === jobId);
+  }
+  function targetFor(jobs) {
+    if (!jobs || !jobs.length) return 0;
+    return jobs.reduce((a, j) => a + (j.planned || 0), 0);
+  }
+  function paddableCount(job) {
+    return PADDED_STYLES.reduce((n, s) => n + ((job.mix && job.mix[s]) || 0), 0);
+  }
+  function styleSummary(jobs) {
+    if (!jobs || !jobs.length) return "nothing booked";
+    return jobs.map(j => Math.round(j.planned) + " " + j.jobName.split(" ")[0] + " b" + j.batch).join(", ");
+  }
+
+  const $ = (id) => root.querySelector("#" + id);
+
+  function renderDate() {
+    const d = new Date();
+    $("dateline").textContent = d.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" });
+    $("weekline").textContent = "week commencing " + mondayOf(d).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+  }
+
+  function renderPipe() {
+    $("pipe").innerHTML = FLOOR_STAGES.map(s => {
+      const jobs = jobsAt(s.key), t = targetFor(jobs);
+      return `
+      <div class="pipe-seg">
+        <div class="pipe-name">${s.name}</div>
+        <div class="pipe-cap">${Math.round(t)} <span>a day</span></div>
+        <div class="pipe-style">${styleSummary(jobs)}</div>
+      </div>`;
+    }).join("");
+  }
+
+  function renderWeek() {
+    const reasmTarget = targetFor(jobsAt("reasm"));
+    const WEEK_DAYS = 4 + (FRIDAY_DAY_HOURS / FULL_DAY_HOURS);
+    const expectedWeek = Math.round(reasmTarget * WEEK_DAYS);
+    const d = new Date();
+    const dowIdx = d.getDay() === 0 ? 5 : Math.min(5, d.getDay());
+    const daysSoFar = (dowIdx >= 5 ? 4 + (FRIDAY_DAY_HOURS / FULL_DAY_HOURS) * fractionOfDayElapsed(d)
+                                   : (dowIdx - 1) + fractionOfDayElapsed(d));
+    const paceNow = Math.round(reasmTarget * daysSoFar);
+    const actual = (weekToDate.reasm || 0) + totalAt("reasm");
+    const behind = actual < paceNow;
+    $("weekstrip").innerHTML = `
+      <div class="wk" style="flex:1">
+        <div class="wk-num">${expectedWeek}</div>
+        <div class="wk-lbl">cabinets expected through re-assembly this week</div>
+        <div class="wk-note">4 full days plus Friday morning, at the styles booked in</div>
+      </div>
+      <div class="wk ${behind ? "behind" : ""}" style="width:230px">
+        <div class="wk-num">${actual} <span style="font-size:15px;color:var(--ink3);font-weight:400">of ${paceNow}</span></div>
+        <div class="wk-lbl">week to date</div>
+        <div class="wk-note">${behind ? (paceNow - actual) + " behind pace" : "running to pace"}</div>
+      </div>`;
+  }
+
+  function renderStages() {
+    const now = new Date(), f = fractionOfDayElapsed(now);
+    $("stages").innerHTML = FLOOR_STAGES.map(s => {
+      const jobs = jobsAt(s.key);
+      const t = targetFor(jobs);
+      const done = totalAt(s.key);
+      const due = t * f;
+      const hit = t > 0 && done >= t;
+      const late = !hit && done < due - 1;
+      const pct = t > 0 ? Math.min(100, Math.round(done / t * 100)) : 0;
+      if (!selected[s.key] && jobs.length) selected[s.key] = jobs[0].jobId;
+      const chips = jobs.map(j => {
+        const n = countAt(s.key, j.jobId);
+        const sel = selected[s.key] === j.jobId;
+        const cap = s.key === "pad" ? paddableCount(j) : null;
+        return `<button class="chip ${isOffPlan(s.key, j.jobId) ? "offplan" : ""}"
+          data-stage="${s.key}" data-job="${j.jobId}" aria-pressed="${sel}"
+          aria-label="Select ${j.jobName} at ${s.name}">
+          <span class="swatch" style="background:${(j.colour && j.colour.hex) || "#c9a961"}"></span>
+          ${j.batch} · ${j.jobName}${cap !== null ? ` <span style="color:var(--ink3)">(${Math.round(cap)} painted)</span>` : ""}
+          ${n ? `<span class="chip-n">${n}</span>` : ""}
+        </button>`;
+      }).join("");
+      return `
+      <div class="card ${hit ? "done" : ""} ${late ? "behind" : ""}">
+        <div class="card-head">
+          <div class="card-name">${s.name}</div>
+          <div class="card-tgt">target ${Math.round(t)}</div>
+        </div>
+        <div class="chips">
+          ${chips}
+          <button class="chip chip-add" data-add="${s.key}" aria-label="Add another job to ${s.name}">+ another job</button>
+        </div>
+        ${late ? `<div class="behind-pill">${Math.round(due - done)} behind</div>` : ""}
+        ${hit ? `<div class="done-pill">target met</div>` : ""}
+        <div class="count-row">
+          <div class="count">${done}</div>
+          <div class="of">of ${Math.round(t)}</div>
+        </div>
+        <div class="bar">
+          <div class="bar-fill ${late ? "late" : ""} ${done > t ? "over" : ""}" style="width:${pct}%"></div>
+          <div class="pace" style="left:${(f * 100).toFixed(1)}%" title="where you should be by now"></div>
+        </div>
+        <div class="btns">
+          <button class="plus" data-k="${s.key}" data-d="1" aria-label="Add one cabinet at ${s.name}">+1</button>
+          <button class="minus" data-k="${s.key}" data-d="-1" aria-label="Remove one cabinet at ${s.name}">−</button>
+        </div>
+      </div>`;
+    }).join("");
+  }
+
+  function renderYesterday() {
+    $("yesterday").innerHTML = FLOOR_STAGES.map(s => {
+      const m = yesterday[s.key];
+      if (!m) return `<div class="yrow"><div>${s.name}</div><div class="ynum"><span class="ytgt">not recorded</span></div></div>`;
+      const a = Object.keys(m).reduce((x, k) => x + m[k], 0);
+      const t = targetFor(jobsAt(s.key));
+      const hit = a >= t;
+      return `
+      <div class="yrow">
+        <div>${s.name}</div>
+        <div class="ynum">
+          <span class="yactual">${a}</span>
+          <span class="ytgt">/ ${Math.round(t)}</span>
+          <span class="pill ${hit ? "hit" : "miss"}">${hit ? "HIT" : Math.round(t - a) + " SHORT"}</span>
+        </div>
+      </div>`;
+    }).join("");
+  }
+
+  function renderNotice() {
+    $("notice").textContent = store
+      ? "Counts save to the shared schedule, so the office sees them straight away. Install dates are never changed by this board."
+      : "Not connected to the schedule, so counts will clear when this page reloads.";
+  }
+
+  function renderAll() { renderPipe(); renderWeek(); renderStages(); renderYesterday(); }
+
+  function bump(stageKey, delta) {
+    const jobId = selected[stageKey];
+    if (!jobId) return;
+    today[stageKey] = today[stageKey] || {};
+    today[stageKey][jobId] = Math.max(0, (today[stageKey][jobId] || 0) + delta);
+    renderAll();
+    queueSave(dayKeyFor(new Date()), { ...today, offPlan });
+    const wtd = { ...weekToDate };
+    wtd[stageKey] = (wtd[stageKey] || 0) + delta;
+    weekToDate = wtd;
+    queueSave(weekKeyFor(new Date()), wtd);
+  }
+
+  function addJobToStage(stageKey) {
+    const taken = jobsAt(stageKey).map(j => j.jobId);
+    const options = (planRef.current.allJobs || []).filter(j => taken.indexOf(j.jobId) === -1);
+    if (!options.length) return;
+    const pick = window.prompt(
+      "Add a job to " + stageKey + ":\n\n" +
+      options.map((j, i) => (i + 1) + ". " + j.jobName).join("\n") +
+      "\n\nType a number:"
+    );
+    const idx = parseInt(pick, 10) - 1;
+    if (isNaN(idx) || !options[idx]) return;
+    extraJobs[stageKey] = (extraJobs[stageKey] || []).concat(options[idx]);
+    offPlan.push({ stage: stageKey, jobId: options[idx].jobId });
+    selected[stageKey] = options[idx].jobId;
+    renderAll();
+    queueSave(dayKeyFor(new Date()), { ...today, offPlan });
+  }
+
+  const onClick = (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    if (b.dataset.job) { selected[b.dataset.stage] = b.dataset.job; renderAll(); return; }
+    if (b.dataset.add) { addJobToStage(b.dataset.add); return; }
+    if (b.dataset.k) { bump(b.dataset.k, parseInt(b.dataset.d, 10)); }
+  };
+  root.addEventListener("click", onClick);
+
+  let currentDay = iso(new Date());
+  let unsubscribe = null;
+  let interval = null;
+
+  async function rollOverIfNewDay() {
+    const nowDay = iso(new Date());
+    if (nowDay === currentDay) return;
+    await flush();
+    currentDay = nowDay;
+    const prev = await load(dayKeyFor(prevWorkingDay(new Date())));
+    if (prev) { delete prev.offPlan; yesterday = prev; } else { yesterday = {}; }
+    today = {}; offPlan = []; extraJobs = {}; selected = {};
+    weekToDate = (await load(weekKeyFor(new Date()))) || {};
+    renderDate(); renderAll();
+  }
+
+  (async function init() {
+    renderDate(); renderNotice();
+    const t = await load(dayKeyFor(new Date()));
+    if (t) { offPlan = t.offPlan || []; delete t.offPlan; today = t; }
+    const y = await load(dayKeyFor(prevWorkingDay(new Date())));
+    if (y) { delete y.offPlan; yesterday = y; }
+    weekToDate = (await load(weekKeyFor(new Date()))) || {};
+    renderAll();
+
+    if (store && store.subscribe) {
+      unsubscribe = store.subscribe(async () => {
+        const t2 = await load(dayKeyFor(new Date()));
+        if (t2) { offPlan = t2.offPlan || []; delete t2.offPlan; today = t2; }
+        renderAll();
+      });
+    }
+
+    interval = setInterval(async () => {
+      await rollOverIfNewDay();
+      renderDate(); renderWeek(); renderStages();
+    }, 60000);
+  })();
+
+  return {
+    onPlanChanged() { renderAll(); },
+    teardown() {
+      root.removeEventListener("click", onClick);
+      if (unsubscribe) unsubscribe();
+      if (interval) clearInterval(interval);
+      clearTimeout(flushTimer);
+    },
+  };
+}
+
+function FloorBoard({ scheduled, dayLayout }) {
+  const rootRef = useRef(null);
+  const apiRef = useRef(null);
+  const planRef = useRef({ stages: {}, allJobs: [] });
+  const todayKey = dayKey(new Date());
+  const plan = useMemo(
+    () => buildMorningBrief(scheduled, dayLayout, todayKey),
+    [scheduled, dayLayout, todayKey]
+  );
+  planRef.current = plan;
+
+  useEffect(() => {
+    if (!rootRef.current) return;
+    const holidaysSet = new Set(UK_BANK_HOLIDAYS);
+    apiRef.current = mountFloorBoard(rootRef.current, planRef, holidaysSet);
+    return () => {
+      apiRef.current?.teardown?.();
+      apiRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    apiRef.current?.onPlanChanged?.();
+  }, [plan]);
+
+  return (
+    <div className="floor-board-root" ref={rootRef}>
+      <style>{FLOOR_BOARD_CSS}</style>
+      <div className="wrap">
+        <div className="top">
+          <div>
+            <div className="brand serif">EVIE WILLOW</div>
+            <div className="sub serif">Workshop floor board</div>
+          </div>
+          <div>
+            <div className="today-date serif" id="dateline">—</div>
+            <div className="today-sub" id="weekline">—</div>
+          </div>
+        </div>
+        <div className="pipe" id="pipe" />
+        <div className="weekstrip" id="weekstrip" />
+        <h2 className="sec">Today · tap as each cabinet clears a stage</h2>
+        <div className="stages" id="stages" />
+        <div className="notice" id="notice" />
+        <div className="yesterday-wrap">
+          <h2 className="sec">Yesterday</h2>
+          <div id="yesterday" />
+        </div>
+      </div>
+    </div>
+  );
+}
 
 export default App;

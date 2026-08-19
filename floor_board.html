@@ -1,0 +1,526 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Evie Willow · Floor Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+
+<style>
+  :root{
+    --linen:#f5f0e6; --panel:#faf6ec; --panel2:#fdfaf2;
+    --ink:#3a342c; --ink2:#7a6a55; --ink3:#9b8f7e;
+    --rule:#d9cfba; --rule2:#e8dfca;
+    --sage:#7a8b6f; --sage-bg:#ecf0e2;
+    --clay:#a5614f; --clay-bg:#f5e3dc;
+    --honey:#c9a961; --honey-bg:#f4ecd9;
+    --slate:#6e8794; --lav:#9c8aaa;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--linen);color:var(--ink);
+    font-family:Inter,-apple-system,'Segoe UI',sans-serif;-webkit-font-smoothing:antialiased}
+  .serif{font-family:'Cormorant Garamond',Georgia,serif}
+  .wrap{max-width:1880px;margin:0 auto;padding:20px 28px 32px}
+
+  /* header */
+  .top{display:flex;justify-content:space-between;align-items:flex-end;
+    border-bottom:1px solid var(--rule);padding-bottom:14px}
+  .brand{font-size:30px;letter-spacing:.2em;font-weight:400}
+  .sub{font-size:14px;color:var(--ink3);letter-spacing:.09em;font-style:italic;margin-top:4px}
+  .today-date{font-size:26px;font-weight:500;text-align:right}
+  .today-sub{font-size:13px;color:var(--ink2);letter-spacing:.08em;text-transform:uppercase;text-align:right;margin-top:3px}
+
+  /* pipeline strip: equal segments, target set by the style booked in today */
+  .pipe{display:flex;align-items:flex-end;gap:10px;margin:22px 0 20px}
+  .pipe-seg{background:var(--panel);border:1px solid var(--rule);border-radius:4px;
+    padding:11px 13px 13px;flex:1;min-width:0}
+  .pipe-name{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink2);font-weight:500}
+  .pipe-cap{font-size:34px;font-weight:500;line-height:1.05;margin-top:5px}
+  .pipe-cap span{font-size:14px;color:var(--ink2);letter-spacing:.05em;font-weight:400}
+  .pipe-style{font-size:11px;color:var(--ink3);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+  /* week strip */
+  .weekstrip{display:flex;gap:14px;margin-bottom:24px}
+  .wk{background:var(--panel);border:1px solid var(--rule);border-radius:6px;padding:14px 17px}
+  .wk-num{font-size:38px;font-weight:500;line-height:1}
+  .wk-lbl{font-size:13px;color:var(--ink2);margin-top:4px}
+  .wk-note{font-size:12px;color:var(--ink3);margin-top:3px}
+  .wk.behind{border-color:var(--clay);background:var(--clay-bg)}
+  .wk.behind .wk-num{color:var(--clay)}
+
+  .grid{display:grid;grid-template-columns:1.55fr 1fr;gap:26px;align-items:start}
+  h2.sec{font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:var(--ink3);
+    font-weight:600;margin:0 0 12px;font-family:Inter,sans-serif}
+
+  /* today cards */
+  .stages{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}
+  .card{background:var(--panel);border:1px solid var(--rule);border-radius:6px;padding:15px 16px 17px}
+  .card.done{background:var(--sage-bg);border-color:var(--sage)}
+  .card.behind{background:var(--clay-bg);border-color:var(--clay)}
+  .card-head{display:flex;justify-content:space-between;align-items:baseline}
+  .card-name{font-size:16px;font-weight:500;letter-spacing:.02em}
+  .card-tgt{font-size:12px;color:var(--ink2);letter-spacing:.06em}
+  .chips{display:flex;flex-wrap:wrap;gap:7px;margin:8px 0 4px;min-height:26px}
+  .chip{background:var(--panel2);border:1px solid var(--rule2);border-radius:4px;
+    padding:4px 8px;font-size:12px;color:var(--ink2);display:flex;align-items:center;gap:6px;
+    font-family:Inter,sans-serif;cursor:pointer;font-weight:400}
+  .chip[aria-pressed="true"]{border:2px solid var(--ink);background:#fff;color:var(--ink);padding:3px 7px;font-weight:500}
+  .chip.offplan{border-style:dashed;border-color:var(--honey)}
+  .chip-add{border-style:dashed;color:var(--ink3)}
+  .chip-n{font-weight:500;color:var(--ink)}
+  .swatch{display:inline-block;width:11px;height:11px;border-radius:2px;
+    border:1px solid rgba(58,52,44,.25);flex:none}
+  .count-row{display:flex;align-items:flex-end;gap:12px;margin-top:8px}
+  .count{font-size:56px;font-weight:500;line-height:.9;min-width:64px}
+  .of{font-size:17px;color:var(--ink2);padding-bottom:6px}
+  .behind-pill{font-size:11px;letter-spacing:.1em;text-transform:uppercase;padding:3px 8px;
+    border-radius:3px;background:var(--clay-bg);color:var(--clay);font-weight:600;margin-bottom:8px}
+  .done-pill{font-size:11px;letter-spacing:.1em;text-transform:uppercase;padding:3px 8px;
+    border-radius:3px;background:var(--sage-bg);color:#5a6e50;font-weight:600;margin-bottom:8px}
+  .bar{height:9px;background:var(--rule2);border-radius:5px;margin-top:13px;position:relative}
+  .bar-fill{height:9px;background:var(--sage);border-radius:5px;transition:width .25s}
+  .bar-fill.late{background:var(--clay)}
+  .bar-fill.over{background:var(--honey)}
+  .pace{position:absolute;top:-3px;width:2px;height:15px;background:var(--ink2);border-radius:1px}
+  .btns{display:flex;gap:8px;margin-top:13px}
+  button{font-family:Inter,sans-serif;cursor:pointer;border-radius:4px;font-weight:500}
+  .plus{flex:1;background:var(--sage);color:var(--panel);border:none;
+    font-size:26px;padding:14px 0;letter-spacing:.02em;min-height:56px}
+  .plus:active{background:#68785e}
+  .minus{width:64px;background:transparent;color:var(--ink2);border:1px solid var(--rule);font-size:22px;min-height:56px}
+  .plus:focus-visible,.minus:focus-visible,.chip:focus-visible{outline:3px solid var(--slate);outline-offset:2px}
+
+  /* yesterday */
+  .yrow{display:flex;justify-content:space-between;align-items:center;
+    padding:11px 2px;border-bottom:1px solid var(--rule2);font-size:15px}
+  .ynum{display:flex;align-items:baseline;gap:9px}
+  .yactual{font-size:22px;font-weight:500;min-width:34px;text-align:right}
+  .ytgt{font-size:13px;color:var(--ink3)}
+  .pill{font-size:11px;letter-spacing:.12em;padding:3px 9px;border-radius:3px;font-weight:600;min-width:52px;text-align:center}
+  .hit{background:var(--sage-bg);color:#5a6e50}
+  .miss{background:var(--clay-bg);color:var(--clay)}
+
+  .notice{margin-top:22px;padding:10px 14px;border:1px dashed var(--rule);border-radius:4px;
+    font-size:12px;color:var(--ink3);line-height:1.6}
+  .yesterday-wrap{margin-top:30px;max-width:900px}
+  @media (max-width:1100px){.pipe{flex-wrap:wrap}.pipe-seg{flex:1 1 30%}}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<div class="wrap">
+  <div class="top">
+    <div>
+      <div class="brand serif">EVIE WILLOW</div>
+      <div class="sub serif">Workshop floor board</div>
+    </div>
+    <div>
+      <div class="today-date serif" id="dateline">—</div>
+      <div class="today-sub" id="weekline">—</div>
+    </div>
+  </div>
+
+  <div class="pipe" id="pipe"></div>
+  <div class="weekstrip" id="weekstrip"></div>
+
+  <h2 class="sec">Today · tap as each cabinet clears a stage</h2>
+  <div class="stages" id="stages"></div>
+  <div class="notice" id="notice"></div>
+
+  <div class="yesterday-wrap">
+    <h2 class="sec">Yesterday</h2>
+    <div id="yesterday"></div>
+  </div>
+</div>
+
+<script>
+// ============================================================
+// The board does NOT work out targets from rates. The scheduler fills
+// each day to exactly one day of work, mixing jobs where a job runs
+// out part way through a day, so the plan for today IS the target.
+//
+// Rates live in the scheduler (CABINET_TYPES): painted 9, beaded 6,
+// oak 5, fluted 4 a day. Padding runs at 9 a day and only painted
+// finishes are padded, so an oak job passes straight through. All of
+// that is applied when the schedule lays out the days, not here.
+//
+// Kept only for the "painted to pad" note on the padding chips.
+// ============================================================
+const PADDED_STYLES = ["painted_shaker","beaded_shaker"];
+
+const STAGES = [
+  { key:"cnc",   name:"CNC",         colour:"#8a9670" },
+  { key:"prep",  name:"Bench prep",  colour:"#7d8a99" },
+  { key:"bench", name:"Bench",       colour:"#6e8794" },
+  { key:"spray", name:"Spray",       colour:"#c9a961" },
+  { key:"pad",   name:"Padding",     colour:"#b9a888" },
+  { key:"reasm", name:"Re-assembly", colour:"#9c8aaa" },
+];
+
+// Working day: Mon-Thu 07:00-16:30 less 1h breaks = 8.5h. Fri 07:00-11:00
+// less the 10:00 break = 3.75h. Friday is 0.44 of a day.
+const FULL_DAY_HOURS = 8.5, FRIDAY_HOURS = 3.75;
+const WEEK_DAYS = 4 + (FRIDAY_HOURS / FULL_DAY_HOURS);
+
+const UK_BANK_HOLIDAYS = new Set([
+  "2026-01-01","2026-04-03","2026-04-06","2026-05-04","2026-05-25","2026-08-31",
+  "2026-12-25","2026-12-28","2027-01-01","2027-03-26","2027-03-29","2027-05-03",
+  "2027-05-31","2027-08-30","2027-12-27","2027-12-28"
+]);
+
+// ------------------------------------------------------------
+// PLAN — replaced by a derived morning brief when wired to the
+// scheduler. Shape: per stage, the jobs scheduled there today.
+// mix is the cabinet breakdown, which is what drives the target.
+// ------------------------------------------------------------
+// planned = cabinets of this job the schedule has at this stage TODAY.
+// batch   = which day tranche of the job it is. The bench entry below is
+//           the shared-day case: Morgan's last 4 oak (0.8 of a day) plus
+//           2 painted of Walker-Church filling the remaining fifth.
+const PLAN = {
+  stages: {
+    cnc:   [ { jobId:"job_bihz41e", jobName:"Morgan kitchen",  batch:6, planned:5, colour:{name:"Oak, oiled",  hex:"#a8834f"}, mix:{ oak_shaker:32 } } ],
+    prep:  [ { jobId:"job_nb65143", jobName:"Letton",          batch:2, planned:5, colour:{name:"Mizzle",      hex:"#c7c8bd"}, mix:{ painted_shaker:14 } },
+             { jobId:"job_276uk48", jobName:"Muller",          batch:1, planned:2, colour:{name:"Card Room",   hex:"#9aa08b"}, mix:{ beaded_shaker:18 } } ],
+    bench: [ { jobId:"job_bihz41e", jobName:"Morgan kitchen",  batch:6, planned:4, colour:{name:"Oak, oiled",  hex:"#a8834f"}, mix:{ oak_shaker:32 } },
+             { jobId:"job_wc44821", jobName:"Walker-Church",   batch:1, planned:2, colour:{name:"Drop Cloth",  hex:"#c9bda6"}, mix:{ painted_shaker:27 } } ],
+    spray: [ { jobId:"job_5uzqmyx", jobName:"Franklin",        batch:3, planned:9, colour:{name:"Mizzle",      hex:"#c7c8bd"}, mix:{ painted_shaker:38 } } ],
+    pad:   [ { jobId:"job_5uzqmyx", jobName:"Franklin",        batch:2, planned:9, colour:{name:"Mizzle",      hex:"#c7c8bd"}, mix:{ painted_shaker:38 } } ],
+    reasm: [ { jobId:"job_bsgxpkb", jobName:"Katherine Way",   batch:4, planned:8, colour:{name:"Card Room",   hex:"#9aa08b"}, mix:{ painted_shaker:25, beaded_shaker:6 } } ]
+  },
+  allJobs: [
+    { jobId:"job_7z6nfhx", jobName:"Roberts",       batch:1, planned:0, colour:{name:"Drop Cloth", hex:"#c9bda6"}, mix:{ painted_shaker:22 } },
+    { jobId:"job_rl91his", jobName:"Siviter",       batch:1, planned:0, colour:{name:"Drop Cloth", hex:"#c9bda6"}, mix:{ painted_shaker:19 } },
+    { jobId:"job_aexzjyq", jobName:"Thorborn",      batch:1, planned:0, colour:{name:"Mizzle",     hex:"#c7c8bd"}, mix:{ painted_shaker:28 } },
+    { jobId:"job_504pa7b", jobName:"Venniri",       batch:1, planned:0, colour:{name:"Card Room",  hex:"#9aa08b"}, mix:{ painted_shaker:25 } }
+  ]
+};
+
+// ============================================================
+// TARGETS
+// ============================================================
+
+// The target is simply what the schedule has planned at this stage today.
+// The scheduler has already filled the day to one day of work using the
+// style rates, so a bench day of 4 oak plus 2 painted has a target of 6.
+function targetFor(stageKey, jobs){
+  if(!jobs || !jobs.length) return 0;
+  return jobs.reduce((a,j) => a + (j.planned || 0), 0);
+}
+
+// Padding only touches painted finishes, so this is what the chip shows.
+function paddableCount(job){
+  return PADDED_STYLES.reduce((n,s) => n + (job.mix[s] || 0), 0);
+}
+
+// What is actually booked at this stage today, for under the strip figure.
+function styleSummary(stageKey, jobs){
+  if(!jobs || !jobs.length) return "nothing booked";
+  return jobs.map(j => j.planned + " " + j.jobName.split(" ")[0] + " b" + j.batch).join(", ");
+}
+
+// ============================================================
+// STORAGE
+// ============================================================
+const iso = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+const store = (typeof window !== "undefined" && window.storage) ? window.storage : null;
+const memory = {};
+
+async function load(key){
+  if(!store) return memory[key] ?? null;
+  try{ const r = await store.get(key); return r?.value ? JSON.parse(r.value) : null; }
+  catch(e){ return null; }
+}
+async function saveNow(key,val){
+  if(!store){ memory[key] = val; return; }
+  try{ await store.set(key, JSON.stringify(val)); }catch(e){ memory[key] = val; }
+}
+
+// Debounced writes, 600ms, matching the scheduler's save effects.
+// Nine taps in a row should be one write, not nine.
+const pending = {};
+let flushTimer = null;
+function queueSave(key,val){
+  pending[key] = val;
+  clearTimeout(flushTimer);
+  flushTimer = setTimeout(flush, 600);
+}
+async function flush(){
+  const keys = Object.keys(pending);
+  for(const k of keys){ const v = pending[k]; delete pending[k]; await saveNow(k,v); }
+}
+
+const dayKey  = d => "floor:" + iso(d);
+const weekKey = d => "floor:wtd:" + iso(mondayOf(d));
+
+function mondayOf(d){
+  const m = new Date(d), dow = m.getDay();
+  m.setDate(m.getDate() + (dow === 0 ? -6 : 1 - dow));
+  return m;
+}
+// Previous working day, skipping weekends AND bank holidays. Without the
+// holiday check, the Tuesday after a bank holiday Monday shows every row
+// as "not recorded" and looks broken when it isn't.
+function prevWorkingDay(d){
+  const p = new Date(d);
+  do { p.setDate(p.getDate() - 1); }
+  while(p.getDay() === 0 || p.getDay() === 6 || UK_BANK_HOLIDAYS.has(iso(p)));
+  return p;
+}
+
+// ============================================================
+// PACE — where you should be by this point in the day
+// ============================================================
+function dayLengthHours(d){ return d.getDay() === 5 ? FRIDAY_HOURS : FULL_DAY_HOURS; }
+
+function fractionOfDayElapsed(now){
+  const start = 7, breaks = [[10,0.25],[13,0.5],[15,0.25]];
+  const h = now.getHours() + now.getMinutes()/60;
+  if(h <= start) return 0;
+  let worked = Math.min(h, now.getDay() === 5 ? 11 : 16.5) - start;
+  breaks.forEach(([at,len]) => { if(h > at) worked -= Math.min(len, h - at); });
+  return Math.max(0, Math.min(1, worked / dayLengthHours(now)));
+}
+
+// ============================================================
+// STATE
+// ============================================================
+let today = {};          // { stageKey: { jobId: count } }
+let yesterday = {};
+let weekToDate = {};     // { stageKey: count }
+let offPlan = [];        // [ { stage, jobId } ]
+let extraJobs = {};      // { stageKey: [ job ] } added by the floor
+let selected = {};       // { stageKey: jobId }
+
+function jobsAt(stageKey){
+  return (PLAN.stages[stageKey] || []).concat(extraJobs[stageKey] || []);
+}
+function countAt(stageKey, jobId){
+  return (today[stageKey] && today[stageKey][jobId]) || 0;
+}
+function totalAt(stageKey){
+  const m = today[stageKey] || {};
+  return Object.keys(m).reduce((a,k) => a + m[k], 0);
+}
+function isOffPlan(stageKey, jobId){
+  return offPlan.some(o => o.stage === stageKey && o.jobId === jobId);
+}
+
+// ============================================================
+// RENDER
+// ============================================================
+function renderDate(){
+  const d = new Date();
+  document.getElementById("dateline").textContent =
+    d.toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long"});
+  document.getElementById("weekline").textContent =
+    "week commencing " + mondayOf(d).toLocaleDateString("en-GB",{day:"numeric",month:"short"});
+}
+
+function renderPipe(){
+  document.getElementById("pipe").innerHTML = STAGES.map(s => {
+    const jobs = jobsAt(s.key), t = targetFor(s.key, jobs);
+    return `
+    <div class="pipe-seg">
+      <div class="pipe-name">${s.name}</div>
+      <div class="pipe-cap">${t} <span>a day</span></div>
+      <div class="pipe-style">${styleSummary(s.key, jobs)}</div>
+    </div>`;
+  }).join("");
+}
+
+function renderWeek(){
+  // Expected through re-assembly this week, at the styles booked in.
+  const reasmTarget = targetFor("reasm", jobsAt("reasm"));
+  const expectedWeek = Math.round(reasmTarget * WEEK_DAYS);
+
+  const d = new Date();
+  const dowIdx = d.getDay() === 0 ? 5 : Math.min(5, d.getDay());
+  const daysSoFar = (dowIdx >= 5 ? 4 + (FRIDAY_HOURS/FULL_DAY_HOURS) * fractionOfDayElapsed(d)
+                                 : (dowIdx - 1) + fractionOfDayElapsed(d));
+  const paceNow = Math.round(reasmTarget * daysSoFar);
+  const actual  = (weekToDate.reasm || 0) + totalAt("reasm");
+  const behind  = actual < paceNow;
+
+  document.getElementById("weekstrip").innerHTML = `
+    <div class="wk" style="flex:1">
+      <div class="wk-num">${expectedWeek}</div>
+      <div class="wk-lbl">cabinets expected through re-assembly this week</div>
+      <div class="wk-note">4 full days plus Friday morning, at the styles booked in</div>
+    </div>
+    <div class="wk ${behind?"behind":""}" style="width:230px">
+      <div class="wk-num">${actual} <span style="font-size:15px;color:var(--ink3);font-weight:400">of ${paceNow}</span></div>
+      <div class="wk-lbl">week to date</div>
+      <div class="wk-note">${behind ? (paceNow-actual) + " behind pace" : "running to pace"}</div>
+    </div>`;
+}
+
+function renderStages(){
+  const now = new Date(), f = fractionOfDayElapsed(now);
+
+  document.getElementById("stages").innerHTML = STAGES.map(s => {
+    const jobs  = jobsAt(s.key);
+    const t     = targetFor(s.key, jobs);
+    const done  = totalAt(s.key);
+    const due   = t * f;
+    const hit   = t > 0 && done >= t;
+    const late  = !hit && done < due - 1;
+    const pct   = t > 0 ? Math.min(100, Math.round(done / t * 100)) : 0;
+
+    if(!selected[s.key] && jobs.length) selected[s.key] = jobs[0].jobId;
+
+    const chips = jobs.map(j => {
+      const n = countAt(s.key, j.jobId);
+      const sel = selected[s.key] === j.jobId;
+      const cap = s.key === "pad" ? paddableCount(j) : null;
+      return `<button class="chip ${isOffPlan(s.key,j.jobId)?"offplan":""}"
+        data-stage="${s.key}" data-job="${j.jobId}" aria-pressed="${sel}"
+        aria-label="Select ${j.jobName} at ${s.name}">
+        <span class="swatch" style="background:${j.colour.hex}"></span>
+        ${j.batch} · ${j.jobName}${cap !== null ? ` <span style="color:var(--ink3)">(${cap} painted)</span>` : ""}
+        ${n ? `<span class="chip-n">${n}</span>` : ""}
+      </button>`;
+    }).join("");
+
+    return `
+    <div class="card ${hit?"done":""} ${late?"behind":""}">
+      <div class="card-head">
+        <div class="card-name">${s.name}</div>
+        <div class="card-tgt">target ${t}</div>
+      </div>
+      <div class="chips">
+        ${chips}
+        <button class="chip chip-add" data-add="${s.key}" aria-label="Add another job to ${s.name}">+ another job</button>
+      </div>
+      ${late ? `<div class="behind-pill">${Math.round(due-done)} behind</div>` : ""}
+      ${hit  ? `<div class="done-pill">target met</div>` : ""}
+      <div class="count-row">
+        <div class="count">${done}</div>
+        <div class="of">of ${t}</div>
+      </div>
+      <div class="bar">
+        <div class="bar-fill ${late?"late":""} ${done>t?"over":""}" style="width:${pct}%"></div>
+        <div class="pace" style="left:${(f*100).toFixed(1)}%" title="where you should be by now"></div>
+      </div>
+      <div class="btns">
+        <button class="plus" data-k="${s.key}" data-d="1" aria-label="Add one cabinet at ${s.name}">+1</button>
+        <button class="minus" data-k="${s.key}" data-d="-1" aria-label="Remove one cabinet at ${s.name}">−</button>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function renderYesterday(){
+  document.getElementById("yesterday").innerHTML = STAGES.map(s => {
+    const m = yesterday[s.key];
+    if(!m) return `<div class="yrow"><div>${s.name}</div>
+      <div class="ynum"><span class="ytgt">not recorded</span></div></div>`;
+    const a = Object.keys(m).reduce((x,k) => x + m[k], 0);
+    const t = targetFor(s.key, jobsAt(s.key));
+    const hit = a >= t;
+    return `
+    <div class="yrow">
+      <div>${s.name}</div>
+      <div class="ynum">
+        <span class="yactual">${a}</span>
+        <span class="ytgt">/ ${t}</span>
+        <span class="pill ${hit?"hit":"miss"}">${hit?"HIT":(t-a)+" SHORT"}</span>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+
+function renderNotice(){
+  document.getElementById("notice").textContent = store
+    ? "Counts save to the shared schedule, so the office sees them straight away. Install dates are never changed by this board."
+    : "Not connected to the schedule, so counts will clear when this page reloads. Point window.storage at the scheduler to keep them.";
+}
+
+function renderAll(){ renderPipe(); renderWeek(); renderStages(); renderYesterday(); }
+
+// ============================================================
+// TAPS
+// ============================================================
+function bump(stageKey, delta){
+  const jobId = selected[stageKey];
+  if(!jobId) return;
+  today[stageKey] = today[stageKey] || {};
+  today[stageKey][jobId] = Math.max(0, (today[stageKey][jobId] || 0) + delta);
+  renderAll();
+  queueSave(dayKey(new Date()), { ...today, offPlan });
+  const wtd = { ...weekToDate };
+  wtd[stageKey] = (wtd[stageKey] || 0) + delta;
+  queueSave(weekKey(new Date()), wtd);
+}
+
+function addJobToStage(stageKey){
+  const taken = jobsAt(stageKey).map(j => j.jobId);
+  const options = PLAN.allJobs.filter(j => taken.indexOf(j.jobId) === -1);
+  if(!options.length) return;
+  const pick = window.prompt(
+    "Add a job to " + stageKey + ":\n\n" +
+    options.map((j,i) => (i+1) + ". " + j.batch + " · " + j.jobName).join("\n") +
+    "\n\nType a number:");
+  const idx = parseInt(pick,10) - 1;
+  if(isNaN(idx) || !options[idx]) return;
+  extraJobs[stageKey] = (extraJobs[stageKey] || []).concat(options[idx]);
+  offPlan.push({ stage: stageKey, jobId: options[idx].jobId });
+  selected[stageKey] = options[idx].jobId;
+  renderAll();
+  queueSave(dayKey(new Date()), { ...today, offPlan });
+}
+
+document.addEventListener("click", e => {
+  const b = e.target.closest("button");
+  if(!b) return;
+  if(b.dataset.job){ selected[b.dataset.stage] = b.dataset.job; renderAll(); return; }
+  if(b.dataset.add){ addJobToStage(b.dataset.add); return; }
+  if(b.dataset.k)  { bump(b.dataset.k, parseInt(b.dataset.d,10)); }
+});
+
+// ============================================================
+// INIT
+// ============================================================
+(async function init(){
+  renderDate(); renderNotice();
+
+  const t = await load(dayKey(new Date()));
+  if(t){ offPlan = t.offPlan || []; delete t.offPlan; today = t; }
+  const y = await load(dayKey(prevWorkingDay(new Date())));
+  if(y){ delete y.offPlan; yesterday = y; }
+  weekToDate = (await load(weekKey(new Date()))) || {};
+
+  renderAll();
+
+  // Realtime: pick up office edits to the schedule and taps from another
+  // screen. Echo suppression for our own writes lives in the storage shim.
+  if(store && store.subscribe){
+    store.subscribe(async () => {
+      const t2 = await load(dayKey(new Date()));
+      if(t2){ offPlan = t2.offPlan || []; delete t2.offPlan; today = t2; }
+      renderAll();
+    });
+  }
+
+  // A wall board runs for weeks without being touched, so it has to notice
+  // the date changing. Without this it would keep showing yesterday and
+  // writing counts to yesterday's key.
+  let currentDay = iso(new Date());
+  async function rollOverIfNewDay(){
+    const nowDay = iso(new Date());
+    if(nowDay === currentDay) return;
+    await flush();                 // land any pending taps against the old day
+    currentDay = nowDay;
+    const prev = await load(dayKey(prevWorkingDay(new Date())));
+    yesterday = prev ? (delete prev.offPlan, prev) : {};
+    today = {}; offPlan = []; extraJobs = {}; selected = {};
+    weekToDate = (await load(weekKey(new Date()))) || {};
+    renderDate(); renderAll();
+  }
+
+  // Keep the clock, the pace marker and the behind states moving.
+  setInterval(async () => {
+    await rollOverIfNewDay();
+    renderDate(); renderWeek(); renderStages();
+  }, 60000);
+})();
+</script>
