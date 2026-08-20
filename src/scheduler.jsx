@@ -200,7 +200,21 @@ const FRIDAY_DAY_HOURS = 3.75;
 const FRIDAY_DAY_FRACTION = FRIDAY_DAY_HOURS / FULL_DAY_HOURS;
 const DAY_EPSILON = 1e-9;
 
+// Core scheduling treats Friday as a HALF working day (matching the
+// half-day-slot model this app used before the fractional rewrite), not
+// Friday's real ~44% hours (fridayAwareCapacity below). Folding the real
+// figure into month-spanning date math compounds across the backlog
+// (settings.startDate deliberately sits far in the past) into large,
+// disruptive drift versus the positions the workshop is used to seeing —
+// this keeps core scheduling's calendar positions matching that history.
 function dayCapacity(date) {
+  return date.getDay() === 5 ? 0.5 : 1;
+}
+
+// Friday's REAL capacity (07:00-11:00 minus a break = 3.75 of an 8.5-hour
+// day) — used only for the floor board's own day-by-day cabinet breakdown
+// (dayLayoutForRatedInterval), never for the core scheduler's date math.
+function fridayAwareCapacity(date) {
   return date.getDay() === 5 ? FRIDAY_DAY_FRACTION : 1;
 }
 // Floating point add/subtract of day-fractions (cabinets/rate) drifts over a
@@ -397,6 +411,18 @@ function featureImpact(features) {
 // Each cabinet type takes (count / rate) days. Mixed jobs add up. Returns the
 // true fractional day count — no rounding to a half-day minimum, so a small
 // job doesn't force capacity to be wasted rounding it up.
+// Core scheduling rounds each job's total bench/finishing/reassembly time up
+// to the nearest half day (with a 0.5-day floor), same as before the
+// fractional rewrite. The floor board's own day-by-day cabinet breakdown
+// (dayLayoutForRatedInterval/cabinetEntriesFor) still works from each style's
+// EXACT count and rate, independent of this rounding — so partial-day
+// sharing between jobs still displays precisely. Rounding here is about
+// keeping the overall schedule's month-spanning positions stable: an exact,
+// unrounded total compounds small savings across months of backlog into
+// large, disruptive drift versus what the workshop is used to seeing.
+function roundToHalf(days) {
+  return Math.max(0.5, Math.round(days * 2) / 2);
+}
 function benchDaysForJob(job) {
   let days = 0;
   for (const [type, count] of Object.entries(job.cabinets)) {
@@ -404,7 +430,7 @@ function benchDaysForJob(job) {
   }
   const impact = featureImpact(job.features);
   days += impact.perCabExtra;
-  return roundDay(days);
+  return roundToHalf(days);
 }
 
 function totalCabinets(job) {
@@ -443,7 +469,7 @@ function dayLayoutForRatedInterval(startSlot, cabinetEntries, holidays) {
   for (const { style, count, rate } of cabinetEntries) {
     let remaining = count;
     while (remaining > DAY_EPSILON) {
-      const availableToday = dayCapacity(cursor.date) - cursor.used;
+      const availableToday = fridayAwareCapacity(cursor.date) - cursor.used;
       if (availableToday <= DAY_EPSILON) {
         cursor = normalizeToWorkingDay({ date: nextWorkingDay(addDays(cursor.date, 1), holidays), used: 0 }, holidays);
         continue;
