@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
-import { Plus, Trash2, AlertTriangle, Calendar, Settings, Download, Upload, X, Truck } from "lucide-react";
+import { Plus, Trash2, AlertTriangle, Calendar, Settings, Download, Upload, X, Truck, Undo2, Redo2 } from "lucide-react";
 import "./storage.js"; // installs window.storage backed by Supabase
 
 // Read-only mode: append ?readonly=1 to the URL to disable all edits.
@@ -452,9 +452,14 @@ function totalCabinets(job) {
 // Oak and fluted/reeded pass straight through with no padding days at all.
 const PADDED_STYLES = ["painted_shaker", "beaded_shaker"];
 
-function cabinetEntriesFor(job) {
+// rateScale lets the day layout reflect a job that's been overbooked — extra
+// hours/hands thrown at it so it clears faster than the standard rate. 1
+// (the default) means the standard rate; computeDayLayout passes a scaled
+// value derived from how much smaller a stage's actual (possibly
+// benchDaysOverride'd) duration is than its nominal cabinet-math duration.
+function cabinetEntriesFor(job, rateScale = 1) {
   return Object.keys(CABINET_TYPES)
-    .map(style => ({ style, count: job.cabinets[style] || 0, rate: CABINET_TYPES[style].rate }))
+    .map(style => ({ style, count: job.cabinets[style] || 0, rate: CABINET_TYPES[style].rate * rateScale }))
     .filter(e => e.count > 0);
 }
 
@@ -530,13 +535,22 @@ function computeDayLayout(scheduled, holidays) {
 
   scheduled.forEach(job => {
     if (!job.tasks?.length) return;
-    const entries = cabinetEntriesFor(job);
-    if (!entries.length) return;
+    if (totalCabinets(job) === 0) return;
     const colour = job.colour || { name: "", hex: "" };
+    // A stage whose actual days (task.days, which reflects any
+    // benchDaysOverride/finishingDaysOverride/reassemblyDaysOverride) is
+    // smaller than its nominal cabinet-math days has been overbooked — extra
+    // hours/hands thrown at it to clear faster than the standard rate. Scale
+    // that stage's own day-layout rate up to match, so the floor board's
+    // cabinets/day reflects the actual pace rather than the standard one.
+    // Unoverridden stages have task.days === nominal, so scale is exactly 1.
+    const nominalBenchDays = benchDaysForJob(job);
+    const nominalFinishDays = nominalBenchDays + featureImpact(job.features).flatExtra;
 
     const benchTask = job.tasks.find(t => t.stage === "bench");
     if (benchTask?.startSlot) {
-      const dl = dayLayoutForRatedInterval(benchTask.startSlot, entries, holidays);
+      const benchScale = benchTask.days > 0 ? nominalBenchDays / benchTask.days : 1;
+      const dl = dayLayoutForRatedInterval(benchTask.startSlot, cabinetEntriesFor(job, benchScale), holidays);
       let batch = 0;
       [...dl.keys()].sort().forEach(k => {
         batch++;
@@ -560,7 +574,8 @@ function computeDayLayout(scheduled, holidays) {
 
     const finishTask = job.tasks.find(t => t.stage === "finishing");
     if (finishTask?.startSlot) {
-      const fdl = dayLayoutForRatedInterval(finishTask.startSlot, entries, holidays);
+      const finishScale = finishTask.days > 0 ? nominalFinishDays / finishTask.days : 1;
+      const fdl = dayLayoutForRatedInterval(finishTask.startSlot, cabinetEntriesFor(job, finishScale), holidays);
       let batch = 0;
       [...fdl.keys()].sort().forEach(k => {
         batch++;
@@ -575,7 +590,8 @@ function computeDayLayout(scheduled, holidays) {
 
     const reasmTask = job.tasks.find(t => t.stage === "reassembly");
     if (reasmTask?.startSlot) {
-      const rdl = dayLayoutForRatedInterval(reasmTask.startSlot, entries, holidays);
+      const reasmScale = reasmTask.days > 0 ? nominalBenchDays / reasmTask.days : 1;
+      const rdl = dayLayoutForRatedInterval(reasmTask.startSlot, cabinetEntriesFor(job, reasmScale), holidays);
       let batch = 0;
       [...rdl.keys()].sort().forEach(k => {
         batch++;
@@ -2273,6 +2289,20 @@ function App() {
   const [updateFeedback, setUpdateFeedback] = useState(null); // { ok, message, updates, unparsed, offset }
   const [loading, setLoading] = useState(true);
 
+  // Undo/redo history — a stack of { jobs, settings } snapshots. jobs/settings
+  // are always replaced (never mutated) elsewhere in this component, so
+  // storing the reference is enough; no cloning needed.
+  const [historyStack, setHistoryStack] = useState([]);
+  const [redoStack, setRedoStack] = useState([]);
+  const MAX_HISTORY = 20;
+  const lastCommittedRef = useRef(null);
+  const historyInitRef = useRef(false);
+  // Set by undo()/redo() right before they call setJobs/setSettings, so the
+  // capture effect below (which runs again on that resulting render) treats
+  // it as an already-settled point rather than racing its own debounce timer
+  // against the state undo/redo just restored.
+  const isUndoRedoActionRef = useRef(false);
+
   // Track the timestamp of our last write so we can ignore realtime echoes
   // of our own changes (the Supabase realtime fires when WE save, which
   // would otherwise trigger a reload and overwrite local state).
@@ -2333,13 +2363,77 @@ function App() {
     return () => { clearTimeout(debounceTimer); unsubscribe(); };
   }, [loading]);
 
+  // Undo history capture — DEBOUNCED (1s of no further change) so a burst of
+  // edits (typing a field, dragging a bar) collapses into one undo step
+  // rather than one per keystroke. The first run after load establishes the
+  // baseline without recording a step. Known limitation: a remote change
+  // from another device also produces an undo step — acceptable for a
+  // single-workshop tool rather than building multi-device-aware history.
+  useEffect(() => {
+    if (loading || IS_READONLY) return;
+    if (!historyInitRef.current) {
+      lastCommittedRef.current = { jobs, settings };
+      historyInitRef.current = true;
+      return;
+    }
+    if (isUndoRedoActionRef.current) {
+      // This render is undo()/redo() restoring a snapshot, not a new user
+      // edit — treat it as already-settled instead of debouncing/capturing.
+      // Don't reset the ref here: the save-jobs effect below also needs to
+      // see it as true during this same commit (see undo()/redo(), which
+      // schedule the reset for right after this tick instead).
+      lastCommittedRef.current = { jobs, settings };
+      return;
+    }
+    const timer = setTimeout(() => {
+      const prev = lastCommittedRef.current;
+      if (prev && (prev.jobs !== jobs || prev.settings !== settings)) {
+        setHistoryStack(h => [...h.slice(-(MAX_HISTORY - 1)), prev]);
+        setRedoStack([]);
+        lastCommittedRef.current = { jobs, settings };
+      }
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [jobs, settings, loading]);
+
+  // Undo/redo set isUndoRedoActionRef synchronously so every effect reacting
+  // to this same jobs/settings change (history capture above, the save-jobs
+  // empty-array guard below) can see it during this commit, then clear it
+  // shortly after — asynchronously, so it's still true when those effects'
+  // bodies run (effects run synchronously within the commit; a plain
+  // "reset it in the first effect that reads it" would hide it from the
+  // others, since effects for one commit run in declaration order).
+  const undo = () => {
+    if (historyStack.length === 0) return;
+    const prev = historyStack[historyStack.length - 1];
+    setRedoStack(r => [...r, { jobs, settings }]);
+    setHistoryStack(h => h.slice(0, -1));
+    isUndoRedoActionRef.current = true;
+    setJobs(prev.jobs);
+    setSettings(prev.settings);
+    setTimeout(() => { isUndoRedoActionRef.current = false; }, 0);
+  };
+  const redo = () => {
+    if (redoStack.length === 0) return;
+    const next = redoStack[redoStack.length - 1];
+    setHistoryStack(h => [...h, { jobs, settings }]);
+    setRedoStack(r => r.slice(0, -1));
+    isUndoRedoActionRef.current = true;
+    setJobs(next.jobs);
+    setSettings(next.settings);
+    setTimeout(() => { isUndoRedoActionRef.current = false; }, 0);
+  };
+
   // Save jobs — DEBOUNCED so rapid typing/dragging doesn't fire 20 saves.
   // Waits 600ms after the last change before writing. Includes the
-  // empty-array safety guard so a transient empty state can't wipe data.
+  // empty-array safety guard so a transient empty state can't wipe data —
+  // except when undo/redo deliberately restored an empty array, which is a
+  // real historical state to persist, not a race to guard against.
+  const wasUndoRedoForSave = isUndoRedoActionRef.current;
   useEffect(() => {
     if (loading || IS_READONLY) return;
     const t = setTimeout(() => {
-      if (jobs.length === 0) {
+      if (jobs.length === 0 && !wasUndoRedoForSave) {
         // Safety check: don't overwrite non-empty Supabase data with an empty array
         window.storage.get("ew-jobs").then(r => {
           if (!r || !r.value) {
@@ -2838,6 +2932,10 @@ function App() {
         lastUpdateDate={settings.lastUpdateDate}
         varianceCount={varianceCount}
         onShowVarianceReview={() => setShowVarianceReview(true)}
+        canUndo={historyStack.length > 0}
+        canRedo={redoStack.length > 0}
+        onUndo={undo}
+        onRedo={redo}
       />
 
       {IS_READONLY && (
@@ -3118,7 +3216,7 @@ function App() {
   );
 }
 
-function Header({ onAddJob, onSettings, onWhatIf, onExport, onImport, jobCount, warningCount, onShowWarnings, reminderCount, onShowReminders, onWeeklyUpdate, lastUpdateDate, varianceCount, onShowVarianceReview }) {
+function Header({ onAddJob, onSettings, onWhatIf, onExport, onImport, jobCount, warningCount, onShowWarnings, reminderCount, onShowReminders, onWeeklyUpdate, lastUpdateDate, varianceCount, onShowVarianceReview, canUndo, canRedo, onUndo, onRedo }) {
   const fileRef = useRef(null);
   // Show "needs check-in" hint if the last update was more than 7 days ago, or never
   const needsCheckin = (() => {
@@ -3136,6 +3234,26 @@ function Header({ onAddJob, onSettings, onWhatIf, onExport, onImport, jobCount, 
         <div style={styles.subbrand}>Workshop Production Schedule · {jobCount} jobs</div>
       </div>
       <div style={styles.headerActions}>
+        {!IS_READONLY && (
+          <>
+            <button
+              style={{ ...styles.btnGhost, opacity: canUndo ? 1 : 0.4, cursor: canUndo ? "pointer" : "default" }}
+              onClick={onUndo}
+              disabled={!canUndo}
+              title="Undo"
+            >
+              <Undo2 size={14} />
+            </button>
+            <button
+              style={{ ...styles.btnGhost, opacity: canRedo ? 1 : 0.4, cursor: canRedo ? "pointer" : "default" }}
+              onClick={onRedo}
+              disabled={!canRedo}
+              title="Redo"
+            >
+              <Redo2 size={14} />
+            </button>
+          </>
+        )}
         <button
           style={needsCheckin ? styles.btnWarning : styles.btnGhost}
           onClick={onWeeklyUpdate}
