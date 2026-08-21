@@ -992,7 +992,23 @@ function scheduleJobs(jobs, holidays, settings) {
     });
   }
 
-  return { scheduled, warnings, dayLayout: computeDayLayout(scheduled, holidays) };
+  // Once a job's install has fully finished, its warnings are done too —
+  // nothing about a completed job needs manual review, and re-surfacing it
+  // (e.g. because upstream drift nudged its computed dates slightly) is just
+  // noise. Doesn't touch scheduling itself, only which warnings are reported.
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const installDoneJobIds = new Set(
+    scheduled
+      .filter(j => {
+        const installTask = j.tasks?.find(t => t.stage === "install");
+        return installTask && installTask.end <= today;
+      })
+      .map(j => j.id)
+  );
+  const liveWarnings = warnings.filter(w => !(w.jobId && installDoneJobIds.has(w.jobId)));
+
+  return { scheduled, warnings: liveWarnings, dayLayout: computeDayLayout(scheduled, holidays) };
 }
 
 // Given a target install ISO date, return the Monday of that week.
