@@ -2619,7 +2619,7 @@ function App() {
   // gives the workshop the rest of the week to catch back up on its own, and
   // only asks "where are we" once, at the start of the next week.
   const varianceReview = useMemo(() => {
-    const empty = { unreviewedDays: 0, anchorJobId: null, anchorJobName: "", offsetDays: 0, latestDate: null };
+    const empty = { unreviewedDays: 0, anchorJobId: null, anchorJobName: "", offsetDays: 0, latestDate: null, notes: [] };
     // Compare as plain ISO date strings (lastVarianceReviewDate has no time
     // component) so a review actioned any time Monday closes the gate for
     // the rest of that week, rather than re-opening later the same day.
@@ -2632,17 +2632,22 @@ function App() {
     const unreviewed = floorDates.filter(d => !settings.lastVarianceReviewDate || d > settings.lastVarianceReviewDate);
     if (!unreviewed.length) return empty;
 
+    // Notes the floor board logged on any day covered by this review —
+    // read-only context alongside the offset, never itself a trigger for
+    // anything.
+    const notes = unreviewed.flatMap(d => (floorActuals[d]?.notes || []).map(text => ({ date: d, text })));
+
     const latestDate = unreviewed[unreviewed.length - 1];
     const benchTaps = floorActuals[latestDate]?.bench || {};
     let anchorJobId = null, anchorCount = -1;
     Object.entries(benchTaps).forEach(([jobId, count]) => {
       if (count > anchorCount) { anchorCount = count; anchorJobId = jobId; }
     });
-    if (!anchorJobId) return { ...empty, unreviewedDays: unreviewed.length, latestDate };
+    if (!anchorJobId) return { ...empty, unreviewedDays: unreviewed.length, latestDate, notes };
 
     const anchorJob = scheduled.find(j => j.id === anchorJobId);
     const benchTask = anchorJob?.tasks?.find(t => t.stage === "bench");
-    if (!benchTask) return { ...empty, unreviewedDays: unreviewed.length, latestDate };
+    if (!benchTask) return { ...empty, unreviewedDays: unreviewed.length, latestDate, notes };
 
     const latest = parseISO(latestDate);
     latest.setHours(0, 0, 0, 0);
@@ -2650,12 +2655,14 @@ function App() {
     schedOnly.setHours(0, 0, 0, 0);
     const offsetDays = diffDays(latest, schedOnly);
 
-    return { unreviewedDays: unreviewed.length, anchorJobId, anchorJobName: anchorJob.name, offsetDays, latestDate };
+    return { unreviewedDays: unreviewed.length, anchorJobId, anchorJobName: anchorJob.name, offsetDays, latestDate, notes };
   }, [floorActuals, settings.lastVarianceReviewDate, scheduled]);
 
-  // Only worth surfacing if there's an actual mismatch to look at — floor
-  // data that matches the plan exactly needs no review.
-  const varianceCount = (varianceReview.anchorJobId && varianceReview.offsetDays !== 0)
+  // Only worth surfacing if there's an actual mismatch to look at, OR the
+  // floor left a note — a day that hit its target exactly but still had a
+  // note worth reading (e.g. "close call, needed the extra hour") shouldn't
+  // go unseen just because it didn't move the schedule.
+  const varianceCount = (varianceReview.notes.length > 0 || (varianceReview.anchorJobId && varianceReview.offsetDays !== 0))
     ? varianceReview.unreviewedDays
     : 0;
 
@@ -3452,9 +3459,24 @@ function VarianceReviewModal({ review, preview, onAccept, onDismiss, onClose }) 
           <button style={styles.iconBtn} onClick={onClose}><X size={14} /></button>
         </div>
         <div style={{ ...styles.modalBody, paddingTop: 12 }}>
+          {review.notes.length > 0 && (
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: "#3a342c", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                Notes from the floor
+              </div>
+              {review.notes.map((n, i) => (
+                <div key={i} style={{ background: "#fdfaf2", border: "1px dashed #c89072", borderRadius: 3, padding: "8px 10px", fontSize: 12, color: "#7a6a55", lineHeight: 1.5, marginBottom: 6 }}>
+                  <span style={{ color: "#9b8f7e", fontSize: 10, display: "block", marginBottom: 2 }}>{fmtShort(parseISO(n.date))}</span>
+                  {n.text}
+                </div>
+              ))}
+            </div>
+          )}
           {!review.anchorJobId ? (
             <div style={{ fontSize: 12, color: "#7a6a55", lineHeight: 1.6 }}>
-              The floor board has recorded activity as of {latestLabel}, but nothing in it points to a specific job on the bench to compare against. Nothing to review.
+              {review.notes.length > 0
+                ? "Nothing in the floor board's activity points to a specific job on the bench to compare against, so there's no schedule change to consider — just the note above."
+                : `The floor board has recorded activity as of ${latestLabel}, but nothing in it points to a specific job on the bench to compare against. Nothing to review.`}
             </div>
           ) : review.offsetDays === 0 ? (
             <div style={{ fontSize: 12, color: "#7a6a55", lineHeight: 1.6 }}>
@@ -6473,6 +6495,15 @@ const FLOOR_BOARD_CSS = `
   .floor-board-root .notice{margin-top:22px;padding:10px 14px;border:1px dashed var(--rule);border-radius:4px;
     font-size:12px;color:var(--ink3);line-height:1.6}
   .floor-board-root .yesterday-wrap{margin-top:30px;max-width:900px}
+  .floor-board-root .notes-wrap{margin-top:30px;max-width:900px}
+  .floor-board-root .note-row{display:flex;gap:8px;margin-bottom:10px}
+  .floor-board-root .note-row input{flex:1;border:1px solid var(--rule);border-radius:4px;padding:9px 12px;
+    font-size:13px;background:#fff;color:var(--ink);font-family:Inter,sans-serif}
+  .floor-board-root .note-row button{background:var(--sage);color:var(--panel);border:none;border-radius:4px;
+    padding:9px 16px;font-size:13px;cursor:pointer;font-family:Inter,sans-serif}
+  .floor-board-root .note-item{background:var(--panel2);border:1px dashed var(--clay);border-radius:4px;
+    padding:9px 12px;font-size:13px;color:var(--ink2);line-height:1.5;margin-bottom:6px}
+  .floor-board-root .note-empty{font-size:12px;color:var(--ink3);font-style:italic}
   @media (max-width:1100px){.floor-board-root .pipe{flex-wrap:wrap}.floor-board-root .pipe-seg{flex:1 1 30%}}
   @media (prefers-reduced-motion:reduce){.floor-board-root *{transition:none!important}}
 `;
@@ -6540,7 +6571,7 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     return Math.max(0, Math.min(1, worked / dayLengthHours(now)));
   }
 
-  let today = {}, yesterday = {}, weekToDate = {}, offPlan = [], extraJobs = {}, selected = {};
+  let today = {}, yesterday = {}, weekToDate = {}, offPlan = [], notes = [], extraJobs = {}, selected = {};
 
   function jobsAt(stageKey) {
     return (planRef.current.stages[stageKey] || []).concat(extraJobs[stageKey] || []);
@@ -6687,7 +6718,27 @@ function mountFloorBoard(root, planRef, holidaysSet) {
       : "Not connected to the schedule, so counts will clear when this page reloads.";
   }
 
-  function renderAll() { renderPipe(); renderWeek(); renderStages(); renderYesterday(); }
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  function renderNotes() {
+    $("notes-list").innerHTML = notes.length
+      ? notes.map(n => `<div class="note-item">${escapeHtml(n)}</div>`).join("")
+      : `<div class="note-empty">Nothing logged today.</div>`;
+  }
+
+  function addNote() {
+    const input = $("note-input");
+    const text = (input.value || "").trim();
+    if (!text) return;
+    notes = [...notes, text];
+    input.value = "";
+    renderNotes();
+    queueSave(dayKeyFor(new Date()), { ...today, offPlan, notes });
+  }
+
+  function renderAll() { renderPipe(); renderWeek(); renderStages(); renderYesterday(); renderNotes(); }
 
   function bump(stageKey, delta) {
     const jobId = selected[stageKey];
@@ -6695,7 +6746,7 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     today[stageKey] = today[stageKey] || {};
     today[stageKey][jobId] = Math.max(0, (today[stageKey][jobId] || 0) + delta);
     renderAll();
-    queueSave(dayKeyFor(new Date()), { ...today, offPlan });
+    queueSave(dayKeyFor(new Date()), { ...today, offPlan, notes });
     const wtd = { ...weekToDate };
     wtd[stageKey] = (wtd[stageKey] || 0) + delta;
     weekToDate = wtd;
@@ -6717,7 +6768,7 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     offPlan.push({ stage: stageKey, jobId: options[idx].jobId });
     selected[stageKey] = options[idx].jobId;
     renderAll();
-    queueSave(dayKeyFor(new Date()), { ...today, offPlan });
+    queueSave(dayKeyFor(new Date()), { ...today, offPlan, notes });
   }
 
   const onClick = (e) => {
@@ -6725,9 +6776,14 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     if (!b) return;
     if (b.dataset.job) { selected[b.dataset.stage] = b.dataset.job; renderAll(); return; }
     if (b.dataset.add) { addJobToStage(b.dataset.add); return; }
+    if (b.dataset.addnote) { addNote(); return; }
     if (b.dataset.k) { bump(b.dataset.k, parseInt(b.dataset.d, 10)); }
   };
   root.addEventListener("click", onClick);
+  const onKeydown = (e) => {
+    if (e.key === "Enter" && e.target && e.target.id === "note-input") addNote();
+  };
+  root.addEventListener("keydown", onKeydown);
 
   let currentDay = iso(new Date());
   let unsubscribe = null;
@@ -6739,8 +6795,8 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     await flush();
     currentDay = nowDay;
     const prev = await load(dayKeyFor(prevWorkingDay(new Date())));
-    if (prev) { delete prev.offPlan; yesterday = prev; } else { yesterday = {}; }
-    today = {}; offPlan = []; extraJobs = {}; selected = {};
+    if (prev) { delete prev.offPlan; delete prev.notes; yesterday = prev; } else { yesterday = {}; }
+    today = {}; offPlan = []; notes = []; extraJobs = {}; selected = {};
     weekToDate = (await load(weekKeyFor(new Date()))) || {};
     renderDate(); renderAll();
   }
@@ -6748,16 +6804,16 @@ function mountFloorBoard(root, planRef, holidaysSet) {
   (async function init() {
     renderDate(); renderNotice();
     const t = await load(dayKeyFor(new Date()));
-    if (t) { offPlan = t.offPlan || []; delete t.offPlan; today = t; }
+    if (t) { offPlan = t.offPlan || []; notes = t.notes || []; delete t.offPlan; delete t.notes; today = t; }
     const y = await load(dayKeyFor(prevWorkingDay(new Date())));
-    if (y) { delete y.offPlan; yesterday = y; }
+    if (y) { delete y.offPlan; delete y.notes; yesterday = y; }
     weekToDate = (await load(weekKeyFor(new Date()))) || {};
     renderAll();
 
     if (store && store.subscribe) {
       unsubscribe = store.subscribe(async () => {
         const t2 = await load(dayKeyFor(new Date()));
-        if (t2) { offPlan = t2.offPlan || []; delete t2.offPlan; today = t2; }
+        if (t2) { offPlan = t2.offPlan || []; notes = t2.notes || []; delete t2.offPlan; delete t2.notes; today = t2; }
         renderAll();
       });
     }
@@ -6772,6 +6828,7 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     onPlanChanged() { renderAll(); },
     teardown() {
       root.removeEventListener("click", onClick);
+      root.removeEventListener("keydown", onKeydown);
       if (unsubscribe) unsubscribe();
       if (interval) clearInterval(interval);
       clearTimeout(flushTimer);
@@ -6824,6 +6881,14 @@ function FloorBoard({ scheduled, dayLayout }) {
         <h2 className="sec">Today · tap as each cabinet clears a stage</h2>
         <div className="stages" id="stages" />
         <div className="notice" id="notice" />
+        <div className="notes-wrap">
+          <h2 className="sec">Notes</h2>
+          <div className="note-row">
+            <input id="note-input" type="text" placeholder="Add a note about today..." maxLength={200} />
+            <button data-addnote="1">Add</button>
+          </div>
+          <div id="notes-list" />
+        </div>
         <div className="yesterday-wrap">
           <h2 className="sec">Yesterday</h2>
           <div id="yesterday" />
