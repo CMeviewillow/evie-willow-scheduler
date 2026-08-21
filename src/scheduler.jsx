@@ -58,11 +58,14 @@ const STAGE_LABELS = {
 // the job, empty/0 meaning "auto". One generic pair of Gantt callbacks
 // (onStageDrag/onStageResize/onStageReset) looks stage behavior up here
 // instead of branching on hardcoded stage names.
+// usedField only applies to the three stages that actually run on the
+// fractional-day bench/finishing model (machining and install use whole-day
+// math, no half-day start position to speak of).
 const DRAGGABLE_STAGES = {
   machining:  { dateField: "machiningOverride",  daysField: "machiningDaysOverride" },
-  bench:      { dateField: "benchOverride",      daysField: "benchDaysOverride" },
-  finishing:  { dateField: "finishingOverride",  daysField: "finishingDaysOverride" },
-  reassembly: { dateField: "reassemblyOverride", daysField: "reassemblyDaysOverride" },
+  bench:      { dateField: "benchOverride",      daysField: "benchDaysOverride", usedField: "benchOverrideUsed" },
+  finishing:  { dateField: "finishingOverride",  daysField: "finishingDaysOverride", usedField: "finishingOverrideUsed" },
+  reassembly: { dateField: "reassemblyOverride", daysField: "reassemblyDaysOverride", usedField: "reassemblyOverrideUsed" },
   install:    { dateField: "installOverride",    daysField: "installDaysOverride" },
 };
 
@@ -374,10 +377,13 @@ function newJob() {
     machiningDaysOverride: 0,// manual machining duration in days (0 = use auto-calc)
     benchOverride: "",          // ISO date, empty = auto (flows from bench cursor)
     benchDaysOverride: 0,       // days, 0 = auto (from cabinet counts and rates)
+    benchOverrideUsed: 0,       // 0 = start of day, 0.5 = half a day in (from dragging to a half-day position)
     finishingOverride: "",
     finishingDaysOverride: 0,
+    finishingOverrideUsed: 0,
     reassemblyOverride: "",
     reassemblyDaysOverride: 0,
+    reassemblyOverrideUsed: 0,
     installer: "auto",       // "auto" | "Steve" | "Thompson" | "Chris"
     machiningDays: 3,        // default machining duration
     notes: "",
@@ -706,12 +712,18 @@ function slotsOverlap(aStart, aEnd, bStart, bEnd) {
 // state — so pass 1 (pinning) and pass 2 (scheduling) always agree. An
 // override date always pins the START of a working day (used: 0) — you can
 // pin which day a stage starts, not which fraction of it it starts at.
-function computeOverrideInterval(overrideISO, daysOverride, autoDays, holidays) {
+// usedOverride lets a dragged/pinned override start partway through its day
+// (e.g. after lunch) instead of only ever at the start of it — capped to
+// that day's own capacity (relevant for Friday, whose capacity is already
+// less than a full day) and otherwise passed straight to normalizeToWorkingDay,
+// which already knows how to roll over if `used` reaches or exceeds capacity.
+function computeOverrideInterval(overrideISO, daysOverride, autoDays, holidays, usedOverride = 0) {
   const parsed = parseISO(overrideISO);
   const normDate = (isWeekend(parsed) || holidays.has(dayKey(parsed)))
     ? nextWorkingDay(parsed, holidays)
     : parsed;
-  const startSlot = normalizeToWorkingDay({ date: normDate, used: 0 }, holidays);
+  const cappedUsed = Math.max(0, Math.min(usedOverride || 0, dayCapacity(normDate)));
+  const startSlot = normalizeToWorkingDay({ date: normDate, used: cappedUsed }, holidays);
   const days = (daysOverride && daysOverride > 0) ? daysOverride : autoDays;
   const endSlot = advanceFractionalDay(startSlot, days, holidays);
   return { startSlot, endSlot };
@@ -812,7 +824,7 @@ function scheduleJobs(jobs, holidays, settings) {
     const nominalBenchDays = benchDaysForJob(job);
 
     if (job.benchOverride) {
-      const interval = computeOverrideInterval(job.benchOverride, job.benchDaysOverride, nominalBenchDays, holidays);
+      const interval = computeOverrideInterval(job.benchOverride, job.benchDaysOverride, nominalBenchDays, holidays, job.benchOverrideUsed);
       for (const existing of state.benchOccupied) {
         if (slotsOverlap(interval.startSlot, interval.endSlot, existing.startSlot, existing.endSlot)) {
           warnings.push({
@@ -827,7 +839,7 @@ function scheduleJobs(jobs, holidays, settings) {
     }
     if (job.finishingOverride) {
       const nominalFinishDays = nominalBenchDays + impact.flatExtra;
-      const interval = computeOverrideInterval(job.finishingOverride, job.finishingDaysOverride, nominalFinishDays, holidays);
+      const interval = computeOverrideInterval(job.finishingOverride, job.finishingDaysOverride, nominalFinishDays, holidays, job.finishingOverrideUsed);
       for (const existing of state.finishingOccupied) {
         if (slotsOverlap(interval.startSlot, interval.endSlot, existing.startSlot, existing.endSlot)) {
           warnings.push({
@@ -1340,7 +1352,7 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
   const SLACK_THRESHOLD_WORKING_DAYS = 15; // ~3 working weeks before deferral kicks in
   let benchStartSlot, benchEndSlot;
   if (benchWasPinned) {
-    const interval = computeOverrideInterval(job.benchOverride, job.benchDaysOverride, benchDays, holidays);
+    const interval = computeOverrideInterval(job.benchOverride, job.benchDaysOverride, benchDays, holidays, job.benchOverrideUsed);
     benchStartSlot = interval.startSlot;
     benchEndSlot = interval.endSlot;
   } else {
@@ -1465,7 +1477,7 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
   let finishStartSlot, finishEndSlot;
   let finishingPushed = false;
   if (finishWasPinned) {
-    const interval = computeOverrideInterval(job.finishingOverride, job.finishingDaysOverride, finishDays, holidays);
+    const interval = computeOverrideInterval(job.finishingOverride, job.finishingDaysOverride, finishDays, holidays, job.finishingOverrideUsed);
     finishStartSlot = interval.startSlot;
     finishEndSlot = interval.endSlot;
     if (compareFractionalSlot(finishStartSlot, benchStartSlot) < 0) {
@@ -1520,7 +1532,7 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
   };
   let reassemblyStartSlot, reassemblyEndSlot;
   if (reassemblyWasPinned) {
-    const interval = computeOverrideInterval(job.reassemblyOverride, job.reassemblyDaysOverride, benchDays, holidays);
+    const interval = computeOverrideInterval(job.reassemblyOverride, job.reassemblyDaysOverride, benchDays, holidays, job.reassemblyOverrideUsed);
     reassemblyStartSlot = interval.startSlot;
     reassemblyEndSlot = interval.endSlot;
     if (compareFractionalSlot(reassemblyStartSlot, finishStartSlot) < 0) {
@@ -3091,10 +3103,12 @@ function App() {
           startDate={parseISO(settings.startDate)}
           holidays={holidaySet}
           fitterHolidays={settings.fitterHolidays || []}
-          onStageDrag={(jobId, stage, isoDate) => {
+          onStageDrag={(jobId, stage, isoDate, usedFraction) => {
             const cfg = DRAGGABLE_STAGES[stage];
             if (!cfg) return;
-            updateJob(jobId, { [cfg.dateField]: isoDate });
+            const patch = { [cfg.dateField]: isoDate };
+            if (cfg.usedField) patch[cfg.usedField] = usedFraction || 0;
+            updateJob(jobId, patch);
           }}
           onStageResize={(jobId, stage, days) => {
             const cfg = DRAGGABLE_STAGES[stage];
@@ -3104,7 +3118,9 @@ function App() {
           onStageReset={(jobId, stage) => {
             const cfg = DRAGGABLE_STAGES[stage];
             if (!cfg) return;
-            updateJob(jobId, { [cfg.dateField]: "", [cfg.daysField]: 0 });
+            const patch = { [cfg.dateField]: "", [cfg.daysField]: 0 };
+            if (cfg.usedField) patch[cfg.usedField] = 0;
+            updateJob(jobId, patch);
           }}
           onToggleLock={(jobId, scheduledJob) => {
             // When locking: snapshot the current install date, duration, and fitter
@@ -3897,9 +3913,10 @@ function JobRow({ job, isEditing, onSelect, onUpdate, onDelete }) {
 // machining, bench, finishing and reassembly — install has its own two
 // panels further down (differently styled, tied to the lock UI), so it
 // isn't folded in here.
-function OverridePanel({ stageLabel, job, onUpdate, dateField, daysField }) {
+function OverridePanel({ stageLabel, job, onUpdate, dateField, daysField, usedField }) {
   const dateVal = job[dateField];
   const daysVal = job[daysField];
+  const usedVal = usedField ? (job[usedField] || 0) : 0;
   if (!dateVal && !(daysVal && daysVal > 0)) return null;
   return (
     <div style={{
@@ -3916,12 +3933,12 @@ function OverridePanel({ stageLabel, job, onUpdate, dateField, daysField }) {
     }}>
       <span>
         {stageLabel} manually adjusted
-        {dateVal && ` · starts ${fmtUK(parseISO(dateVal))}`}
+        {dateVal && ` · starts ${fmtUK(parseISO(dateVal))}${usedVal > 0 ? " (half day)" : ""}`}
         {daysVal > 0 && ` · ${daysVal} day${daysVal === 1 ? "" : "s"}`}
       </span>
       <button
         style={{ ...styles.btnGhost, padding: "3px 8px", fontSize: 10 }}
-        onClick={() => onUpdate({ [dateField]: "", [daysField]: 0 })}
+        onClick={() => onUpdate({ [dateField]: "", [daysField]: 0, ...(usedField ? { [usedField]: 0 } : {}) })}
       >
         Reset to auto
       </button>
@@ -4023,9 +4040,9 @@ function JobEditor({ job, onUpdate, onDelete }) {
           </div>
         </div>
         <OverridePanel stageLabel="Machining" job={job} onUpdate={onUpdate} dateField="machiningOverride" daysField="machiningDaysOverride" />
-        <OverridePanel stageLabel="Bench" job={job} onUpdate={onUpdate} dateField="benchOverride" daysField="benchDaysOverride" />
-        <OverridePanel stageLabel="Finishing" job={job} onUpdate={onUpdate} dateField="finishingOverride" daysField="finishingDaysOverride" />
-        <OverridePanel stageLabel="Re-assembly" job={job} onUpdate={onUpdate} dateField="reassemblyOverride" daysField="reassemblyDaysOverride" />
+        <OverridePanel stageLabel="Bench" job={job} onUpdate={onUpdate} dateField="benchOverride" daysField="benchDaysOverride" usedField="benchOverrideUsed" />
+        <OverridePanel stageLabel="Finishing" job={job} onUpdate={onUpdate} dateField="finishingOverride" daysField="finishingDaysOverride" usedField="finishingOverrideUsed" />
+        <OverridePanel stageLabel="Re-assembly" job={job} onUpdate={onUpdate} dateField="reassemblyOverride" daysField="reassemblyDaysOverride" usedField="reassemblyOverrideUsed" />
         <div style={styles.row2}>
           <div style={styles.field}>
             <label style={styles.labelSm}>Installer</label>
@@ -4646,33 +4663,66 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
                           const startX = e.clientX;
                           const barLeft = barLeftFor(t);
                           const barW = barWidthFor(t);
+                          // Bench/finishing/reassembly run on the fractional-day model and
+                          // can start partway through a day (e.g. after lunch), so they snap
+                          // to half-day positions; machining/install have no such concept and
+                          // keep the original whole-day-only snap.
+                          const supportsHalfDay = !!stageCfg.usedField;
                           let lastDate = null;
+                          let lastUsed = 0;
                           const onMove = (ev) => {
                             const dx = ev.clientX - startX;
                             const newLeft = barLeft + dx;
-                            const snappedDayIdx = Math.round(newLeft / COL_WIDTH);
-                            if (snappedDayIdx < 0 || snappedDayIdx >= days.length) return;
-                            let snappedDate = days[snappedDayIdx];
-                            while (isWeekend(snappedDate) || holidays.has(dayKey(snappedDate))) {
-                              snappedDate = addDays(snappedDate, 1);
-                              if (diffDays(snappedDate, ganttStart) >= days.length) break;
+                            if (supportsHalfDay) {
+                              const snappedHalfIdx = Math.round(newLeft / (COL_WIDTH / 2));
+                              const dayIdx = Math.floor(snappedHalfIdx / 2);
+                              if (dayIdx < 0 || dayIdx >= days.length) return;
+                              let snappedDate = days[dayIdx];
+                              let usedFraction = (snappedHalfIdx - dayIdx * 2) * 0.5;
+                              while (isWeekend(snappedDate) || holidays.has(dayKey(snappedDate))) {
+                                snappedDate = addDays(snappedDate, 1);
+                                usedFraction = 0;
+                                if (diffDays(snappedDate, ganttStart) >= days.length) break;
+                              }
+                              usedFraction = Math.min(usedFraction, dayCapacity(snappedDate));
+                              const snappedLeft = diffDays(snappedDate, ganttStart) * COL_WIDTH + usedFraction * COL_WIDTH;
+                              lastDate = dayKey(snappedDate);
+                              lastUsed = usedFraction;
+                              setDragState({
+                                jobId: job.id,
+                                currentLeft: snappedLeft,
+                                currentDate: lastDate,
+                                width: barW,
+                                stage: t.stage,
+                              });
+                            } else {
+                              const snappedDayIdx = Math.round(newLeft / COL_WIDTH);
+                              if (snappedDayIdx < 0 || snappedDayIdx >= days.length) return;
+                              let snappedDate = days[snappedDayIdx];
+                              while (isWeekend(snappedDate) || holidays.has(dayKey(snappedDate))) {
+                                snappedDate = addDays(snappedDate, 1);
+                                if (diffDays(snappedDate, ganttStart) >= days.length) break;
+                              }
+                              const snappedLeft = diffDays(snappedDate, ganttStart) * COL_WIDTH;
+                              lastDate = dayKey(snappedDate);
+                              lastUsed = 0;
+                              setDragState({
+                                jobId: job.id,
+                                currentLeft: snappedLeft,
+                                currentDate: lastDate,
+                                width: barW,
+                                stage: t.stage,
+                              });
                             }
-                            const snappedLeft = diffDays(snappedDate, ganttStart) * COL_WIDTH;
-                            lastDate = dayKey(snappedDate);
-                            setDragState({
-                              jobId: job.id,
-                              currentLeft: snappedLeft,
-                              currentDate: lastDate,
-                              width: barW,
-                              stage: t.stage,
-                            });
                           };
                           const onUp = () => {
                             window.removeEventListener("mousemove", onMove);
                             window.removeEventListener("mouseup", onUp);
                             setDragState(null);
-                            if (lastDate && lastDate !== dayKey(t.start)) {
-                              onStageDrag && onStageDrag(job.id, t.stage, lastDate);
+                            const startingUsed = t.startSlot?.used || 0;
+                            const usedChanged = supportsHalfDay && Math.abs(lastUsed - startingUsed) > DAY_EPSILON;
+                            if (lastDate && (lastDate !== dayKey(t.start) || usedChanged)) {
+                              onStageDrag && onStageDrag(job.id, t.stage, lastDate, lastUsed);
                             }
                           };
                           window.addEventListener("mousemove", onMove);
