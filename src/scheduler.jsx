@@ -4792,12 +4792,25 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
                             const startX = e.clientX;
                             const startWidth = barWidthFor(t);
                             const startDays = t.days;
+                            // Same fractional-day stages that can drag to a half-day start
+                            // can also resize in half-day steps; machining/install stay
+                            // whole-day-only, matching their existing behaviour exactly.
+                            const supportsHalfDay = !!stageCfg.usedField;
+                            const step = supportsHalfDay ? 0.5 : 1;
+                            const minDays = supportsHalfDay ? 0.5 : 1;
                             let lastDays = startDays;
                             let lastWidth = startWidth;
                             const onMove = (ev) => {
                               const dx = ev.clientX - startX;
-                              const dayDelta = Math.round(dx / COL_WIDTH);
-                              const newDays = Math.max(1, Math.min(15, startDays + dayDelta));
+                              // Snap the resulting duration to the nearest half-day grid
+                              // outright, rather than adding half-day deltas to startDays —
+                              // startDays itself may already be an arbitrary value (a typed
+                              // override, or finishing's flatExtra-adjusted nominal), so
+                              // snapping the end result is what actually guarantees a clean
+                              // half-day number instead of an odd one plus 0.5 forever.
+                              const rawDays = startDays + dx / COL_WIDTH;
+                              const snapped = Math.round(rawDays / step) * step;
+                              const newDays = Math.round(Math.max(minDays, Math.min(15, snapped)) * 10) / 10;
                               lastDays = newDays;
                               lastWidth = newDays * COL_WIDTH - 1;
                               setResizeState({
