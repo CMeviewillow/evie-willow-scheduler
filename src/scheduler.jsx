@@ -813,6 +813,13 @@ function scheduleJobs(jobs, holidays, settings) {
   const state = {
     benchOccupied: [],      // [{startSlot, endSlot, jobName, jobId}] — pinned + placed bench blocks
     finishingOccupied: [],  // same shape, for finishing capacity
+    // Auto (unpinned) jobs only search these two when finding a free slot —
+    // pins never go in here, so dragging/adding a pin never displaces an
+    // auto-scheduled job that was already sitting fine where it was. Pins
+    // may end up overlapping an auto job's slot as a result; that's allowed,
+    // same as two pins overlapping each other, and gets a quiet warning.
+    benchOccupiedAuto: [],
+    finishingOccupiedAuto: [],
     installerSchedules: {},
     installBookings: [],   // [{customer, jobName, start, end, installer, cabCount, weekKey}]
     vanBookings: [],       // [{date, jobName, isSibling}] — 1 van can do 1 delivery per day
@@ -873,10 +880,14 @@ function scheduleJobs(jobs, holidays, settings) {
 
     const result = scheduleSingleJob(job, state, holidays, settings, impact);
     if (!result.benchWasPinned) {
-      state.benchOccupied.push({ ...result.benchInterval, jobName: job.name, jobId: job.id });
+      const entry = { ...result.benchInterval, jobName: job.name, jobId: job.id };
+      state.benchOccupied.push(entry);
+      state.benchOccupiedAuto.push(entry);
     }
     if (!result.finishWasPinned) {
-      state.finishingOccupied.push({ ...result.finishingInterval, jobName: job.name, jobId: job.id });
+      const entry = { ...result.finishingInterval, jobName: job.name, jobId: job.id };
+      state.finishingOccupied.push(entry);
+      state.finishingOccupiedAuto.push(entry);
     }
     if (result.installerBooking) {
       if (result.installer === "Team") {
@@ -1363,7 +1374,7 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     benchStartSlot = interval.startSlot;
     benchEndSlot = interval.endSlot;
   } else {
-    const asapSlot = findFreeBenchSlot(earliestBenchSlot, benchActualDays, state.benchOccupied, holidays);
+    const asapSlot = findFreeBenchSlot(earliestBenchSlot, benchActualDays, state.benchOccupiedAuto, holidays);
     benchStartSlot = asapSlot;
     if (pinnedInstallDate) {
       const { benchStart: latestBenchStartDate } = backwardFromInstall(
@@ -1372,7 +1383,7 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
       const desiredLatestBenchStart = { date: latestBenchStartDate, used: 0 };
       const slackWorkingDays = workingDaysBetween(asapSlot.date, desiredLatestBenchStart.date, holidays);
       if (slackWorkingDays >= SLACK_THRESHOLD_WORKING_DAYS) {
-        const latestSlot = findLatestFreeBenchSlot(desiredLatestBenchStart, benchActualDays, state.benchOccupied, holidays);
+        const latestSlot = findLatestFreeBenchSlot(desiredLatestBenchStart, benchActualDays, state.benchOccupiedAuto, holidays);
         // Only actually defer if the backward search landed later than ASAP —
         // if congestion pushed it back to (or before) the ASAP slot anyway,
         // there's no benefit, just use ASAP.
@@ -1383,6 +1394,21 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     }
   }
   benchEndSlot = advanceFractionalDay(benchStartSlot, benchActualDays, holidays);
+  // Auto-placed bench no longer avoids pinned jobs (see benchOccupiedAuto
+  // above), so it can land right on top of one — allowed, but worth a quiet
+  // note same as a pin-vs-pin overlap, rather than going completely unsaid.
+  if (!benchWasPinned) {
+    for (const existing of state.benchOccupied) {
+      if (slotsOverlap(benchStartSlot, benchEndSlot, existing.startSlot, existing.endSlot)) {
+        warnings.push({
+          jobId: job.id,
+          jobName: job.name,
+          type: "buffer_too_tight",
+          message: `Bench overlaps ${existing.jobName}'s pinned bench — both left in place, resolve manually`,
+        });
+      }
+    }
+  }
   const benchInterval = { startSlot: benchStartSlot, endSlot: benchEndSlot };
   tasks.push({
     stage: "bench",
@@ -1496,7 +1522,7 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
       });
     }
   } else {
-    finishStartSlot = findFreeBenchSlot(desiredFinishStart, finishActualDays, state.finishingOccupied, holidays);
+    finishStartSlot = findFreeBenchSlot(desiredFinishStart, finishActualDays, state.finishingOccupiedAuto, holidays);
     if (compareFractionalSlot(finishStartSlot, desiredFinishStart) > 0) {
       finishingPushed = true;
       // Only warn if the push actually moves to a different day
@@ -1510,6 +1536,18 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
       }
     }
     finishEndSlot = advanceFractionalDay(finishStartSlot, finishActualDays, holidays);
+    // Auto-placed finishing no longer avoids pinned jobs either — allowed,
+    // same quiet note as the bench case above rather than going unsaid.
+    for (const existing of state.finishingOccupied) {
+      if (slotsOverlap(finishStartSlot, finishEndSlot, existing.startSlot, existing.endSlot)) {
+        warnings.push({
+          jobId: job.id,
+          jobName: job.name,
+          type: "buffer_too_tight",
+          message: `Finishing overlaps ${existing.jobName}'s pinned finishing — both left in place, resolve manually`,
+        });
+      }
+    }
   }
   const finishingInterval = { startSlot: finishStartSlot, endSlot: finishEndSlot };
   tasks.push({
@@ -2134,10 +2172,16 @@ function findBestSlot(hypoJob, existingJobs, holidays, settings, options = {}) {
   // First, build the current state by scheduling all existing jobs
   const { scheduled } = scheduleJobs(existingJobs, holidays, settings);
 
-  // Build state snapshot from scheduled jobs
+  // Build state snapshot from scheduled jobs. Unlike the live scheduler, the
+  // What-If tool always wants the hypothetical job to avoid EVERY existing
+  // job (pinned or not) — it's answering "where's actually free right now",
+  // not "don't disturb an already-settled auto job", so bench/finishingOccupiedAuto
+  // here deliberately mirror the full occupied lists rather than excluding pins.
   const state = {
     benchOccupied: [],
     finishingOccupied: [],
+    benchOccupiedAuto: [],
+    finishingOccupiedAuto: [],
     installerSchedules: {},
     installBookings: [],
     vanBookings: [],
@@ -2150,10 +2194,14 @@ function findBestSlot(hypoJob, existingJobs, holidays, settings, options = {}) {
     const finishTask = job.tasks.find(t => t.stage === "finishing");
     const installTask = job.tasks.find(t => t.stage === "install");
     if (benchTask?.startSlot && benchTask?.endSlot) {
-      state.benchOccupied.push({ startSlot: benchTask.startSlot, endSlot: benchTask.endSlot, jobName: job.name, jobId: job.id });
+      const entry = { startSlot: benchTask.startSlot, endSlot: benchTask.endSlot, jobName: job.name, jobId: job.id };
+      state.benchOccupied.push(entry);
+      state.benchOccupiedAuto.push(entry);
     }
     if (finishTask?.startSlot && finishTask?.endSlot) {
-      state.finishingOccupied.push({ startSlot: finishTask.startSlot, endSlot: finishTask.endSlot, jobName: job.name, jobId: job.id });
+      const entry = { startSlot: finishTask.startSlot, endSlot: finishTask.endSlot, jobName: job.name, jobId: job.id };
+      state.finishingOccupied.push(entry);
+      state.finishingOccupiedAuto.push(entry);
     }
     if (installTask && installTask.installer) {
       // Team installs claim all three fitters, same as the live scheduling
@@ -2268,6 +2316,8 @@ function deepCloneState(state) {
   return {
     benchOccupied: cloneOccupied(state.benchOccupied),
     finishingOccupied: cloneOccupied(state.finishingOccupied),
+    benchOccupiedAuto: cloneOccupied(state.benchOccupiedAuto),
+    finishingOccupiedAuto: cloneOccupied(state.finishingOccupiedAuto),
     installerSchedules: Object.fromEntries(
       Object.entries(state.installerSchedules).map(([k, v]) => [
         k,
@@ -2527,38 +2577,16 @@ function App() {
     [warnings, dismissedWarnings]
   );
 
-  // Auto-popup only for SERIOUS warnings. Routine warnings (FITTER swap, PAIR, DATE
-  // moved a few days, BUFFER tight, LOAD) just accumulate in the bell — you can
-  // open the modal whenever you want. Serious warnings DO auto-pop because they
-  // need attention: target unreachable, locked-job conflicts, fitter conflicts.
-  //
-  // BUT: NEVER auto-pop while the user is actively editing a job. The editor is
-  // open whenever editingJobId is non-null. Closing the editor (clicking a job
-  // to deselect, or saving) lets the popup fire if there are unresolved warnings.
-  // Collisions between jobs (installer_conflict, buffer_too_tight) are allowed
-  // by design now — overscheduling is the workshop's call, so they no longer
-  // interrupt with a popup, just sit in the bell. Only a genuinely unreachable
-  // customer-promised date (target_unreachable) still pops.
+  // Nothing auto-pops the warnings modal any more — every warning, including a
+  // genuinely unreachable customer-promised date, just sits quietly in the
+  // bell until you choose to open it. The schedule can move fast when a lot
+  // of jobs are being rearranged at once, and a popup firing mid-edit was
+  // pure interruption; the badge count is enough to know something's there.
+  // Still used to decide what counts as "worth surfacing" in the variance
+  // review's before/after preview.
   const SERIOUS_WARNING_TYPES = new Set([
     "target_unreachable",
   ]);
-  const seriousActiveSig = useMemo(() =>
-    activeWarnings
-      .filter(w => SERIOUS_WARNING_TYPES.has(w.type))
-      .map(fingerprintFor)
-      .join("~"),
-    [activeWarnings]
-  );
-  const [lastSeenSeriousSig, setLastSeenSeriousSig] = useState("");
-  useEffect(() => {
-    if (loading) return;
-    if (seriousActiveSig === "") return;
-    if (seriousActiveSig === lastSeenSeriousSig) return;
-    // Don't pop while user is editing — wait until they close the editor
-    if (editingJobId !== null) return;
-    setShowWarnings(true);
-    setLastSeenSeriousSig(seriousActiveSig);
-  }, [seriousActiveSig, loading, editingJobId]);
 
   // Garbage-collect dismissed warnings whose fingerprint is no longer produced
   // (e.g. job deleted, or warning resolved). Keeps the storage tidy.
@@ -2604,12 +2632,9 @@ function App() {
     return out;
   }, [scheduled, dismissedReminders]);
 
-  // Auto-pop reminders on load if any are active
-  useEffect(() => {
-    if (!loading && activeReminders.length > 0) {
-      setShowReminders(true);
-    }
-  }, [loading, activeReminders.length]);
+  // Survey reminders no longer auto-pop on load — same reasoning as the
+  // warnings modal above. The badge (reminderCount in the header) still
+  // shows how many are outstanding; opening the list is a deliberate click.
 
   // Figure out whether the floor board has recorded anything since the last
   // variance review, and if so, which job it says was actually on the bench
