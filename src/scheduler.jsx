@@ -664,6 +664,13 @@ function fitterOnHolidayDuring(fitter, start, end, fitterHolidays) {
   return null;
 }
 
+// Earliest date a fitter is actually free to take this on — used to pick the
+// best available fitter when auto-assigning, and to find an alternative when
+// the chosen one is on holiday. Still avoids existing bookings here: that's
+// load-balancing between fitters (a good thing, never part of the "rigid"
+// complaint), not the collision-blocking that got removed elsewhere. Once a
+// fitter+date is actually decided, a clash with it is allowed and just
+// produces a warning — see the collision check below where installer is set.
 function findEarliestInstallSlot(fitter, earliest, days, state, holidays, fitterHolidays) {
   const sched = state.installerSchedules[fitter] || [];
   let proposedStart = earliest;
@@ -1581,20 +1588,22 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
 
   let earliestInstallStart;
   if (job.installOverride) {
-    // Drag-overridden install: lands EXACTLY where the user put it. Production
-    // does not push it back, even if production finishes after install starts.
-    // We warn loudly so the user knows there's a physical impossibility, but
-    // they may have a workaround in mind (extending production, moving things
-    // around manually). It's their decision to make.
-    earliestInstallStart = pinnedInstallDate;
+    // Drag-overridden install: lands EXACTLY where the user put it, with one
+    // exception — production finishing AFTER install has started isn't a
+    // scheduling choice, it's physically impossible, so a too-tight date gets
+    // nudged forward to the earliest date production can actually hit.
+    // Everything else about the drag (the fitter, skipping auto-move/pairing)
+    // still behaves exactly as dropped.
     if (pinnedInstallDate < earliestFeasible) {
-      const gap = diffDays(earliestFeasible, pinnedInstallDate);
+      earliestInstallStart = earliestFeasible;
       warnings.push({
         jobId: job.id,
         jobName: job.name,
-        type: "target_unreachable",
-        message: `Install ${fmtUK(pinnedInstallDate)} is ${gap} working day${gap === 1 ? "" : "s"} BEFORE production finishes (${fmtUK(reassemblyEndDate)}) — physically impossible unless you move production earlier`,
+        type: "install_nudged",
+        message: `Install nudged from ${fmtUK(pinnedInstallDate)} to ${fmtUK(earliestFeasible)} — production doesn't finish until ${fmtUK(reassemblyEndDate)}`,
       });
+    } else {
+      earliestInstallStart = pinnedInstallDate;
     }
   } else if (pinnedInstallDate) {
     // Form-typed target (softer commitment): honour unless production can't finish in time.
@@ -1771,13 +1780,10 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     }
   }
 
-  // Normal collision check - find next free slot for this fitter,
-  // and check if this fitter is on holiday during the proposed install.
-  // If so, auto-reassign to an available alternative fitter.
-  //
-  // SKIP both checks if the user has manually set the install date via drag
-  // (installOverride). The user picked this date and fitter deliberately —
-  // any clashes were already warned about above. Don't move anything.
+  // Date/fitter double-booking is allowed board-wide — the workshop may
+  // deliberately overschedule, and the scheduler shouldn't silently reshuffle
+  // jobs to avoid it. We only ever auto-move for genuine fitter unavailability
+  // (holiday), and only for jobs the user hasn't manually drag-positioned.
   const skipAutoMove = !!job.installOverride;
 
   if (isTeam) {
@@ -1810,26 +1816,22 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
       }
     }
   } else {
-  // Normal (non-team) collision check - find next free slot for this fitter,
-  // and check if this fitter is on holiday during the proposed install.
-  // If so, auto-reassign to an available alternative fitter.
-  //
-  // SKIP both checks if the user has manually set the install date via drag
-  // (installOverride). The user picked this date and fitter deliberately —
-  // any clashes were already warned about above. Don't move anything.
+  // Normal (non-team) collision check — flag a clash with this fitter's
+  // existing bookings, but never move anything because of it. Overlapping
+  // installs are the workshop's call, not something the scheduler resolves.
   const sched = state.installerSchedules[installer] || [];
-  if (!skipAutoMove) {
-    let collision = true;
-    while (collision) {
-      collision = false;
-      const proposedSeq = workingDaysSeq(proposedStart, Math.ceil(installDays), holidays);
-      const propEnd = addDays(proposedSeq[proposedSeq.length - 1], 1);
-      for (const booked of sched) {
-        if (proposedSeq[0] < booked.end && propEnd > booked.start) {
-          collision = true;
-          proposedStart = nextWorkingDay(booked.end, holidays);
-          break;
-        }
+  {
+    const proposedSeq = workingDaysSeq(proposedStart, Math.ceil(installDays), holidays);
+    const propEnd = addDays(proposedSeq[proposedSeq.length - 1], 1);
+    for (const booked of sched) {
+      if (proposedSeq[0] < booked.end && propEnd > booked.start) {
+        warnings.push({
+          jobId: job.id,
+          jobName: job.name,
+          type: "installer_conflict",
+          message: `${installer} already booked ${fmtUK(booked.start)}–${fmtUK(addDays(booked.end, -1))} for ${booked.jobName} — overlaps this install`,
+        });
+        break;
       }
     }
   }
@@ -2533,10 +2535,12 @@ function App() {
   // BUT: NEVER auto-pop while the user is actively editing a job. The editor is
   // open whenever editingJobId is non-null. Closing the editor (clicking a job
   // to deselect, or saving) lets the popup fire if there are unresolved warnings.
+  // Collisions between jobs (installer_conflict, buffer_too_tight) are allowed
+  // by design now — overscheduling is the workshop's call, so they no longer
+  // interrupt with a popup, just sit in the bell. Only a genuinely unreachable
+  // customer-promised date (target_unreachable) still pops.
   const SERIOUS_WARNING_TYPES = new Set([
     "target_unreachable",
-    "installer_conflict",
-    "buffer_too_tight",
   ]);
   const seriousActiveSig = useMemo(() =>
     activeWarnings
@@ -3848,14 +3852,15 @@ function WarningsModal({ warnings, fingerprintFor, onApproveOne, onApproveAll, o
 function warningColorFor(type) {
   switch (type) {
     case "installer":          return "#6b4f8a"; // purple — fitter swap (auto)
-    case "installer_conflict": return "#c44a3a"; // red — needs your decision
+    case "installer_conflict": return "#8a6b3a"; // amber — overlap allowed, routine notice
     case "sibling":            return "#3a6b5a"; // green — pairing
     case "bunching":           return "#c44a3a"; // red — capacity issue
     case "target_stagger":     return "#c47a2a"; // orange — date moved
     case "target_unreachable": return "#c44a3a"; // red — hard miss
+    case "install_nudged":     return "#c47a2a"; // orange — date auto-corrected
     case "slip":               return "#c44a3a";
     case "buffer_tight":       return "#c47a2a"; // orange — buffer compressed
-    case "buffer_too_tight":   return "#c44a3a"; // red — under minimum
+    case "buffer_too_tight":   return "#8a6b3a"; // amber — overlap allowed, routine notice
     case "bench_gap":          return "#8a6b3a"; // amber — routine, bell only
     case "booth_run_mismatch": return "#8a6b3a"; // amber — routine, bell only
     case "load":
@@ -3867,14 +3872,15 @@ function warningColorFor(type) {
 function warningLabelFor(type) {
   switch (type) {
     case "installer":          return "FITTER";
-    case "installer_conflict": return "FITTER!";
+    case "installer_conflict": return "FITTER";
     case "sibling":            return "PAIR";
     case "bunching":           return "BENCH";
     case "target_stagger":     return "DATE";
     case "target_unreachable": return "TARGET";
+    case "install_nudged":     return "NUDGED";
     case "slip":               return "SLIP";
     case "buffer_tight":       return "BUFFER";
-    case "buffer_too_tight":   return "BUFFER!";
+    case "buffer_too_tight":   return "BUFFER";
     case "bench_gap":          return "GAP";
     case "booth_run_mismatch": return "BOOTH";
     case "load":
@@ -4211,6 +4217,103 @@ function JobEditor({ job, onUpdate, onDelete }) {
 // GANTT VIEW
 // ============================================================
 
+// Pure Gantt bar-positioning helpers, hoisted to module scope rather than
+// defined as closures inside GanttView. A closure gets a fresh identity on
+// every render; a module-level function never does — which is what lets
+// GanttRow (below) be wrapped in React.memo and actually skip re-rendering
+// rows untouched by a drag, instead of comparing "changed" function props on
+// every one of them every frame.
+const GANTT_WORKSHOP_STAGES = new Set(["machining", "bench", "finishing", "reassembly"]);
+
+function ganttXFor(date, ganttStart, colWidth) {
+  return diffDays(date, ganttStart) * colWidth;
+}
+
+// Position bars using fractional-day precision when available. `used` is a
+// fraction of the FULL day (0 to that day's capacity), so it maps directly
+// onto a proportional slice of the day's column width — a Friday bar simply
+// never fills past ~0.44 of the column, reflecting its shorter capacity.
+function ganttBarLeftFor(task, ganttStart, colWidth) {
+  if (task.startSlot) {
+    const dayOffset = diffDays(task.startSlot.date, ganttStart);
+    return dayOffset * colWidth + (task.startSlot.used * colWidth);
+  }
+  return ganttXFor(task.start, ganttStart, colWidth);
+}
+
+function ganttBarWidthFor(task, ganttStart, colWidth) {
+  if (task.startSlot && task.endSlot) {
+    const left = ganttBarLeftFor(task, ganttStart, colWidth);
+    const endDayOffset = diffDays(task.endSlot.date, ganttStart);
+    const right = endDayOffset * colWidth + (task.endSlot.used * colWidth);
+    return Math.max(right - left - 1, 6);
+  }
+  // Whole-day tasks: use start→end span
+  return Math.max(diffDays(task.end, task.start) * colWidth - 1, 6);
+}
+
+// Split a task into one or more segments so bars don't cross weekends/holidays.
+// Returns array of {left, width} pairs.
+function ganttSegmentsFor(task, ganttStart, colWidth, holidays) {
+  const segments = [];
+  const fullLeft = ganttBarLeftFor(task, ganttStart, colWidth);
+  const fullWidth = ganttBarWidthFor(task, ganttStart, colWidth);
+  if (fullWidth <= 0) return segments;
+  const fullRight = fullLeft + fullWidth;
+  const isWorkshop = GANTT_WORKSHOP_STAGES.has(task.stage);
+
+  // Walk each day in the task's span; emit segments broken by non-working days.
+  // For workshop stages, also break/truncate at Friday afternoons (workshop closed).
+  let segStart = null;
+  const taskStartDate = task.startSlot ? task.startSlot.date : task.start;
+  const taskEndDate = task.end;
+  let cur = new Date(taskStartDate.getTime());
+  while (cur < taskEndDate) {
+    const isNonWorking = isWeekend(cur) || holidays.has(dayKey(cur));
+    const isFriday = cur.getDay() === 5 && !isNonWorking;
+    const dayIdx = diffDays(cur, ganttStart);
+    const dayLeft = dayIdx * colWidth;
+
+    if (isNonWorking) {
+      // End any open segment just before this day
+      if (segStart !== null) {
+        segments.push({
+          left: segStart,
+          width: Math.max(Math.min(dayLeft, fullRight) - segStart - 1, 4),
+        });
+        segStart = null;
+      }
+    } else if (isFriday && isWorkshop) {
+      // Workshop stages close Friday at 11am (0.44 of a day), not midday.
+      if (segStart === null) {
+        segStart = Math.max(dayLeft, fullLeft);
+      }
+      const segEnd = Math.min(dayLeft + colWidth * FRIDAY_DAY_FRACTION, fullRight);
+      if (segEnd > segStart) {
+        segments.push({
+          left: segStart,
+          width: Math.max(segEnd - segStart - 1, 4),
+        });
+      }
+      segStart = null;
+    } else {
+      // Working day — either open a new segment or extend
+      if (segStart === null) {
+        segStart = Math.max(dayLeft, fullLeft);
+      }
+    }
+    cur = addDays(cur, 1);
+  }
+  // Close final segment
+  if (segStart !== null) {
+    segments.push({
+      left: segStart,
+      width: Math.max(fullRight - segStart - 1, 4),
+    });
+  }
+  return segments;
+}
+
 function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onStageResize, onStageReset, onToggleLock, onDeliveryDrag }) {
   const COL_WIDTH = 36;       // wider so day numbers are readable
   const ROW_HEIGHT = 64;
@@ -4227,148 +4330,81 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
   const [deliveryDragState, setDeliveryDragState] = useState(null);
   // deliveryDragState: { jobId, currentLeft, currentDate }
 
-  // Determine date range
-  const allDates = jobs.flatMap(j => (j.tasks || []).flatMap(t => [t.start, t.end]));
-  if (allDates.length === 0) {
+  // Chart geometry (day columns, month/week groupings) depends only on the
+  // jobs' dates and the workshop start date — memoized so a drag (which only
+  // ever touches local dragState) doesn't reallocate any of it every frame.
+  // That stability is what lets GanttRow's memoization below actually skip
+  // re-rendering the rows not involved in the drag.
+  const chart = useMemo(() => {
+    const allDates = jobs.flatMap(j => (j.tasks || []).flatMap(t => [t.start, t.end]));
+    if (allDates.length === 0) return null;
+    const minDate = new Date(Math.min(...allDates.map(d => d.getTime()), startDate.getTime()));
+    const maxDate = new Date(Math.max(...allDates.map(d => d.getTime())));
+    // Round minDate down to Monday
+    const dow = minDate.getDay();
+    const offsetToMon = dow === 0 ? -6 : 1 - dow;
+    const ganttStart = addDays(minDate, offsetToMon);
+    // Pad end by a week and round up to a Sunday
+    let ganttEnd = addDays(maxDate, 7);
+    while (ganttEnd.getDay() !== 0) ganttEnd = addDays(ganttEnd, 1);
+    const totalDays = diffDays(ganttEnd, ganttStart);
+
+    // Build day columns
+    const days = [];
+    for (let i = 0; i < totalDays; i++) {
+      days.push(addDays(ganttStart, i));
+    }
+
+    // Build month groupings
+    const months = [];
+    let curMonth = null;
+    days.forEach((d, i) => {
+      const m = d.toLocaleString("en-GB", { month: "long", year: "numeric" });
+      if (m !== curMonth) {
+        months.push({ label: m, startIdx: i, count: 0 });
+        curMonth = m;
+      }
+      months[months.length - 1].count++;
+    });
+
+    // Build week groupings (Mon–Sun)
+    const weeks = [];
+    days.forEach((d, i) => {
+      if (d.getDay() === 1 || i === 0) {
+        weeks.push({
+          label: "w/c " + d.toLocaleDateString("en-GB", { day: "numeric", month: "short" }),
+          startIdx: i,
+          count: 0,
+          date: d,
+        });
+      }
+      weeks[weeks.length - 1].count++;
+    });
+
+    return { ganttStart, ganttEnd, totalDays, days, months, weeks };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobs, startDate]);
+
+  // Rows flow top-to-bottom in the order each job's earliest stage actually
+  // starts, so dragging a job's bench (etc.) earlier than another job visibly
+  // moves it up the chart to match — an even flow down the page instead of a
+  // fixed, drag-independent order.
+  const orderedJobs = useMemo(() => {
+    const earliestStart = (job) => {
+      if (!job.tasks || !job.tasks.length) return Infinity;
+      return Math.min(...job.tasks.map(t => t.start.getTime()));
+    };
+    return [...jobs].sort((a, b) => earliestStart(a) - earliestStart(b));
+  }, [jobs]);
+
+  if (!chart) {
     return (
       <div style={styles.gantt}>
         <div style={styles.empty}>Add jobs to see the schedule.</div>
       </div>
     );
   }
-  const minDate = new Date(Math.min(...allDates.map(d => d.getTime()), startDate.getTime()));
-  const maxDate = new Date(Math.max(...allDates.map(d => d.getTime())));
-  // Round minDate down to Monday
-  const dow = minDate.getDay();
-  const offsetToMon = dow === 0 ? -6 : 1 - dow;
-  const ganttStart = addDays(minDate, offsetToMon);
-  // Pad end by a week and round up to a Sunday
-  let ganttEnd = addDays(maxDate, 7);
-  while (ganttEnd.getDay() !== 0) ganttEnd = addDays(ganttEnd, 1);
-  const totalDays = diffDays(ganttEnd, ganttStart);
-
-  // Build day columns
-  const days = [];
-  for (let i = 0; i < totalDays; i++) {
-    days.push(addDays(ganttStart, i));
-  }
-
-  // Build month groupings
-  const months = [];
-  let curMonth = null;
-  days.forEach((d, i) => {
-    const m = d.toLocaleString("en-GB", { month: "long", year: "numeric" });
-    if (m !== curMonth) {
-      months.push({ label: m, startIdx: i, count: 0 });
-      curMonth = m;
-    }
-    months[months.length - 1].count++;
-  });
-
-  // Build week groupings (Mon–Sun)
-  const weeks = [];
-  days.forEach((d, i) => {
-    if (d.getDay() === 1 || i === 0) {
-      weeks.push({
-        label: "w/c " + d.toLocaleDateString("en-GB", { day: "numeric", month: "short" }),
-        startIdx: i,
-        count: 0,
-        date: d,
-      });
-    }
-    weeks[weeks.length - 1].count++;
-  });
-
-  const xFor = (date) => diffDays(date, ganttStart) * COL_WIDTH;
-
-  // Position bars using fractional-day precision when available. `used` is a
-  // fraction of the FULL day (0 to that day's capacity), so it maps directly
-  // onto a proportional slice of the day's column width — a Friday bar simply
-  // never fills past ~0.44 of the column, reflecting its shorter capacity.
-  const barLeftFor = (task) => {
-    if (task.startSlot) {
-      const dayOffset = diffDays(task.startSlot.date, ganttStart);
-      return dayOffset * COL_WIDTH + (task.startSlot.used * COL_WIDTH);
-    }
-    return xFor(task.start);
-  };
-
-  const barWidthFor = (task) => {
-    if (task.startSlot && task.endSlot) {
-      const left = barLeftFor(task);
-      const endDayOffset = diffDays(task.endSlot.date, ganttStart);
-      const right = endDayOffset * COL_WIDTH + (task.endSlot.used * COL_WIDTH);
-      return Math.max(right - left - 1, 6);
-    }
-    // Whole-day tasks: use start→end span
-    return Math.max(diffDays(task.end, task.start) * COL_WIDTH - 1, 6);
-  };
-
-  // Split a task into one or more segments so bars don't cross weekends/holidays.
-  // Returns array of {left, width} pairs.
-  // Stages that are workshop-only (don't run Friday afternoons)
-  const WORKSHOP_STAGES = new Set(["machining", "bench", "finishing", "reassembly"]);
-
-  const segmentsFor = (task) => {
-    const segments = [];
-    // Determine the full pixel span
-    const fullLeft = barLeftFor(task);
-    const fullWidth = barWidthFor(task);
-    if (fullWidth <= 0) return segments;
-    const fullRight = fullLeft + fullWidth;
-    const isWorkshop = WORKSHOP_STAGES.has(task.stage);
-
-    // Walk each day in the task's span; emit segments broken by non-working days.
-    // For workshop stages, also break/truncate at Friday afternoons (workshop closed).
-    let segStart = null;
-    const taskStartDate = task.startSlot ? task.startSlot.date : task.start;
-    const taskEndDate = task.end;
-    let cur = new Date(taskStartDate.getTime());
-    while (cur < taskEndDate) {
-      const isNonWorking = isWeekend(cur) || holidays.has(dayKey(cur));
-      const isFriday = cur.getDay() === 5 && !isNonWorking;
-      const dayIdx = diffDays(cur, ganttStart);
-      const dayLeft = dayIdx * COL_WIDTH;
-
-      if (isNonWorking) {
-        // End any open segment just before this day
-        if (segStart !== null) {
-          segments.push({
-            left: segStart,
-            width: Math.max(Math.min(dayLeft, fullRight) - segStart - 1, 4),
-          });
-          segStart = null;
-        }
-      } else if (isFriday && isWorkshop) {
-        // Workshop stages close Friday at 11am (0.44 of a day), not midday.
-        if (segStart === null) {
-          segStart = Math.max(dayLeft, fullLeft);
-        }
-        const segEnd = Math.min(dayLeft + COL_WIDTH * FRIDAY_DAY_FRACTION, fullRight);
-        if (segEnd > segStart) {
-          segments.push({
-            left: segStart,
-            width: Math.max(segEnd - segStart - 1, 4),
-          });
-        }
-        segStart = null;
-      } else {
-        // Working day — either open a new segment or extend
-        if (segStart === null) {
-          segStart = Math.max(dayLeft, fullLeft);
-        }
-      }
-      cur = addDays(cur, 1);
-    }
-    // Close final segment
-    if (segStart !== null) {
-      segments.push({
-        left: segStart,
-        width: Math.max(fullRight - segStart - 1, 4),
-      });
-    }
-    return segments;
-  };
+  const { ganttStart, totalDays, days, months, weeks } = chart;
 
   const today = dayKey(new Date());
 
@@ -4496,491 +4532,29 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
 
           {/* Job rows */}
           <div style={{ position: "relative", marginTop: 4 }}>
-            {jobs.map((job, i) => (
-              <div
+            {orderedJobs.map((job, i) => (
+              <GanttRow
                 key={job.id}
-                style={{
-                  ...styles.ganttRow,
-                  height: ROW_HEIGHT,
-                  background: i % 2 ? "#fdfaf2" : "#f5f0e6",
-                }}
-              >
-                {/* Day grid lines (weekend + week-start emphasis) */}
-                {days.map((d, di) => {
-                  const isWk = isWeekend(d);
-                  const isHol = holidays.has(dayKey(d));
-                  const isToday = dayKey(d) === today;
-                  const isWeekStart = d.getDay() === 1;
-                  const isFriday = d.getDay() === 5 && !isHol;
-                  return (
-                    <React.Fragment key={di}>
-                      <div
-                        style={{
-                          position: "absolute",
-                          left: di * COL_WIDTH,
-                          width: COL_WIDTH,
-                          top: 0, bottom: 0,
-                          background: isToday ? "rgba(122,139,111,0.10)"
-                                    : isHol ? "rgba(165,97,79,0.10)"
-                                    : isWk ? "rgba(58,52,44,0.05)"
-                                    : "transparent",
-                          borderLeft: isWeekStart ? "1px solid #d9cfba" : "1px solid rgba(217,207,186,0.4)",
-                        }}
-                      />
-                      {/* Friday PM is non-working — hatched overlay on right half */}
-                      {isFriday && (
-                        <div
-                          style={{
-                            position: "absolute",
-                            left: di * COL_WIDTH + COL_WIDTH / 2,
-                            width: COL_WIDTH / 2,
-                            top: 0, bottom: 0,
-                            backgroundImage: "repeating-linear-gradient(135deg, transparent 0 4px, rgba(58,52,44,0.10) 4px 5px)",
-                            background: "rgba(58,52,44,0.05)",
-                            backgroundBlendMode: "multiply",
-                            pointerEvents: "none",
-                          }}
-                          title="Friday afternoon — workshop closed"
-                        />
-                      )}
-                    </React.Fragment>
-                  );
-                })}
-                {/* Task bars — split into segments so they don't cross weekends */}
-                {(job.tasks || []).flatMap((t, ti) => {
-                  const isHalfDay = t.startSlot && t.days && (t.days % 1 !== 0);
-                  const isInstall = t.stage === "install";
-                  const isTeamInstall = isInstall && t.installer === "Team";
-                  const hasSecondary = isInstall && !isTeamInstall && t.secondaryInstaller && FITTER_CONFIG[t.secondaryInstaller];
-                  const isDraggingThis = dragState && dragState.jobId === job.id && dragState.stage === t.stage;
-                  const isResizingThis = resizeState && resizeState.jobId === job.id && resizeState.stage === t.stage;
-                  const tooltip = `${STAGE_LABELS[t.stage]}: ${dayKey(t.start)}${t.days ? ` · ${t.days}d` : ""}${t.installer ? ` · ${t.installer === "Team" ? "Steve + Thompson + Chris" : t.installer}${hasSecondary ? " + " + t.secondaryInstaller : ""}` : ""}${t.siblingOf ? ` · parallel w/ ${t.siblingOf}` : ""}${isInstall ? " · drag to move, drag right edge to resize" : ""}`;
-                  // Install bars coloured by fitter
-                  let barColor;
-                  let barBackground;
-                  if (isTeamInstall) {
-                    // Diagonal stripes of all three fitter colours
-                    const sc = FITTER_CONFIG.Steve.color;
-                    const tc = FITTER_CONFIG.Thompson.color;
-                    const cc = FITTER_CONFIG.Chris.color;
-                    barBackground = `repeating-linear-gradient(135deg, ${sc} 0 8px, ${tc} 8px 16px, ${cc} 16px 24px)`;
-                    barColor = sc; // fallback for drag ghost
-                  } else if (hasSecondary) {
-                    // Two-fitter install: split bar — primary on top 65%, secondary stripe on bottom 35%
-                    const primary = FITTER_CONFIG[t.installer].color;
-                    const secondary = FITTER_CONFIG[t.secondaryInstaller].color;
-                    barBackground = `linear-gradient(to bottom, ${primary} 0 65%, ${secondary} 65% 100%)`;
-                    barColor = primary;
-                  } else if (isInstall && t.installer && FITTER_CONFIG[t.installer]) {
-                    barColor = FITTER_CONFIG[t.installer].color;
-                    barBackground = barColor;
-                  } else {
-                    barColor = STAGE_COLORS[t.stage];
-                    barBackground = barColor;
-                  }
-                  const segs = segmentsFor(t);
-
-                  // For install bars when being dragged, render a single ghost bar at the drag position
-                  if (isDraggingThis && dragState.currentLeft !== null) {
-                    const dragWidth = dragState.width;
-                    return [(
-                      <div
-                        key={`${ti}-drag`}
-                        style={{
-                          position: "absolute",
-                          left: dragState.currentLeft,
-                          width: dragWidth,
-                          top: getStageRowOffset(t.stage) - 1,
-                          height: 11,
-                          background: barColor,
-                          borderRadius: 3,
-                          boxShadow: "0 4px 12px rgba(58,52,44,0.35)",
-                          opacity: 0.92,
-                          outline: "2px solid #faf6ec",
-                          cursor: "grabbing",
-                          pointerEvents: "none",
-                        }}
-                        title={tooltip}
-                      />
-                    )];
-                  }
-
-                  // For install bars being resized, render a ghost bar with new width
-                  if (isResizingThis && resizeState.currentWidth !== null) {
-                    const resizeLeft = barLeftFor(t);
-                    return [(
-                      <div
-                        key={`${ti}-resize`}
-                        style={{
-                          position: "absolute",
-                          left: resizeLeft,
-                          width: resizeState.currentWidth,
-                          top: getStageRowOffset(t.stage) - 1,
-                          height: 11,
-                          background: barColor,
-                          borderRadius: 3,
-                          boxShadow: "0 4px 12px rgba(58,52,44,0.35)",
-                          opacity: 0.92,
-                          outline: "2px solid #faf6ec",
-                          cursor: "ew-resize",
-                          pointerEvents: "none",
-                        }}
-                        title={`${resizeState.currentDays} days`}
-                      >
-                        <div style={{
-                          position: "absolute",
-                          right: -4,
-                          top: -22,
-                          background: "#3a342c",
-                          color: "#faf6ec",
-                          padding: "2px 7px",
-                          fontSize: 10,
-                          borderRadius: 3,
-                          fontFamily: "'Cormorant Garamond', 'Georgia', serif",
-                          letterSpacing: "0.04em",
-                        }}>
-                          {resizeState.currentDays} days
-                        </div>
-                      </div>
-                    )];
-                  }
-
-                  const out = [];
-                  const isLocked = isInstall && !!job.locked;
-                  const stageCfg = DRAGGABLE_STAGES[t.stage];
-                  // Any draggable stage is interactive, except a locked install bar
-                  // (it stays pinned) and everything in read-only mode.
-                  const isDraggable = !IS_READONLY && !!stageCfg && !isLocked;
-                  const isResizable = isDraggable;
-                  segs.forEach((seg, si) => {
-                    const isLastSeg = si === segs.length - 1;
-                    out.push(
-                      <div
-                        key={`${ti}-${si}`}
-                        style={{
-                          position: "absolute",
-                          left: seg.left,
-                          width: seg.width,
-                          top: getStageRowOffset(t.stage),
-                          height: isInstall ? 11 : 9,
-                          background: barBackground,
-                          borderRadius: 2,
-                          boxShadow: isInstall
-                            ? "0 1px 2px rgba(58,52,44,0.18)"
-                            : "0 1px 0 rgba(58,52,44,0.12)",
-                          cursor: isDraggable ? "grab" : "default",
-                          outline: (t.isOverridden && !isLocked)
-                            ? "1px dashed rgba(58,52,44,0.4)"
-                            : "none",
-                        }}
-                        title={tooltip}
-                        onContextMenu={(isDraggable && t.isOverridden) ? (e) => {
-                          e.preventDefault();
-                          if (window.confirm(`Reset ${STAGE_LABELS[t.stage]} to auto-calculated position and duration?`)) {
-                            onStageReset && onStageReset(job.id, t.stage);
-                          }
-                        } : undefined}
-                        onMouseDown={isDraggable ? (e) => {
-                          e.preventDefault();
-                          const startX = e.clientX;
-                          const barLeft = barLeftFor(t);
-                          const barW = barWidthFor(t);
-                          // Bench/finishing/reassembly run on the fractional-day model and
-                          // can start partway through a day (e.g. after lunch), so they snap
-                          // to half-day positions; machining/install have no such concept and
-                          // keep the original whole-day-only snap.
-                          const supportsHalfDay = !!stageCfg.usedField;
-                          let lastDate = null;
-                          let lastUsed = 0;
-                          const onMove = (ev) => {
-                            const dx = ev.clientX - startX;
-                            const newLeft = barLeft + dx;
-                            if (supportsHalfDay) {
-                              const snappedHalfIdx = Math.round(newLeft / (COL_WIDTH / 2));
-                              const dayIdx = Math.floor(snappedHalfIdx / 2);
-                              if (dayIdx < 0 || dayIdx >= days.length) return;
-                              let snappedDate = days[dayIdx];
-                              let usedFraction = (snappedHalfIdx - dayIdx * 2) * 0.5;
-                              while (isWeekend(snappedDate) || holidays.has(dayKey(snappedDate))) {
-                                snappedDate = addDays(snappedDate, 1);
-                                usedFraction = 0;
-                                if (diffDays(snappedDate, ganttStart) >= days.length) break;
-                              }
-                              usedFraction = Math.min(usedFraction, dayCapacity(snappedDate));
-                              const snappedLeft = diffDays(snappedDate, ganttStart) * COL_WIDTH + usedFraction * COL_WIDTH;
-                              lastDate = dayKey(snappedDate);
-                              lastUsed = usedFraction;
-                              setDragState({
-                                jobId: job.id,
-                                currentLeft: snappedLeft,
-                                currentDate: lastDate,
-                                width: barW,
-                                stage: t.stage,
-                              });
-                            } else {
-                              const snappedDayIdx = Math.round(newLeft / COL_WIDTH);
-                              if (snappedDayIdx < 0 || snappedDayIdx >= days.length) return;
-                              let snappedDate = days[snappedDayIdx];
-                              while (isWeekend(snappedDate) || holidays.has(dayKey(snappedDate))) {
-                                snappedDate = addDays(snappedDate, 1);
-                                if (diffDays(snappedDate, ganttStart) >= days.length) break;
-                              }
-                              const snappedLeft = diffDays(snappedDate, ganttStart) * COL_WIDTH;
-                              lastDate = dayKey(snappedDate);
-                              lastUsed = 0;
-                              setDragState({
-                                jobId: job.id,
-                                currentLeft: snappedLeft,
-                                currentDate: lastDate,
-                                width: barW,
-                                stage: t.stage,
-                              });
-                            }
-                          };
-                          const onUp = () => {
-                            window.removeEventListener("mousemove", onMove);
-                            window.removeEventListener("mouseup", onUp);
-                            setDragState(null);
-                            const startingUsed = t.startSlot?.used || 0;
-                            const usedChanged = supportsHalfDay && Math.abs(lastUsed - startingUsed) > DAY_EPSILON;
-                            if (lastDate && (lastDate !== dayKey(t.start) || usedChanged)) {
-                              onStageDrag && onStageDrag(job.id, t.stage, lastDate, lastUsed);
-                            }
-                          };
-                          window.addEventListener("mousemove", onMove);
-                          window.addEventListener("mouseup", onUp);
-                        } : undefined}
-                      />
-                    );
-
-                    // Padlock icon overlay on locked install bars
-                    if (isInstall && isLocked && isLastSeg) {
-                      out.push(
-                        <div
-                          key={`${ti}-${si}-lockicon`}
-                          style={{
-                            position: "absolute",
-                            left: seg.left + 4,
-                            top: getStageRowOffset(t.stage) - 1,
-                            fontSize: 9,
-                            color: "#faf6ec",
-                            pointerEvents: "none",
-                            textShadow: "0 1px 1px rgba(58,52,44,0.5)",
-                          }}
-                        >🔒</div>
-                      );
-                    }
-
-                    // Team install icon overlay (only when not also locked, since lock takes the spot)
-                    if (isInstall && isTeamInstall && !isLocked && isLastSeg) {
-                      out.push(
-                        <div
-                          key={`${ti}-${si}-teamicon`}
-                          style={{
-                            position: "absolute",
-                            left: seg.left + 4,
-                            top: getStageRowOffset(t.stage) - 1,
-                            fontSize: 9,
-                            color: "#faf6ec",
-                            pointerEvents: "none",
-                            textShadow: "0 1px 1px rgba(58,52,44,0.6)",
-                            fontWeight: 700,
-                            letterSpacing: "0.05em",
-                          }}
-                        >TEAM</div>
-                      );
-                    }
-
-                    // Resize handle on the last segment only, for any draggable stage
-                    if (isResizable && isLastSeg) {
-                      out.push(
-                        <div
-                          key={`${ti}-${si}-handle`}
-                          style={{
-                            position: "absolute",
-                            left: seg.left + seg.width - 5,
-                            width: 8,
-                            top: getStageRowOffset(t.stage) - 2,
-                            height: 15,
-                            background: "rgba(58,52,44,0.55)",
-                            borderRadius: 2,
-                            cursor: "ew-resize",
-                            zIndex: 3,
-                          }}
-                          title={`Drag to resize · current: ${t.days} day${t.days === 1 ? "" : "s"}`}
-                          onMouseDown={(e) => {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            const startX = e.clientX;
-                            const startWidth = barWidthFor(t);
-                            const startDays = t.days;
-                            // Same fractional-day stages that can drag to a half-day start
-                            // can also resize in half-day steps; machining/install stay
-                            // whole-day-only, matching their existing behaviour exactly.
-                            const supportsHalfDay = !!stageCfg.usedField;
-                            const step = supportsHalfDay ? 0.5 : 1;
-                            const minDays = supportsHalfDay ? 0.5 : 1;
-                            let lastDays = startDays;
-                            let lastWidth = startWidth;
-                            const onMove = (ev) => {
-                              const dx = ev.clientX - startX;
-                              // Snap the resulting duration to the nearest half-day grid
-                              // outright, rather than adding half-day deltas to startDays —
-                              // startDays itself may already be an arbitrary value (a typed
-                              // override, or finishing's flatExtra-adjusted nominal), so
-                              // snapping the end result is what actually guarantees a clean
-                              // half-day number instead of an odd one plus 0.5 forever.
-                              const rawDays = startDays + dx / COL_WIDTH;
-                              const snapped = Math.round(rawDays / step) * step;
-                              const newDays = Math.round(Math.max(minDays, Math.min(15, snapped)) * 10) / 10;
-                              lastDays = newDays;
-                              lastWidth = newDays * COL_WIDTH - 1;
-                              setResizeState({
-                                jobId: job.id,
-                                currentDays: newDays,
-                                currentWidth: lastWidth,
-                                stage: t.stage,
-                              });
-                            };
-                            const onUp = () => {
-                              window.removeEventListener("mousemove", onMove);
-                              window.removeEventListener("mouseup", onUp);
-                              setResizeState(null);
-                              if (lastDays !== startDays) {
-                                onStageResize && onStageResize(job.id, t.stage, lastDays);
-                              }
-                            };
-                            window.addEventListener("mousemove", onMove);
-                            window.addEventListener("mouseup", onUp);
-                          }}
-                        />
-                      );
-                    }
-
-                    // Lock/unlock button just past the right edge of the install bar
-                    if (isInstall && isLastSeg) {
-                      out.push(
-                        <button
-                          key={`${ti}-${si}-lockbtn`}
-                          style={{
-                            position: "absolute",
-                            left: seg.left + seg.width + 6,
-                            top: getStageRowOffset(t.stage) - 3,
-                            width: 22,
-                            height: 17,
-                            padding: 0,
-                            border: "1px solid " + (isLocked ? "#7a8b6f" : "#d9cfba"),
-                            background: isLocked ? "#7a8b6f" : "#faf6ec",
-                            color: isLocked ? "#faf6ec" : "#7a6a55",
-                            borderRadius: 3,
-                            fontSize: 10,
-                            cursor: "pointer",
-                            zIndex: 4,
-                            fontFamily: "inherit",
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "center",
-                            lineHeight: 1,
-                          }}
-                          title={isLocked
-                            ? "Locked — click to unlock"
-                            : "Lock this install (date, duration, fitter)"}
-                          disabled={IS_READONLY}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            if (IS_READONLY) return;
-                            onToggleLock && onToggleLock(job.id, job);
-                          }}
-                        >
-                          {isLocked ? "🔓" : "🔒"}
-                        </button>
-                      );
-                    }
-                  });
-
-                  // Truck delivery icon (only for install tasks).
-                  // Positioned at the deliveryDate; draggable anywhere along the Gantt.
-                  if (isInstall && t.deliveryDate) {
-                    const isDraggingThisDel = deliveryDragState && deliveryDragState.jobId === job.id;
-                    const delDayIdx = diffDays(t.deliveryDate, ganttStart);
-                    const liveDelLeft = isDraggingThisDel
-                      ? deliveryDragState.currentLeft
-                      : delDayIdx * COL_WIDTH;
-                    const delDate = isDraggingThisDel
-                      ? parseISO(deliveryDragState.currentDate)
-                      : t.deliveryDate;
-                    const delTooltip = `Delivery: ${delDate.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })} · drag to reschedule`;
-                    out.push(
-                      <div
-                        key={`${ti}-truck`}
-                        title={delTooltip}
-                        style={{
-                          position: "absolute",
-                          left: liveDelLeft + 4,
-                          top: getStageRowOffset(t.stage) - 9,
-                          width: 22,
-                          height: 22,
-                          borderRadius: "50%",
-                          background: "#3a342c",
-                          color: "#faf6ec",
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                          cursor: IS_READONLY ? "default" : "grab",
-                          zIndex: 6,
-                          boxShadow: "0 1px 3px rgba(58,52,44,0.4)",
-                          border: "1.5px solid #faf6ec",
-                          opacity: isDraggingThisDel ? 0.85 : 1,
-                        }}
-                        onMouseDown={IS_READONLY ? undefined : (e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          const startX = e.clientX;
-                          const startLeft = delDayIdx * COL_WIDTH;
-                          let lastDate = null;
-                          const onMove = (ev) => {
-                            const dx = ev.clientX - startX;
-                            const newLeft = startLeft + dx;
-                            const snappedDayIdx = Math.round(newLeft / COL_WIDTH);
-                            if (snappedDayIdx < 0 || snappedDayIdx >= days.length) return;
-                            let snappedDate = days[snappedDayIdx];
-                            // Snap weekend/holiday days to next working day
-                            while (isWeekend(snappedDate) || holidays.has(dayKey(snappedDate))) {
-                              snappedDate = addDays(snappedDate, 1);
-                              if (diffDays(snappedDate, ganttStart) >= days.length) break;
-                            }
-                            const snappedLeft = diffDays(snappedDate, ganttStart) * COL_WIDTH;
-                            lastDate = dayKey(snappedDate);
-                            setDeliveryDragState({
-                              jobId: job.id,
-                              currentLeft: snappedLeft,
-                              currentDate: lastDate,
-                            });
-                          };
-                          const onUp = () => {
-                            window.removeEventListener("mousemove", onMove);
-                            window.removeEventListener("mouseup", onUp);
-                            setDeliveryDragState(null);
-                            if (lastDate && lastDate !== dayKey(t.deliveryDate)) {
-                              onDeliveryDrag && onDeliveryDrag(job.id, lastDate);
-                            }
-                          };
-                          window.addEventListener("mousemove", onMove);
-                          window.addEventListener("mouseup", onUp);
-                        }}
-                      >
-                        <Truck size={12} strokeWidth={2.2} />
-                      </div>
-                    );
-                  }
-
-                  return out;
-                })}
-                {/* Job label overlay */}
-                <div style={styles.ganttJobLabel}>
-                  {job.name || "—"}
-                </div>
-              </div>
+                job={job}
+                i={i}
+                days={days}
+                holidays={holidays}
+                ganttStart={ganttStart}
+                COL_WIDTH={COL_WIDTH}
+                ROW_HEIGHT={ROW_HEIGHT}
+                today={today}
+                dragState={dragState && dragState.jobId === job.id ? dragState : null}
+                resizeState={resizeState && resizeState.jobId === job.id ? resizeState : null}
+                deliveryDragState={deliveryDragState && deliveryDragState.jobId === job.id ? deliveryDragState : null}
+                setDragState={setDragState}
+                setResizeState={setResizeState}
+                setDeliveryDragState={setDeliveryDragState}
+                onStageDrag={onStageDrag}
+                onStageResize={onStageResize}
+                onStageReset={onStageReset}
+                onToggleLock={onToggleLock}
+                onDeliveryDrag={onDeliveryDrag}
+              />
             ))}
           </div>
         </div>
@@ -5011,6 +4585,534 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
     </div>
   );
 }
+
+// One Gantt row. Wrapped in React.memo so a drag — which only ever changes
+// dragState/resizeState/deliveryDragState for the ONE row being dragged —
+// doesn't force every other row to recompute and re-diff its day-grid and
+// task bars on every frame. The parent passes null for these three props on
+// every row except the one actually being dragged, so memo's shallow prop
+// comparison skips re-rendering the rest.
+const GanttRow = React.memo(function GanttRow({
+  job, i, days, holidays, ganttStart, COL_WIDTH, ROW_HEIGHT, today,
+  dragState, resizeState, deliveryDragState,
+  setDragState, setResizeState, setDeliveryDragState,
+  onStageDrag, onStageResize, onStageReset, onToggleLock, onDeliveryDrag,
+}) {
+  return (
+    <div
+      style={{
+        ...styles.ganttRow,
+        height: ROW_HEIGHT,
+        background: i % 2 ? "#fdfaf2" : "#f5f0e6",
+      }}
+    >
+      {/* Day grid lines (weekend + week-start emphasis) */}
+      {days.map((d, di) => {
+        const isWk = isWeekend(d);
+        const isHol = holidays.has(dayKey(d));
+        const isToday = dayKey(d) === today;
+        const isWeekStart = d.getDay() === 1;
+        const isFriday = d.getDay() === 5 && !isHol;
+        return (
+          <React.Fragment key={di}>
+            <div
+              style={{
+                position: "absolute",
+                left: di * COL_WIDTH,
+                width: COL_WIDTH,
+                top: 0, bottom: 0,
+                background: isToday ? "rgba(122,139,111,0.10)"
+                          : isHol ? "rgba(165,97,79,0.10)"
+                          : isWk ? "rgba(58,52,44,0.05)"
+                          : "transparent",
+                borderLeft: isWeekStart ? "1px solid #d9cfba" : "1px solid rgba(217,207,186,0.4)",
+              }}
+            />
+            {/* Friday PM is non-working — hatched overlay on right half */}
+            {isFriday && (
+              <div
+                style={{
+                  position: "absolute",
+                  left: di * COL_WIDTH + COL_WIDTH / 2,
+                  width: COL_WIDTH / 2,
+                  top: 0, bottom: 0,
+                  backgroundImage: "repeating-linear-gradient(135deg, transparent 0 4px, rgba(58,52,44,0.10) 4px 5px)",
+                  background: "rgba(58,52,44,0.05)",
+                  backgroundBlendMode: "multiply",
+                  pointerEvents: "none",
+                }}
+                title="Friday afternoon — workshop closed"
+              />
+            )}
+          </React.Fragment>
+        );
+      })}
+      {/* Task bars — split into segments so they don't cross weekends */}
+      {(job.tasks || []).flatMap((t, ti) => {
+        const isHalfDay = t.startSlot && t.days && (t.days % 1 !== 0);
+        const isInstall = t.stage === "install";
+        const isTeamInstall = isInstall && t.installer === "Team";
+        const hasSecondary = isInstall && !isTeamInstall && t.secondaryInstaller && FITTER_CONFIG[t.secondaryInstaller];
+        const isDraggingThis = dragState && dragState.jobId === job.id && dragState.stage === t.stage;
+        const isResizingThis = resizeState && resizeState.jobId === job.id && resizeState.stage === t.stage;
+        const tooltip = `${STAGE_LABELS[t.stage]}: ${dayKey(t.start)}${t.days ? ` · ${t.days}d` : ""}${t.installer ? ` · ${t.installer === "Team" ? "Steve + Thompson + Chris" : t.installer}${hasSecondary ? " + " + t.secondaryInstaller : ""}` : ""}${t.siblingOf ? ` · parallel w/ ${t.siblingOf}` : ""}${isInstall ? " · drag to move, drag right edge to resize" : ""}`;
+        // Install bars coloured by fitter
+        let barColor;
+        let barBackground;
+        if (isTeamInstall) {
+          // Diagonal stripes of all three fitter colours
+          const sc = FITTER_CONFIG.Steve.color;
+          const tc = FITTER_CONFIG.Thompson.color;
+          const cc = FITTER_CONFIG.Chris.color;
+          barBackground = `repeating-linear-gradient(135deg, ${sc} 0 8px, ${tc} 8px 16px, ${cc} 16px 24px)`;
+          barColor = sc; // fallback for drag ghost
+        } else if (hasSecondary) {
+          // Two-fitter install: split bar — primary on top 65%, secondary stripe on bottom 35%
+          const primary = FITTER_CONFIG[t.installer].color;
+          const secondary = FITTER_CONFIG[t.secondaryInstaller].color;
+          barBackground = `linear-gradient(to bottom, ${primary} 0 65%, ${secondary} 65% 100%)`;
+          barColor = primary;
+        } else if (isInstall && t.installer && FITTER_CONFIG[t.installer]) {
+          barColor = FITTER_CONFIG[t.installer].color;
+          barBackground = barColor;
+        } else {
+          barColor = STAGE_COLORS[t.stage];
+          barBackground = barColor;
+        }
+        const segs = ganttSegmentsFor(t, ganttStart, COL_WIDTH, holidays);
+
+        // For install bars when being dragged, render a single ghost bar at the drag position
+        if (isDraggingThis && dragState.currentLeft !== null) {
+          const dragWidth = dragState.width;
+          return [(
+            <div
+              key={`${ti}-drag`}
+              style={{
+                position: "absolute",
+                left: dragState.currentLeft,
+                width: dragWidth,
+                top: getStageRowOffset(t.stage) - 1,
+                height: 11,
+                background: barColor,
+                borderRadius: 3,
+                boxShadow: "0 4px 12px rgba(58,52,44,0.35)",
+                opacity: 0.92,
+                outline: "2px solid #faf6ec",
+                cursor: "grabbing",
+                pointerEvents: "none",
+              }}
+              title={tooltip}
+            />
+          )];
+        }
+
+        // For install bars being resized, render a ghost bar with new width
+        if (isResizingThis && resizeState.currentWidth !== null) {
+          const resizeLeft = ganttBarLeftFor(t, ganttStart, COL_WIDTH);
+          return [(
+            <div
+              key={`${ti}-resize`}
+              style={{
+                position: "absolute",
+                left: resizeLeft,
+                width: resizeState.currentWidth,
+                top: getStageRowOffset(t.stage) - 1,
+                height: 11,
+                background: barColor,
+                borderRadius: 3,
+                boxShadow: "0 4px 12px rgba(58,52,44,0.35)",
+                opacity: 0.92,
+                outline: "2px solid #faf6ec",
+                cursor: "ew-resize",
+                pointerEvents: "none",
+              }}
+              title={`${resizeState.currentDays} days`}
+            >
+              <div style={{
+                position: "absolute",
+                right: -4,
+                top: -22,
+                background: "#3a342c",
+                color: "#faf6ec",
+                padding: "2px 7px",
+                fontSize: 10,
+                borderRadius: 3,
+                fontFamily: "'Cormorant Garamond', 'Georgia', serif",
+                letterSpacing: "0.04em",
+              }}>
+                {resizeState.currentDays} days
+              </div>
+            </div>
+          )];
+        }
+
+        const out = [];
+        const isLocked = isInstall && !!job.locked;
+        const stageCfg = DRAGGABLE_STAGES[t.stage];
+        // Any draggable stage is interactive, except a locked install bar
+        // (it stays pinned) and everything in read-only mode.
+        const isDraggable = !IS_READONLY && !!stageCfg && !isLocked;
+        const isResizable = isDraggable;
+        segs.forEach((seg, si) => {
+          const isLastSeg = si === segs.length - 1;
+          out.push(
+            <div
+              key={`${ti}-${si}`}
+              style={{
+                position: "absolute",
+                left: seg.left,
+                width: seg.width,
+                top: getStageRowOffset(t.stage),
+                height: isInstall ? 11 : 9,
+                background: barBackground,
+                borderRadius: 2,
+                boxShadow: isInstall
+                  ? "0 1px 2px rgba(58,52,44,0.18)"
+                  : "0 1px 0 rgba(58,52,44,0.12)",
+                cursor: isDraggable ? "grab" : "default",
+                outline: (t.isOverridden && !isLocked)
+                  ? "1px dashed rgba(58,52,44,0.4)"
+                  : "none",
+              }}
+              title={tooltip}
+              onContextMenu={(isDraggable && t.isOverridden) ? (e) => {
+                e.preventDefault();
+                if (window.confirm(`Reset ${STAGE_LABELS[t.stage]} to auto-calculated position and duration?`)) {
+                  onStageReset && onStageReset(job.id, t.stage);
+                }
+              } : undefined}
+              onMouseDown={isDraggable ? (e) => {
+                e.preventDefault();
+                const startX = e.clientX;
+                const barLeft = ganttBarLeftFor(t, ganttStart, COL_WIDTH);
+                const barW = ganttBarWidthFor(t, ganttStart, COL_WIDTH);
+                // Bench/finishing/reassembly run on the fractional-day model and
+                // can start partway through a day (e.g. after lunch), so they snap
+                // to half-day positions; machining/install have no such concept and
+                // keep the original whole-day-only snap.
+                const supportsHalfDay = !!stageCfg.usedField;
+                let lastDate = null;
+                let lastUsed = 0;
+                // Coalesce mousemove updates to one setState per animation frame
+                // instead of one per raw event — mousemove can fire far faster than
+                // the display refreshes, and without this every extra event just
+                // queues up more re-renders than can actually be shown, which is
+                // what made dragging feel laggy.
+                let rafId = null;
+                let pendingState = null;
+                const flush = () => {
+                  rafId = null;
+                  if (pendingState) setDragState(pendingState);
+                };
+                const onMove = (ev) => {
+                  const dx = ev.clientX - startX;
+                  const newLeft = barLeft + dx;
+                  if (supportsHalfDay) {
+                    const snappedHalfIdx = Math.round(newLeft / (COL_WIDTH / 2));
+                    const dayIdx = Math.floor(snappedHalfIdx / 2);
+                    if (dayIdx < 0 || dayIdx >= days.length) return;
+                    let snappedDate = days[dayIdx];
+                    let usedFraction = (snappedHalfIdx - dayIdx * 2) * 0.5;
+                    while (isWeekend(snappedDate) || holidays.has(dayKey(snappedDate))) {
+                      snappedDate = addDays(snappedDate, 1);
+                      usedFraction = 0;
+                      if (diffDays(snappedDate, ganttStart) >= days.length) break;
+                    }
+                    usedFraction = Math.min(usedFraction, dayCapacity(snappedDate));
+                    const snappedLeft = diffDays(snappedDate, ganttStart) * COL_WIDTH + usedFraction * COL_WIDTH;
+                    lastDate = dayKey(snappedDate);
+                    lastUsed = usedFraction;
+                    pendingState = {
+                      jobId: job.id,
+                      currentLeft: snappedLeft,
+                      currentDate: lastDate,
+                      width: barW,
+                      stage: t.stage,
+                    };
+                  } else {
+                    const snappedDayIdx = Math.round(newLeft / COL_WIDTH);
+                    if (snappedDayIdx < 0 || snappedDayIdx >= days.length) return;
+                    let snappedDate = days[snappedDayIdx];
+                    while (isWeekend(snappedDate) || holidays.has(dayKey(snappedDate))) {
+                      snappedDate = addDays(snappedDate, 1);
+                      if (diffDays(snappedDate, ganttStart) >= days.length) break;
+                    }
+                    const snappedLeft = diffDays(snappedDate, ganttStart) * COL_WIDTH;
+                    lastDate = dayKey(snappedDate);
+                    lastUsed = 0;
+                    pendingState = {
+                      jobId: job.id,
+                      currentLeft: snappedLeft,
+                      currentDate: lastDate,
+                      width: barW,
+                      stage: t.stage,
+                    };
+                  }
+                  if (rafId === null) rafId = requestAnimationFrame(flush);
+                };
+                const onUp = () => {
+                  window.removeEventListener("mousemove", onMove);
+                  window.removeEventListener("mouseup", onUp);
+                  if (rafId !== null) cancelAnimationFrame(rafId);
+                  setDragState(null);
+                  const startingUsed = t.startSlot?.used || 0;
+                  const usedChanged = supportsHalfDay && Math.abs(lastUsed - startingUsed) > DAY_EPSILON;
+                  if (lastDate && (lastDate !== dayKey(t.start) || usedChanged)) {
+                    onStageDrag && onStageDrag(job.id, t.stage, lastDate, lastUsed);
+                  }
+                };
+                window.addEventListener("mousemove", onMove);
+                window.addEventListener("mouseup", onUp);
+              } : undefined}
+            />
+          );
+
+          // Padlock icon overlay on locked install bars
+          if (isInstall && isLocked && isLastSeg) {
+            out.push(
+              <div
+                key={`${ti}-${si}-lockicon`}
+                style={{
+                  position: "absolute",
+                  left: seg.left + 4,
+                  top: getStageRowOffset(t.stage) - 1,
+                  fontSize: 9,
+                  color: "#faf6ec",
+                  pointerEvents: "none",
+                  textShadow: "0 1px 1px rgba(58,52,44,0.5)",
+                }}
+              >🔒</div>
+            );
+          }
+
+          // Team install icon overlay (only when not also locked, since lock takes the spot)
+          if (isInstall && isTeamInstall && !isLocked && isLastSeg) {
+            out.push(
+              <div
+                key={`${ti}-${si}-teamicon`}
+                style={{
+                  position: "absolute",
+                  left: seg.left + 4,
+                  top: getStageRowOffset(t.stage) - 1,
+                  fontSize: 9,
+                  color: "#faf6ec",
+                  pointerEvents: "none",
+                  textShadow: "0 1px 1px rgba(58,52,44,0.6)",
+                  fontWeight: 700,
+                  letterSpacing: "0.05em",
+                }}
+              >TEAM</div>
+            );
+          }
+
+          // Resize handle on the last segment only, for any draggable stage
+          if (isResizable && isLastSeg) {
+            out.push(
+              <div
+                key={`${ti}-${si}-handle`}
+                style={{
+                  position: "absolute",
+                  left: seg.left + seg.width - 5,
+                  width: 8,
+                  top: getStageRowOffset(t.stage) - 2,
+                  height: 15,
+                  background: "rgba(58,52,44,0.55)",
+                  borderRadius: 2,
+                  cursor: "ew-resize",
+                  zIndex: 3,
+                }}
+                title={`Drag to resize · current: ${t.days} day${t.days === 1 ? "" : "s"}`}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  const startX = e.clientX;
+                  const startWidth = ganttBarWidthFor(t, ganttStart, COL_WIDTH);
+                  const startDays = t.days;
+                  // Same fractional-day stages that can drag to a half-day start
+                  // can also resize in half-day steps; machining/install stay
+                  // whole-day-only, matching their existing behaviour exactly.
+                  const supportsHalfDay = !!stageCfg.usedField;
+                  const step = supportsHalfDay ? 0.5 : 1;
+                  const minDays = supportsHalfDay ? 0.5 : 1;
+                  let lastDays = startDays;
+                  let lastWidth = startWidth;
+                  let rafId = null;
+                  let pendingState = null;
+                  const flush = () => {
+                    rafId = null;
+                    if (pendingState) setResizeState(pendingState);
+                  };
+                  const onMove = (ev) => {
+                    const dx = ev.clientX - startX;
+                    // Snap the resulting duration to the nearest half-day grid
+                    // outright, rather than adding half-day deltas to startDays —
+                    // startDays itself may already be an arbitrary value (a typed
+                    // override, or finishing's flatExtra-adjusted nominal), so
+                    // snapping the end result is what actually guarantees a clean
+                    // half-day number instead of an odd one plus 0.5 forever.
+                    const rawDays = startDays + dx / COL_WIDTH;
+                    const snapped = Math.round(rawDays / step) * step;
+                    const newDays = Math.round(Math.max(minDays, Math.min(15, snapped)) * 10) / 10;
+                    lastDays = newDays;
+                    lastWidth = newDays * COL_WIDTH - 1;
+                    pendingState = {
+                      jobId: job.id,
+                      currentDays: newDays,
+                      currentWidth: lastWidth,
+                      stage: t.stage,
+                    };
+                    if (rafId === null) rafId = requestAnimationFrame(flush);
+                  };
+                  const onUp = () => {
+                    window.removeEventListener("mousemove", onMove);
+                    window.removeEventListener("mouseup", onUp);
+                    if (rafId !== null) cancelAnimationFrame(rafId);
+                    setResizeState(null);
+                    if (lastDays !== startDays) {
+                      onStageResize && onStageResize(job.id, t.stage, lastDays);
+                    }
+                  };
+                  window.addEventListener("mousemove", onMove);
+                  window.addEventListener("mouseup", onUp);
+                }}
+              />
+            );
+          }
+
+          // Lock/unlock button just past the right edge of the install bar
+          if (isInstall && isLastSeg) {
+            out.push(
+              <button
+                key={`${ti}-${si}-lockbtn`}
+                style={{
+                  position: "absolute",
+                  left: seg.left + seg.width + 6,
+                  top: getStageRowOffset(t.stage) - 3,
+                  width: 22,
+                  height: 17,
+                  padding: 0,
+                  border: "1px solid " + (isLocked ? "#7a8b6f" : "#d9cfba"),
+                  background: isLocked ? "#7a8b6f" : "#faf6ec",
+                  color: isLocked ? "#faf6ec" : "#7a6a55",
+                  borderRadius: 3,
+                  fontSize: 10,
+                  cursor: "pointer",
+                  zIndex: 4,
+                  fontFamily: "inherit",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  lineHeight: 1,
+                }}
+                title={isLocked
+                  ? "Locked — click to unlock"
+                  : "Lock this install (date, duration, fitter)"}
+                disabled={IS_READONLY}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (IS_READONLY) return;
+                  onToggleLock && onToggleLock(job.id, job);
+                }}
+              >
+                {isLocked ? "🔓" : "🔒"}
+              </button>
+            );
+          }
+        });
+
+        // Truck delivery icon (only for install tasks).
+        // Positioned at the deliveryDate; draggable anywhere along the Gantt.
+        if (isInstall && t.deliveryDate) {
+          const isDraggingThisDel = deliveryDragState && deliveryDragState.jobId === job.id;
+          const delDayIdx = diffDays(t.deliveryDate, ganttStart);
+          const liveDelLeft = isDraggingThisDel
+            ? deliveryDragState.currentLeft
+            : delDayIdx * COL_WIDTH;
+          const delDate = isDraggingThisDel
+            ? parseISO(deliveryDragState.currentDate)
+            : t.deliveryDate;
+          const delTooltip = `Delivery: ${delDate.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })} · drag to reschedule`;
+          out.push(
+            <div
+              key={`${ti}-truck`}
+              title={delTooltip}
+              style={{
+                position: "absolute",
+                left: liveDelLeft + 4,
+                top: getStageRowOffset(t.stage) - 9,
+                width: 22,
+                height: 22,
+                borderRadius: "50%",
+                background: "#3a342c",
+                color: "#faf6ec",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                cursor: IS_READONLY ? "default" : "grab",
+                zIndex: 6,
+                boxShadow: "0 1px 3px rgba(58,52,44,0.4)",
+                border: "1.5px solid #faf6ec",
+                opacity: isDraggingThisDel ? 0.85 : 1,
+              }}
+              onMouseDown={IS_READONLY ? undefined : (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const startX = e.clientX;
+                const startLeft = delDayIdx * COL_WIDTH;
+                let lastDate = null;
+                let rafId = null;
+                let pendingState = null;
+                const flush = () => {
+                  rafId = null;
+                  if (pendingState) setDeliveryDragState(pendingState);
+                };
+                const onMove = (ev) => {
+                  const dx = ev.clientX - startX;
+                  const newLeft = startLeft + dx;
+                  const snappedDayIdx = Math.round(newLeft / COL_WIDTH);
+                  if (snappedDayIdx < 0 || snappedDayIdx >= days.length) return;
+                  let snappedDate = days[snappedDayIdx];
+                  // Snap weekend/holiday days to next working day
+                  while (isWeekend(snappedDate) || holidays.has(dayKey(snappedDate))) {
+                    snappedDate = addDays(snappedDate, 1);
+                    if (diffDays(snappedDate, ganttStart) >= days.length) break;
+                  }
+                  const snappedLeft = diffDays(snappedDate, ganttStart) * COL_WIDTH;
+                  lastDate = dayKey(snappedDate);
+                  pendingState = {
+                    jobId: job.id,
+                    currentLeft: snappedLeft,
+                    currentDate: lastDate,
+                  };
+                  if (rafId === null) rafId = requestAnimationFrame(flush);
+                };
+                const onUp = () => {
+                  window.removeEventListener("mousemove", onMove);
+                  window.removeEventListener("mouseup", onUp);
+                  if (rafId !== null) cancelAnimationFrame(rafId);
+                  setDeliveryDragState(null);
+                  if (lastDate && lastDate !== dayKey(t.deliveryDate)) {
+                    onDeliveryDrag && onDeliveryDrag(job.id, lastDate);
+                  }
+                };
+                window.addEventListener("mousemove", onMove);
+                window.addEventListener("mouseup", onUp);
+              }}
+            >
+              <Truck size={12} strokeWidth={2.2} />
+            </div>
+          );
+        }
+
+        return out;
+      })}
+      {/* Job label overlay */}
+      <div style={styles.ganttJobLabel}>
+        {job.name || "—"}
+      </div>
+    </div>
+  );
+});
 
 // Stack stages vertically within a row so they don't overlap visually.
 // Each stage gets its own lane; later stages sit lower in the row.
@@ -6504,6 +6606,29 @@ const FLOOR_BOARD_CSS = `
   .floor-board-root .note-item{background:var(--panel2);border:1px dashed var(--clay);border-radius:4px;
     padding:9px 12px;font-size:13px;color:var(--ink2);line-height:1.5;margin-bottom:6px}
   .floor-board-root .note-empty{font-size:12px;color:var(--ink3);font-style:italic}
+  .floor-board-root .tabbar{display:flex;gap:8px;margin:18px 0 4px}
+  .floor-board-root .tabbtn{flex:none;padding:9px 20px;border:1px solid var(--rule);border-radius:4px;
+    background:var(--panel);color:var(--ink2);font-size:14px;letter-spacing:.04em;font-family:Inter,sans-serif}
+  .floor-board-root .tabbtn[aria-selected="true"]{background:var(--sage);color:var(--panel);border-color:var(--sage)}
+  .floor-board-root .batches-wrap{margin-top:14px;max-width:900px}
+  .floor-board-root .batch-row{display:flex;gap:8px;margin-bottom:14px}
+  .floor-board-root .batch-row input[type="text"]{flex:1;border:1px solid var(--rule);border-radius:4px;padding:9px 12px;
+    font-size:13px;background:#fff;color:var(--ink);font-family:Inter,sans-serif}
+  .floor-board-root .batch-row input[type="number"]{width:84px;border:1px solid var(--rule);border-radius:4px;padding:9px 10px;
+    font-size:13px;background:#fff;color:var(--ink);font-family:Inter,sans-serif}
+  .floor-board-root .batch-row button{background:var(--sage);color:var(--panel);border:none;border-radius:4px;
+    padding:9px 16px;font-size:13px;cursor:pointer;font-family:Inter,sans-serif}
+  .floor-board-root .batch-item{display:flex;justify-content:space-between;align-items:center;background:var(--panel2);
+    border:1px solid var(--rule2);border-radius:4px;padding:10px 12px;margin-bottom:8px}
+  .floor-board-root .batch-item.done{background:var(--sage-bg);border-color:var(--sage)}
+  .floor-board-root .batch-label{font-size:14px;color:var(--ink)}
+  .floor-board-root .batch-count{font-size:12px;color:var(--ink3);margin-top:2px}
+  .floor-board-root .batch-toggle{display:flex;gap:6px}
+  .floor-board-root .batch-toggle button{padding:6px 14px;font-size:12px;border-radius:4px;border:1px solid var(--rule);
+    background:#fff;color:var(--ink2);font-family:Inter,sans-serif;cursor:pointer}
+  .floor-board-root .batch-toggle button.yes[aria-pressed="true"]{background:var(--sage-bg);color:#5a6e50;border-color:var(--sage);font-weight:600}
+  .floor-board-root .batch-toggle button.no[aria-pressed="true"]{background:var(--clay-bg);color:var(--clay);border-color:var(--clay);font-weight:600}
+  .floor-board-root .batch-empty{font-size:12px;color:var(--ink3);font-style:italic}
   @media (max-width:1100px){.floor-board-root .pipe{flex-wrap:wrap}.floor-board-root .pipe-seg{flex:1 1 30%}}
   @media (prefers-reduced-motion:reduce){.floor-board-root *{transition:none!important}}
 `;
@@ -6549,6 +6674,7 @@ function mountFloorBoard(root, planRef, holidaysSet) {
 
   const dayKeyFor = (d) => "floor:" + iso(d);
   const weekKeyFor = (d) => "floor:wtd:" + iso(mondayOf(d));
+  const drawersKey = "floor:drawers";
   function mondayOf(d) {
     const m = new Date(d.getTime());
     const dow = m.getDay();
@@ -6572,6 +6698,7 @@ function mountFloorBoard(root, planRef, holidaysSet) {
   }
 
   let today = {}, yesterday = {}, weekToDate = {}, offPlan = [], notes = [], extraJobs = {}, selected = {};
+  let drawerBatches = [], activeTab = "today";
 
   function jobsAt(stageKey) {
     return (planRef.current.stages[stageKey] || []).concat(extraJobs[stageKey] || []);
@@ -6644,6 +6771,7 @@ function mountFloorBoard(root, planRef, holidaysSet) {
 
   function renderStages() {
     const now = new Date(), f = fractionOfDayElapsed(now);
+    const drawersWaiting = drawerBatches.filter(b => !b.done).reduce((a, b) => a + b.count, 0);
     $("stages").innerHTML = FLOOR_STAGES.map(s => {
       const jobs = jobsAt(s.key);
       const t = targetFor(jobs);
@@ -6676,6 +6804,7 @@ function mountFloorBoard(root, planRef, holidaysSet) {
           <button class="chip chip-add" data-add="${s.key}" aria-label="Add another job to ${s.name}">+ another job</button>
         </div>
         ${late ? `<div class="behind-pill">${Math.round(due - done)} behind</div>` : ""}
+        ${s.key === "prep" && drawersWaiting > 0 ? `<div class="behind-pill">${drawersWaiting} drawer box${drawersWaiting === 1 ? "" : "es"} waiting</div>` : ""}
         ${hit ? `<div class="done-pill">target met</div>` : ""}
         <div class="count-row">
           <div class="count">${done}</div>
@@ -6738,7 +6867,51 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     queueSave(dayKeyFor(new Date()), { ...today, offPlan, notes });
   }
 
-  function renderAll() { renderPipe(); renderWeek(); renderStages(); renderYesterday(); renderNotes(); }
+  function renderDrawers() {
+    const sorted = [...drawerBatches].sort((a, b) => (a.done === b.done ? 0 : a.done ? 1 : -1));
+    $("drawer-list").innerHTML = sorted.length
+      ? sorted.map(b => `
+        <div class="batch-item ${b.done ? "done" : ""}">
+          <div>
+            <div class="batch-label">${escapeHtml(b.label)}</div>
+            <div class="batch-count">${b.count} drawer box${b.count === 1 ? "" : "es"}</div>
+          </div>
+          <div class="batch-toggle">
+            <button class="no" data-batch="${b.id}" data-done="0" aria-pressed="${!b.done}">No</button>
+            <button class="yes" data-batch="${b.id}" data-done="1" aria-pressed="${b.done}">Yes</button>
+          </div>
+        </div>`).join("")
+      : `<div class="batch-empty">No batches logged yet.</div>`;
+  }
+
+  function addDrawerBatch() {
+    const labelInput = $("batch-label"), countInput = $("batch-count");
+    const label = (labelInput.value || "").trim();
+    const count = parseInt(countInput.value, 10);
+    if (!label || !count || count <= 0) return;
+    drawerBatches = [...drawerBatches, { id: Date.now() + "-" + Math.random().toString(36).slice(2), label, count, done: false }];
+    labelInput.value = ""; countInput.value = "";
+    renderDrawers();
+    renderStages();
+    queueSave(drawersKey, drawerBatches);
+  }
+
+  function setDrawerBatchDone(id, done) {
+    drawerBatches = drawerBatches.map(b => (b.id === id ? { ...b, done } : b));
+    renderDrawers();
+    renderStages();
+    queueSave(drawersKey, drawerBatches);
+  }
+
+  function setTab(tab) {
+    activeTab = tab;
+    $("panel-today").style.display = tab === "today" ? "" : "none";
+    $("panel-drawers").style.display = tab === "drawers" ? "" : "none";
+    $("tab-today").setAttribute("aria-selected", tab === "today" ? "true" : "false");
+    $("tab-drawers").setAttribute("aria-selected", tab === "drawers" ? "true" : "false");
+  }
+
+  function renderAll() { renderPipe(); renderWeek(); renderStages(); renderYesterday(); renderNotes(); renderDrawers(); }
 
   function bump(stageKey, delta) {
     const jobId = selected[stageKey];
@@ -6774,14 +6947,18 @@ function mountFloorBoard(root, planRef, holidaysSet) {
   const onClick = (e) => {
     const b = e.target.closest("button");
     if (!b) return;
+    if (b.dataset.tab) { setTab(b.dataset.tab); return; }
     if (b.dataset.job) { selected[b.dataset.stage] = b.dataset.job; renderAll(); return; }
     if (b.dataset.add) { addJobToStage(b.dataset.add); return; }
     if (b.dataset.addnote) { addNote(); return; }
+    if (b.dataset.addbatch) { addDrawerBatch(); return; }
+    if (b.dataset.batch) { setDrawerBatchDone(b.dataset.batch, b.dataset.done === "1"); return; }
     if (b.dataset.k) { bump(b.dataset.k, parseInt(b.dataset.d, 10)); }
   };
   root.addEventListener("click", onClick);
   const onKeydown = (e) => {
     if (e.key === "Enter" && e.target && e.target.id === "note-input") addNote();
+    if (e.key === "Enter" && e.target && (e.target.id === "batch-label" || e.target.id === "batch-count")) addDrawerBatch();
   };
   root.addEventListener("keydown", onKeydown);
 
@@ -6808,12 +6985,14 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     const y = await load(dayKeyFor(prevWorkingDay(new Date())));
     if (y) { delete y.offPlan; delete y.notes; yesterday = y; }
     weekToDate = (await load(weekKeyFor(new Date()))) || {};
+    drawerBatches = (await load(drawersKey)) || [];
     renderAll();
 
     if (store && store.subscribe) {
       unsubscribe = store.subscribe(async () => {
         const t2 = await load(dayKeyFor(new Date()));
         if (t2) { offPlan = t2.offPlan || []; notes = t2.notes || []; delete t2.offPlan; delete t2.notes; today = t2; }
+        drawerBatches = (await load(drawersKey)) || [];
         renderAll();
       });
     }
@@ -6876,22 +7055,39 @@ function FloorBoard({ scheduled, dayLayout }) {
             <div className="today-sub" id="weekline">—</div>
           </div>
         </div>
-        <div className="pipe" id="pipe" />
-        <div className="weekstrip" id="weekstrip" />
-        <h2 className="sec">Today · tap as each cabinet clears a stage</h2>
-        <div className="stages" id="stages" />
-        <div className="notice" id="notice" />
-        <div className="notes-wrap">
-          <h2 className="sec">Notes</h2>
-          <div className="note-row">
-            <input id="note-input" type="text" placeholder="Add a note about today..." maxLength={200} />
-            <button data-addnote="1">Add</button>
-          </div>
-          <div id="notes-list" />
+        <div className="tabbar" role="tablist">
+          <button id="tab-today" className="tabbtn" data-tab="today" role="tab" aria-selected="true">Today</button>
+          <button id="tab-drawers" className="tabbtn" data-tab="drawers" role="tab" aria-selected="false">Drawers</button>
         </div>
-        <div className="yesterday-wrap">
-          <h2 className="sec">Yesterday</h2>
-          <div id="yesterday" />
+        <div id="panel-today">
+          <div className="pipe" id="pipe" />
+          <div className="weekstrip" id="weekstrip" />
+          <h2 className="sec">Today · tap as each cabinet clears a stage</h2>
+          <div className="stages" id="stages" />
+          <div className="notice" id="notice" />
+          <div className="notes-wrap">
+            <h2 className="sec">Notes</h2>
+            <div className="note-row">
+              <input id="note-input" type="text" placeholder="Add a note about today..." maxLength={200} />
+              <button data-addnote="1">Add</button>
+            </div>
+            <div id="notes-list" />
+          </div>
+          <div className="yesterday-wrap">
+            <h2 className="sec">Yesterday</h2>
+            <div id="yesterday" />
+          </div>
+        </div>
+        <div id="panel-drawers" style={{ display: "none" }}>
+          <h2 className="sec">Drawer batches · mark complete once boxed off</h2>
+          <div className="batches-wrap">
+            <div className="batch-row">
+              <input id="batch-label" type="text" placeholder="Job or batch description..." maxLength={80} />
+              <input id="batch-count" type="number" min="1" placeholder="Boxes" />
+              <button data-addbatch="1">Add batch</button>
+            </div>
+            <div id="drawer-list" />
+          </div>
         </div>
       </div>
     </div>
