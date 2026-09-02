@@ -507,7 +507,14 @@ function dayLayoutForMachining(task, job, holidays) {
   const entries = cabinetEntriesFor(job);
   const totalCabs = entries.reduce((a, e) => a + e.count, 0);
   if (totalCabs <= 0 || !task.days) return byDate;
-  const days = workingDaysSeq(addDays(task.start, -1), Math.ceil(task.days), holidays);
+  // task.start is already the first real working day of machining (set by
+  // workingDaysSeq in scheduleSingleJob) — walking from it directly, not a
+  // day earlier, is what actually lines the CNC/prep display up with the
+  // real scheduled dates. The previous -1 here only ever looked right when
+  // machining happened to start the day after a weekend/holiday (nextWorkingDay
+  // rolling it back to the same date by coincidence); any other start day
+  // silently pulled the whole display back one working day.
+  const days = workingDaysSeq(task.start, Math.ceil(task.days), holidays);
   const perDayTotal = totalCabs / days.length;
   days.forEach(d => {
     byDate.set(dayKey(d), entries.map(e => ({
