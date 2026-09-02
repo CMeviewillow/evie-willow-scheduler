@@ -498,32 +498,47 @@ function dayLayoutForRatedInterval(startSlot, cabinetEntries, holidays) {
   return byDate;
 }
 
-// Machining has no per-style rate in the domain model — its duration is
-// matched to bench days or set by hand, not derived from cabinet counts. So
-// its day-by-day breakdown is simpler: divide the job's total cabinets evenly
-// across the block's whole days, carrying the same style mix each day.
-function dayLayoutForMachining(task, job, holidays) {
+// CNC cutting is the one truly continuous resource in the workshop — unlike
+// bench (which needs a distinct block per job for assembly to make sense),
+// raw cutting flows seamlessly from one job's panels straight into the
+// next's. So the floor board's CNC target isn't positioned as a per-job
+// block at all: this walks EVERY job's cabinets, in the same queue order
+// used everywhere else, through the CNC line at each style's standard rate
+// — the same rate-and-fill model bench already uses via
+// dayLayoutForRatedInterval, just spanning the whole backlog in one
+// continuous pass from settings.startDate instead of restarting at each
+// job's own start date. That's what keeps a target on the CNC card every
+// working day there's still backlog to cut, instead of it going idle
+// between one job's own machining block and the next's.
+function cncQueueDayLayout(scheduledJobs, holidays, startDate) {
   const byDate = new Map();
-  const entries = cabinetEntriesFor(job);
-  const totalCabs = entries.reduce((a, e) => a + e.count, 0);
-  if (totalCabs <= 0 || !task.days) return byDate;
-  // task.start is already the first real working day of machining (set by
-  // workingDaysSeq in scheduleSingleJob) — walking from it directly, not a
-  // day earlier, is what actually lines the CNC/prep display up with the
-  // real scheduled dates. The previous -1 here only ever looked right when
-  // machining happened to start the day after a weekend/holiday (nextWorkingDay
-  // rolling it back to the same date by coincidence); any other start day
-  // silently pulled the whole display back one working day.
-  const days = workingDaysSeq(task.start, Math.ceil(task.days), holidays);
-  const perDayTotal = totalCabs / days.length;
-  days.forEach(d => {
-    byDate.set(dayKey(d), entries.map(e => ({
-      style: e.style,
-      cabinets: roundDay(perDayTotal * (e.count / totalCabs)),
-    })));
+  let cursor = normalizeToWorkingDay({ date: startDate, used: 0 }, holidays);
+  scheduledJobs.forEach(job => {
+    if (totalCabinets(job) === 0) return;
+    const colour = job.colour || { name: "", hex: "" };
+    const entries = cabinetEntriesFor(job);
+    entries.forEach(({ style, count, rate }) => {
+      let remaining = count;
+      while (remaining > DAY_EPSILON) {
+        const availableToday = fridayAwareCapacity(cursor.date) - cursor.used;
+        if (availableToday <= DAY_EPSILON) {
+          cursor = normalizeToWorkingDay({ date: nextWorkingDay(addDays(cursor.date, 1), holidays), used: 0 }, holidays);
+          continue;
+        }
+        const daysForRemaining = remaining / rate;
+        const daysConsumedToday = Math.min(daysForRemaining, availableToday);
+        const cabinetsToday = roundDay(daysConsumedToday * rate);
+        const k = dayKey(cursor.date);
+        if (!byDate.has(k)) byDate.set(k, []);
+        byDate.get(k).push({ jobId: job.id, jobName: job.name, colour, style, cabinets: cabinetsToday });
+        remaining = roundDay(remaining - cabinetsToday);
+        cursor = advanceFractionalDay(cursor, daysConsumedToday, holidays);
+      }
+    });
   });
   return byDate;
 }
+
 
 function mixFromEntries(entries) {
   const mix = {};
@@ -532,19 +547,36 @@ function mixFromEntries(entries) {
 }
 
 // Build the full day layout: { dateKey: { stage: [{jobId,jobName,batch,cabinets,colour,mix}] } }.
-// Machining is split into "cnc" and "prep" for display (prep is the last
-// working day, leading into bench, exactly mirroring machining's own 3-day
-// lead on bench) and finishing into "spray" and "pad" (pad is whichever
-// painted-family cabinets land on a given finishing day) — both splits are
-// display-only, the scheduler itself still has one machining stage and one
+// CNC is computed once up front as one continuous queue across the whole
+// backlog (see cncQueueDayLayout) rather than per job. "Bench prep" — frame,
+// door and drawer making — is the cabinets going to bench the next working
+// day, so it's derived straight from bench's own day-by-day numbers, shifted
+// back one working day, rather than paced separately. Finishing splits into
+// "spray" and "pad" (pad is whichever painted-family cabinets land on a
+// given finishing day) — display-only, the scheduler itself still has one
 // finishing stage.
-function computeDayLayout(scheduled, holidays) {
+function computeDayLayout(scheduled, holidays, settings) {
   const layout = {};
   const addEntry = (dateKey, stage, entry) => {
     if (!layout[dateKey]) layout[dateKey] = {};
     if (!layout[dateKey][stage]) layout[dateKey][stage] = [];
     layout[dateKey][stage].push(entry);
   };
+
+  const cncByDate = cncQueueDayLayout(scheduled, holidays, nextWorkingDay(parseISO(settings.startDate), holidays));
+  [...cncByDate.keys()].sort().forEach(k => {
+    const byJob = new Map();
+    cncByDate.get(k).forEach(e => {
+      if (!byJob.has(e.jobId)) byJob.set(e.jobId, { jobName: e.jobName, colour: e.colour, entries: [] });
+      byJob.get(e.jobId).entries.push(e);
+    });
+    let batch = 0;
+    byJob.forEach(({ jobName, colour, entries }, jobId) => {
+      batch++;
+      const cabinets = Math.round(entries.reduce((a, e) => a + e.cabinets, 0));
+      if (cabinets > 0) addEntry(k, "cnc", { jobId, jobName, batch, cabinets, colour, mix: mixFromEntries(entries) });
+    });
+  });
 
   scheduled.forEach(job => {
     if (!job.tasks?.length) return;
@@ -569,19 +601,12 @@ function computeDayLayout(scheduled, holidays) {
         batch++;
         const dayEntries = dl.get(k);
         const cabinets = Math.round(dayEntries.reduce((a, e) => a + e.cabinets, 0));
-        if (cabinets > 0) addEntry(k, "bench", { jobId: job.id, jobName: job.name, batch, cabinets, colour, mix: mixFromEntries(dayEntries) });
-      });
-    }
-
-    const machTask = job.tasks.find(t => t.stage === "machining");
-    if (machTask) {
-      const mdl = dayLayoutForMachining(machTask, job, holidays);
-      const keys = [...mdl.keys()].sort();
-      keys.forEach((k, i) => {
-        const isPrep = i === keys.length - 1; // last day leads into bench, umbrella'd under machining
-        const dayEntries = mdl.get(k);
-        const cabinets = Math.round(dayEntries.reduce((a, e) => a + e.cabinets, 0));
-        if (cabinets > 0) addEntry(k, isPrep ? "prep" : "cnc", { jobId: job.id, jobName: job.name, batch: i + 1, cabinets, colour, mix: mixFromEntries(dayEntries) });
+        if (cabinets > 0) {
+          addEntry(k, "bench", { jobId: job.id, jobName: job.name, batch, cabinets, colour, mix: mixFromEntries(dayEntries) });
+          let prepDate = addDays(parseISO(k), -1);
+          while (isWeekend(prepDate) || holidays.has(dayKey(prepDate))) prepDate = addDays(prepDate, -1);
+          addEntry(dayKey(prepDate), "prep", { jobId: job.id, jobName: job.name, batch, cabinets, colour, mix: mixFromEntries(dayEntries) });
+        }
       });
     }
 
@@ -861,6 +886,10 @@ function scheduleJobs(jobs, holidays, settings) {
     const nominalBenchDays = benchDaysForJob(job);
 
     if (job.machiningOverride) {
+      // Only the CNC-cutting portion (everything but the last day) shares
+      // the machining line — the last day is bench prep (frame/door/drawer
+      // making), a different job entirely, done by different hands, so it
+      // doesn't block the CNC line for anyone else.
       const cabCountForMach = totalCabinets(job);
       const autoMachDays = (cabCountForMach < 9)
         ? Math.max(1, Math.ceil(nominalBenchDays))
@@ -868,21 +897,24 @@ function scheduleJobs(jobs, holidays, settings) {
       const machDays = (job.machiningDaysOverride && job.machiningDaysOverride > 0)
         ? job.machiningDaysOverride
         : autoMachDays;
-      const parsed = parseISO(job.machiningOverride);
-      const mStart = (isWeekend(parsed) || holidays.has(dayKey(parsed))) ? nextWorkingDay(parsed, holidays) : parsed;
-      const mSeq = workingDaysSeq(mStart, machDays, holidays);
-      const mEnd = addDays(mSeq[mSeq.length - 1], 1);
-      for (const existing of state.machiningOccupied) {
-        if (mStart < existing.end && existing.start < mEnd) {
-          warnings.push({
-            jobId: job.id,
-            jobName: job.name,
-            type: "buffer_too_tight",
-            message: `Machining pinned to ${fmtUK(mStart)} overlaps ${existing.jobName}'s pinned machining — both left in place, resolve manually`,
-          });
+      const cncDaysPin = Math.max(0, machDays - 1);
+      if (cncDaysPin > 0) {
+        const parsed = parseISO(job.machiningOverride);
+        const mStart = (isWeekend(parsed) || holidays.has(dayKey(parsed))) ? nextWorkingDay(parsed, holidays) : parsed;
+        const mSeq = workingDaysSeq(mStart, cncDaysPin, holidays);
+        const mEnd = addDays(mSeq[mSeq.length - 1], 1);
+        for (const existing of state.machiningOccupied) {
+          if (mStart < existing.end && existing.start < mEnd) {
+            warnings.push({
+              jobId: job.id,
+              jobName: job.name,
+              type: "buffer_too_tight",
+              message: `Machining pinned to ${fmtUK(mStart)} overlaps ${existing.jobName}'s pinned machining — both left in place, resolve manually`,
+            });
+          }
         }
+        state.machiningOccupied.push({ start: mStart, end: mEnd, jobName: job.name, jobId: job.id });
       }
-      state.machiningOccupied.push({ start: mStart, end: mEnd, jobName: job.name, jobId: job.id });
     }
     if (job.benchOverride) {
       const interval = computeOverrideInterval(job.benchOverride, job.benchDaysOverride, nominalBenchDays, holidays, job.benchOverrideUsed);
@@ -926,7 +958,7 @@ function scheduleJobs(jobs, holidays, settings) {
     }
 
     const result = scheduleSingleJob(job, state, holidays, settings, impact);
-    if (!result.machiningWasPinned) {
+    if (!result.machiningWasPinned && result.machiningInterval) {
       state.machiningOccupied.push({ ...result.machiningInterval, jobName: job.name, jobId: job.id });
     }
     if (!result.benchWasPinned) {
@@ -1084,7 +1116,7 @@ function scheduleJobs(jobs, holidays, settings) {
   );
   const liveWarnings = warnings.filter(w => !(w.jobId && installDoneJobIds.has(w.jobId)));
 
-  return { scheduled, warnings: liveWarnings, dayLayout: computeDayLayout(scheduled, holidays) };
+  return { scheduled, warnings: liveWarnings, dayLayout: computeDayLayout(scheduled, holidays, settings) };
 }
 
 // Given a target install ISO date, return the Monday of that week.
@@ -1469,33 +1501,54 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     ? job.machiningDaysOverride
     : autoMachDays;
 
+  // CNC cutting and bench prep (frame/door/drawer making) are different
+  // work done by different hands, not one continuous block — cncDays is
+  // everything but the last day, which is always exactly the prep day.
+  const cncDays = Math.max(0, machDays - 1);
   const machiningWasPinned = !!job.machiningOverride;
-  let machiningStartActual;
+  let machiningStartActual, machiningEnd, cncStart = null, cncEnd = null, prepDay;
+
   if (machiningWasPinned) {
+    // Dragged/pinned: lands exactly where dropped, one contiguous block —
+    // same as every other manually-positioned stage. Last day is prep.
     const parsed = parseISO(job.machiningOverride);
     machiningStartActual = (isWeekend(parsed) || holidays.has(dayKey(parsed)))
       ? nextWorkingDay(parsed, holidays)
       : parsed;
+    const machiningSeq = workingDaysSeq(machiningStartActual, machDays, holidays);
+    machiningEnd = addDays(machiningSeq[machiningSeq.length - 1], 1);
+    prepDay = machiningSeq[machiningSeq.length - 1];
+    if (cncDays > 0) {
+      cncStart = machiningStartActual;
+      cncEnd = addDays(machiningSeq[cncDays - 1], 1);
+    }
   } else {
-    // CNC stays continuously busy: claim the earliest free slot on the
-    // machining line — filling any gap a finished job left behind — instead
-    // of always deferring to "3 working days before this job's own bench
-    // start". That fixed offset is what let CNC sit idle even when there
-    // was backlog ready to pull forward onto it. The existing production-
-    // order warning below still catches the rare case where this pulls a
-    // job's machining so early relative to its own bench slot (or, on a
-    // congested line, so late) that something needs a manual look.
-    const earliestMach = nextWorkingDay(parseISO(settings.startDate), holidays);
-    machiningStartActual = findFreeMachiningSlot(earliestMach, machDays, state.machiningOccupied, holidays);
+    // Auto: bench prep is always the working day right before THIS job's
+    // own bench start — "bench prep is the cabinets for tomorrow's bench" —
+    // independent of every other job. CNC cutting is a separate, continuous
+    // queue (see findFreeMachiningSlot) that keeps pulling the next job
+    // forward the moment the line frees up, instead of waiting on some
+    // OTHER job's prep day the way one shared block used to force it to.
+    prepDay = addDays(benchStartSlot.date, -1);
+    while (isWeekend(prepDay) || holidays.has(dayKey(prepDay))) {
+      prepDay = addDays(prepDay, -1);
+    }
+    if (cncDays > 0) {
+      const earliestMach = nextWorkingDay(parseISO(settings.startDate), holidays);
+      cncStart = findFreeMachiningSlot(earliestMach, cncDays, state.machiningOccupied, holidays);
+      const cncSeq = workingDaysSeq(cncStart, cncDays, holidays);
+      cncEnd = addDays(cncSeq[cncSeq.length - 1], 1);
+    }
+    machiningStartActual = cncDays > 0 ? cncStart : prepDay;
+    machiningEnd = addDays(prepDay, 1);
   }
-
-  const machiningSeq = workingDaysSeq(machiningStartActual, machDays, holidays);
-  const machiningEnd = addDays(machiningSeq[machiningSeq.length - 1], 1);
 
   // Sanity warning: if user has manually positioned machining such that it ends
   // AFTER bench has started, flag it (production order broken). Same physical
   // problem can be caused from either side — machining pinned too late, or
-  // bench pinned too early — so check both, but only warn once.
+  // bench pinned too early — so check both, but only warn once. Auto jobs'
+  // prep day is always valid relative to bench by construction, so this only
+  // ever fires for a manual pin on one side or the other.
   if (machiningEnd > benchStartSlot.date) {
     if (job.machiningOverride) {
       warnings.push({
@@ -1511,25 +1564,29 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
         type: "buffer_too_tight",
         message: `Bench pinned to start ${fmtUK(benchStartSlot.date)} but machining doesn't finish until ${fmtUK(addDays(machiningEnd, -1))} — production order broken`,
       });
-    } else {
-      // Both auto — the machining line is now its own independent queue
-      // (see findFreeMachiningSlot), so unlike before it's genuinely
-      // possible for it to be more congested than bench's queue at this
-      // point in the backlog and finish later than this job's bench start.
-      warnings.push({
-        jobId: job.id,
-        jobName: job.name,
-        type: "buffer_too_tight",
-        message: `Machining doesn't finish until ${fmtUK(addDays(machiningEnd, -1))} but bench starts ${fmtUK(benchStartSlot.date)} — CNC queue is running behind, review manually`,
-      });
     }
+  }
+  // Auto jobs with a real cutting portion: the CNC line is its own
+  // independent queue now, so on a congested line it's genuinely possible
+  // for cutting to still be running when this job's own prep day arrives —
+  // flag it rather than silently showing prep as ready when it isn't.
+  if (!machiningWasPinned && cncDays > 0 && cncEnd > prepDay) {
+    warnings.push({
+      jobId: job.id,
+      jobName: job.name,
+      type: "buffer_too_tight",
+      message: `CNC cutting doesn't finish until ${fmtUK(addDays(cncEnd, -1))} but prep is due ${fmtUK(prepDay)} — CNC queue is running behind, review manually`,
+    });
   }
 
   tasks.push({
     stage: "machining",
-    start: machiningSeq[0],
+    start: machiningStartActual,
     end: machiningEnd,
     days: machDays,
+    cncDays,
+    cncStart,
+    prepDay,
     isOverridden: !!(job.machiningOverride || (job.machiningDaysOverride && job.machiningDaysOverride > 0)),
   });
 
@@ -2163,7 +2220,10 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     tasks,
     benchDays,
     finishDays,
-    machiningInterval: { start: machiningSeq[0], end: machiningEnd },
+    // Only the CNC-cutting portion is a shared resource other jobs' cutting
+    // needs to avoid — null when this job has no separate cutting day at all
+    // (a small job that's entirely a single prep day).
+    machiningInterval: (cncDays > 0 && cncStart) ? { start: cncStart, end: cncEnd } : null,
     machiningWasPinned,
     benchInterval,
     benchWasPinned,
@@ -2221,8 +2281,12 @@ function findBestSlot(hypoJob, existingJobs, holidays, settings, options = {}) {
     const benchTask = job.tasks.find(t => t.stage === "bench");
     const finishTask = job.tasks.find(t => t.stage === "finishing");
     const installTask = job.tasks.find(t => t.stage === "install");
-    if (machTask) {
-      state.machiningOccupied.push({ start: machTask.start, end: machTask.end, jobName: job.name, jobId: job.id });
+    if (machTask && machTask.cncDays > 0 && machTask.cncStart) {
+      // Only the CNC-cutting portion is shared line time — the prep day is
+      // separate work (see scheduleSingleJob) and doesn't block the line.
+      const cncSeq = workingDaysSeq(machTask.cncStart, machTask.cncDays, holidays);
+      const cncEnd = addDays(cncSeq[cncSeq.length - 1], 1);
+      state.machiningOccupied.push({ start: machTask.cncStart, end: cncEnd, jobName: job.name, jobId: job.id });
     }
     if (benchTask?.startSlot && benchTask?.endSlot) {
       state.benchOccupied.push({ startSlot: benchTask.startSlot, endSlot: benchTask.endSlot, jobName: job.name, jobId: job.id });
