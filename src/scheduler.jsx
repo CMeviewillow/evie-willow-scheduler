@@ -762,6 +762,28 @@ function findFreeBenchSlot(afterSlot, daysNeeded, occupied, holidays) {
   return candidate;
 }
 
+// Whole-day analog of findFreeBenchSlot, for the machining/CNC line — it has
+// no fractional-day model, just plain start/end dates. Walk forward from
+// afterDate and return the first date where `daysNeeded` working days fit
+// without overlapping anything in `occupied` ([{start, end}, ...], end
+// exclusive) — same "no overlap, fill any gap" rule as bench, so the CNC
+// line never sits idle between two unpinned jobs when there's backlog ready
+// to pull forward into it.
+function findFreeMachiningSlot(afterDate, daysNeeded, occupied, holidays) {
+  let candidate = nextWorkingDay(afterDate, holidays);
+  const sorted = [...occupied].sort((a, b) => a.start - b.start);
+  for (const block of sorted) {
+    if (block.end <= candidate) continue; // already behind us
+    const candidateSeq = workingDaysSeq(candidate, daysNeeded, holidays);
+    const candidateEnd = addDays(candidateSeq[candidateSeq.length - 1], 1);
+    if (candidateEnd <= block.start) {
+      return candidate; // fits entirely before this block
+    }
+    candidate = nextWorkingDay(block.end, holidays); // jump past it
+  }
+  return candidate;
+}
+
 // Backward mirror of findFreeBenchSlot: walk backward from beforeSlot and
 // return the LATEST position at or before it where `daysNeeded` days of work
 // fit without overlapping anything in `occupied`. Used to schedule jobs with
@@ -818,6 +840,7 @@ function scheduleJobs(jobs, holidays, settings) {
   });
 
   const state = {
+    machiningOccupied: [], // [{start, end, jobName, jobId}] — pinned + placed CNC blocks (end exclusive)
     benchOccupied: [],      // [{startSlot, endSlot, jobName, jobId}] — pinned + placed bench blocks
     finishingOccupied: [],  // same shape, for finishing capacity
     installerSchedules: {},
@@ -829,14 +852,38 @@ function scheduleJobs(jobs, holidays, settings) {
   const scheduled = [];
   const warnings = [];
 
-  // PASS 1: pin every job with a bench/finishing override into the occupied
-  // arrays before anything else is scheduled. Pinned jobs are fixed points —
-  // unpinned jobs (pass 2) flow tight around them, filling gaps.
+  // PASS 1: pin every job with a machining/bench/finishing override into the
+  // occupied arrays before anything else is scheduled. Pinned jobs are fixed
+  // points — unpinned jobs (pass 2) flow tight around them, filling gaps.
   for (const job of sorted) {
     const impact = featureImpact(job.features);
     if (totalCabinets(job) === 0 && impact.holdExtra === 0) continue;
     const nominalBenchDays = benchDaysForJob(job);
 
+    if (job.machiningOverride) {
+      const cabCountForMach = totalCabinets(job);
+      const autoMachDays = (cabCountForMach < 9)
+        ? Math.max(1, Math.ceil(nominalBenchDays))
+        : Math.max(Math.ceil(nominalBenchDays), job.machiningDays || 0);
+      const machDays = (job.machiningDaysOverride && job.machiningDaysOverride > 0)
+        ? job.machiningDaysOverride
+        : autoMachDays;
+      const parsed = parseISO(job.machiningOverride);
+      const mStart = (isWeekend(parsed) || holidays.has(dayKey(parsed))) ? nextWorkingDay(parsed, holidays) : parsed;
+      const mSeq = workingDaysSeq(mStart, machDays, holidays);
+      const mEnd = addDays(mSeq[mSeq.length - 1], 1);
+      for (const existing of state.machiningOccupied) {
+        if (mStart < existing.end && existing.start < mEnd) {
+          warnings.push({
+            jobId: job.id,
+            jobName: job.name,
+            type: "buffer_too_tight",
+            message: `Machining pinned to ${fmtUK(mStart)} overlaps ${existing.jobName}'s pinned machining — both left in place, resolve manually`,
+          });
+        }
+      }
+      state.machiningOccupied.push({ start: mStart, end: mEnd, jobName: job.name, jobId: job.id });
+    }
     if (job.benchOverride) {
       const interval = computeOverrideInterval(job.benchOverride, job.benchDaysOverride, nominalBenchDays, holidays, job.benchOverrideUsed);
       for (const existing of state.benchOccupied) {
@@ -879,6 +926,9 @@ function scheduleJobs(jobs, holidays, settings) {
     }
 
     const result = scheduleSingleJob(job, state, holidays, settings, impact);
+    if (!result.machiningWasPinned) {
+      state.machiningOccupied.push({ ...result.machiningInterval, jobName: job.name, jobId: job.id });
+    }
     if (!result.benchWasPinned) {
       state.benchOccupied.push({ ...result.benchInterval, jobName: job.name, jobId: job.id });
     }
@@ -1419,24 +1469,24 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     ? job.machiningDaysOverride
     : autoMachDays;
 
+  const machiningWasPinned = !!job.machiningOverride;
   let machiningStartActual;
-  if (job.machiningOverride) {
+  if (machiningWasPinned) {
     const parsed = parseISO(job.machiningOverride);
     machiningStartActual = (isWeekend(parsed) || holidays.has(dayKey(parsed)))
       ? nextWorkingDay(parsed, holidays)
       : parsed;
   } else {
-    // Auto: 3 working days before bench start
-    machiningStartActual = benchStartSlot.date;
-    for (let i = 0; i < 3; i++) {
-      machiningStartActual = addDays(machiningStartActual, -1);
-      while (isWeekend(machiningStartActual) || holidays.has(dayKey(machiningStartActual))) {
-        machiningStartActual = addDays(machiningStartActual, -1);
-      }
-    }
-    // Don't allow machining to start before today (or settings.startDate)
+    // CNC stays continuously busy: claim the earliest free slot on the
+    // machining line — filling any gap a finished job left behind — instead
+    // of always deferring to "3 working days before this job's own bench
+    // start". That fixed offset is what let CNC sit idle even when there
+    // was backlog ready to pull forward onto it. The existing production-
+    // order warning below still catches the rare case where this pulls a
+    // job's machining so early relative to its own bench slot (or, on a
+    // congested line, so late) that something needs a manual look.
     const earliestMach = nextWorkingDay(parseISO(settings.startDate), holidays);
-    if (machiningStartActual < earliestMach) machiningStartActual = earliestMach;
+    machiningStartActual = findFreeMachiningSlot(earliestMach, machDays, state.machiningOccupied, holidays);
   }
 
   const machiningSeq = workingDaysSeq(machiningStartActual, machDays, holidays);
@@ -1460,6 +1510,17 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
         jobName: job.name,
         type: "buffer_too_tight",
         message: `Bench pinned to start ${fmtUK(benchStartSlot.date)} but machining doesn't finish until ${fmtUK(addDays(machiningEnd, -1))} — production order broken`,
+      });
+    } else {
+      // Both auto — the machining line is now its own independent queue
+      // (see findFreeMachiningSlot), so unlike before it's genuinely
+      // possible for it to be more congested than bench's queue at this
+      // point in the backlog and finish later than this job's bench start.
+      warnings.push({
+        jobId: job.id,
+        jobName: job.name,
+        type: "buffer_too_tight",
+        message: `Machining doesn't finish until ${fmtUK(addDays(machiningEnd, -1))} but bench starts ${fmtUK(benchStartSlot.date)} — CNC queue is running behind, review manually`,
       });
     }
   }
@@ -2102,6 +2163,8 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     tasks,
     benchDays,
     finishDays,
+    machiningInterval: { start: machiningSeq[0], end: machiningEnd },
+    machiningWasPinned,
     benchInterval,
     benchWasPinned,
     finishingInterval,
@@ -2143,6 +2206,7 @@ function findBestSlot(hypoJob, existingJobs, holidays, settings, options = {}) {
 
   // Build state snapshot from scheduled jobs
   const state = {
+    machiningOccupied: [],
     benchOccupied: [],
     finishingOccupied: [],
     installerSchedules: {},
@@ -2153,9 +2217,13 @@ function findBestSlot(hypoJob, existingJobs, holidays, settings, options = {}) {
 
   for (const job of scheduled) {
     if (!job.tasks?.length) continue;
+    const machTask = job.tasks.find(t => t.stage === "machining");
     const benchTask = job.tasks.find(t => t.stage === "bench");
     const finishTask = job.tasks.find(t => t.stage === "finishing");
     const installTask = job.tasks.find(t => t.stage === "install");
+    if (machTask) {
+      state.machiningOccupied.push({ start: machTask.start, end: machTask.end, jobName: job.name, jobId: job.id });
+    }
     if (benchTask?.startSlot && benchTask?.endSlot) {
       state.benchOccupied.push({ startSlot: benchTask.startSlot, endSlot: benchTask.endSlot, jobName: job.name, jobId: job.id });
     }
@@ -2271,8 +2339,20 @@ function cloneOccupied(occupied) {
   }));
 }
 
+// Whole-day analog of cloneOccupied, for the machining line's plain
+// {start, end} Date shape (no fractional slot).
+function cloneMachiningOccupied(occupied) {
+  return occupied.map(b => ({
+    start: new Date(b.start.getTime()),
+    end: new Date(b.end.getTime()),
+    jobName: b.jobName,
+    jobId: b.jobId,
+  }));
+}
+
 function deepCloneState(state) {
   return {
+    machiningOccupied: cloneMachiningOccupied(state.machiningOccupied),
     benchOccupied: cloneOccupied(state.benchOccupied),
     finishingOccupied: cloneOccupied(state.finishingOccupied),
     installerSchedules: Object.fromEntries(
