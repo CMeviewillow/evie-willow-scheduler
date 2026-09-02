@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
-import { Plus, Trash2, AlertTriangle, Calendar, Settings, Download, Upload, X, Truck, Undo2, Redo2 } from "lucide-react";
+import { Plus, Trash2, AlertTriangle, Calendar, Settings, Download, Upload, X, Truck, Undo2, Redo2, TrendingUp } from "lucide-react";
 import "./storage.js"; // installs window.storage backed by Supabase
 
 // Read-only mode: append ?readonly=1 to the URL to disable all edits.
@@ -467,6 +467,59 @@ function cabinetEntriesFor(job, rateScale = 1) {
   return Object.keys(CABINET_TYPES)
     .map(style => ({ style, count: job.cabinets[style] || 0, rate: CABINET_TYPES[style].rate * rateScale }))
     .filter(e => e.count > 0);
+}
+
+// Compares each style's assumed rate (CABINET_TYPES) against what the floor
+// board's own bench taps show it actually running at, once there's enough
+// real data to say. Read-only reporting — nothing here changes the
+// schedule. If a style's actual pace looks meaningfully different, updating
+// the rate constant is a deliberate, tested code change, the same as every
+// other capacity assumption in this app — not something applied
+// automatically off a handful of days that might just be a bad week.
+//
+// Only single-style jobs count towards a style's sample: a mixed-style
+// job's daily tap count can't be split back out into "how many were
+// painted vs oak" after the fact, so including it would just be a guess.
+function computeRateReview(floorActuals, jobs) {
+  const jobById = new Map(jobs.map(j => [j.id, j]));
+  const byStyle = {};
+  Object.keys(CABINET_TYPES).forEach(s => { byStyle[s] = new Map(); }); // jobId -> {total, days:Set}
+
+  Object.entries(floorActuals || {}).forEach(([dateKey, record]) => {
+    const bench = record?.bench || {};
+    Object.entries(bench).forEach(([jobId, count]) => {
+      if (!count || count <= 0) return;
+      const job = jobById.get(jobId);
+      if (!job) return;
+      const styles = Object.entries(job.cabinets || {}).filter(([, c]) => c > 0);
+      if (styles.length !== 1) return; // mixed-style job — can't attribute, skip
+      const [style] = styles[0];
+      if (!byStyle[style]) return;
+      const entry = byStyle[style].get(jobId) || { total: 0, days: new Set() };
+      entry.total += count;
+      entry.days.add(dateKey);
+      byStyle[style].set(jobId, entry);
+    });
+  });
+
+  return Object.keys(CABINET_TYPES).map(style => {
+    const jobSamples = [...byStyle[style].values()];
+    const assumedRate = CABINET_TYPES[style].rate;
+    if (jobSamples.length === 0) {
+      return { style, label: CABINET_TYPES[style].label, assumedRate, actualRate: null, sampleJobs: 0, sampleDays: 0 };
+    }
+    // Weight each job's own rate (its total ÷ its own active days) by how
+    // many cabinets it contributed, so a big job's real pace counts for
+    // more than a small job that happened to land on an odd day.
+    let weightedSum = 0, totalCabinets = 0, totalDays = 0;
+    jobSamples.forEach(({ total, days }) => {
+      weightedSum += (total / days.size) * total;
+      totalCabinets += total;
+      totalDays += days.size;
+    });
+    const actualRate = totalCabinets > 0 ? Math.round((weightedSum / totalCabinets) * 10) / 10 : null;
+    return { style, label: CABINET_TYPES[style].label, assumedRate, actualRate, sampleJobs: jobSamples.length, sampleDays: totalDays };
+  });
 }
 
 // Walk a job's cabinet mix, style by style at that style's own rate, across a
@@ -2462,6 +2515,7 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showWhatIf, setShowWhatIf] = useState(false);
   const [showWarnings, setShowWarnings] = useState(false);
+  const [showRateReview, setShowRateReview] = useState(false);
   const [dismissedWarnings, setDismissedWarnings] = useState({}); // { fingerprint: true }
   const [showReminders, setShowReminders] = useState(false);
   const [dismissedReminders, setDismissedReminders] = useState({}); // { "jobId:surveyDate": true }
@@ -2499,11 +2553,16 @@ function App() {
   };
 
   // Pull every floor:YYYY-MM-DD record (the floor board's daily tap counts) —
-  // excluding the floor:wtd: week-to-date keys, which aren't per-day actuals.
+  // matching the exact daily-record shape excludes both floor:wtd: (week-to-
+  // date) and floor:drawers (the batch list) — an earlier, looser "starts
+  // with floor: and isn't wtd:" filter let floor:drawers's key sort after
+  // every real date string, which broke the variance review's "latest date"
+  // detection the moment any drawer batch existed.
   const loadFloorActuals = async () => {
     try {
       const listing = await window.storage.list("floor:");
-      const dayKeys = (listing?.keys || []).filter(k => k.startsWith("floor:") && !k.startsWith("floor:wtd:"));
+      const dayKeyRe = /^floor:\d{4}-\d{2}-\d{2}$/;
+      const dayKeys = (listing?.keys || []).filter(k => dayKeyRe.test(k));
       const entries = {};
       for (const k of dayKeys) {
         try {
@@ -3091,6 +3150,7 @@ function App() {
         jobCount={jobs.length}
         warningCount={activeWarnings.length}
         onShowWarnings={() => setShowWarnings(true)}
+        onShowRateReview={() => setShowRateReview(true)}
         reminderCount={activeReminders.length}
         onShowReminders={() => setShowReminders(true)}
         onWeeklyUpdate={() => setShowWeeklyUpdate(true)}
@@ -3305,6 +3365,14 @@ function App() {
         />
       )}
 
+      {showRateReview && (
+        <RateReviewModal
+          floorActuals={floorActuals}
+          jobs={jobs}
+          onClose={() => setShowRateReview(false)}
+        />
+      )}
+
       {showReminders && activeReminders.length > 0 && (
         <RemindersModal
           reminders={activeReminders}
@@ -3385,7 +3453,7 @@ function App() {
   );
 }
 
-function Header({ onAddJob, onSettings, onWhatIf, onExport, onImport, jobCount, warningCount, onShowWarnings, reminderCount, onShowReminders, onWeeklyUpdate, lastUpdateDate, varianceCount, onShowVarianceReview, canUndo, canRedo, onUndo, onRedo }) {
+function Header({ onAddJob, onSettings, onWhatIf, onExport, onImport, jobCount, warningCount, onShowWarnings, onShowRateReview, reminderCount, onShowReminders, onWeeklyUpdate, lastUpdateDate, varianceCount, onShowVarianceReview, canUndo, canRedo, onUndo, onRedo }) {
   const fileRef = useRef(null);
   // Show "needs check-in" hint if the last update was more than 7 days ago, or never
   const needsCheckin = (() => {
@@ -3468,6 +3536,9 @@ function Header({ onAddJob, onSettings, onWhatIf, onExport, onImport, jobCount, 
           style={{ display: "none" }}
           onChange={onImport}
         />
+        <button style={styles.btnGhost} onClick={onShowRateReview} title="Rate review — assumed vs actual cabinets/day">
+          <TrendingUp size={14} />
+        </button>
         <button style={styles.btnGhost} onClick={onSettings} title="Settings">
           <Settings size={14} />
         </button>
@@ -3969,6 +4040,73 @@ function WarningsModal({ warnings, fingerprintFor, onApproveOne, onApproveAll, o
               Review later
             </button>
           </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Read-only comparison of the assumed cabinet-per-day rates against what the
+// floor board's own bench taps actually show, once there's enough of them —
+// the groundwork for the schedule eventually calibrating itself, without
+// actually doing that calibration automatically yet. See computeRateReview.
+function RateReviewModal({ floorActuals, jobs, onClose }) {
+  const rows = useMemo(() => computeRateReview(floorActuals, jobs), [floorActuals, jobs]);
+  const sampleDates = Object.keys(floorActuals || {}).sort();
+  const hasAnyData = sampleDates.length > 0;
+
+  return (
+    <div style={styles.modalOverlay} onClick={onClose}>
+      <div style={{ ...styles.modal, width: 560, maxHeight: "80vh" }} onClick={e => e.stopPropagation()}>
+        <div style={styles.modalHeader}>
+          <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <TrendingUp size={14} style={{ color: "#5a6e50" }} />
+            Rate review
+          </span>
+          <button style={styles.iconBtn} onClick={onClose}><X size={14} /></button>
+        </div>
+        <div style={{ ...styles.modalBody, paddingTop: 8 }}>
+          <div style={{ fontSize: 11, color: "#7a6a55", marginBottom: 14, lineHeight: 1.5 }}>
+            What the floor board's bench taps show each style actually running
+            at, against what the schedule assumes. Read-only — nothing here
+            changes the schedule. Only counts jobs that are entirely one
+            style, since a mixed job's taps can't be split back out by style
+            after the fact.
+          </div>
+          {!hasAnyData && (
+            <div style={{ fontSize: 12, color: "#9b8f7e", fontStyle: "italic", padding: "8px 0" }}>
+              No floor board history yet — this fills in once the board's been in use for a while.
+            </div>
+          )}
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+            <thead>
+              <tr style={{ borderBottom: "1px solid #d9cfba" }}>
+                <th style={{ textAlign: "left", padding: "6px 4px", color: "#7a6a55", fontWeight: 500 }}>Style</th>
+                <th style={{ textAlign: "right", padding: "6px 4px", color: "#7a6a55", fontWeight: 500 }}>Assumed</th>
+                <th style={{ textAlign: "right", padding: "6px 4px", color: "#7a6a55", fontWeight: 500 }}>Actual</th>
+                <th style={{ textAlign: "right", padding: "6px 4px", color: "#7a6a55", fontWeight: 500 }}>Sample</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map(r => (
+                <tr key={r.style} style={{ borderBottom: "1px solid #e8dfca" }}>
+                  <td style={{ padding: "8px 4px" }}>{r.label}</td>
+                  <td style={{ padding: "8px 4px", textAlign: "right", color: "#7a6a55" }}>{r.assumedRate}/day</td>
+                  <td style={{ padding: "8px 4px", textAlign: "right", fontWeight: r.actualRate !== null ? 600 : 400, color: r.actualRate !== null ? "#3a342c" : "#c3b9a4" }}>
+                    {r.actualRate !== null ? `${r.actualRate}/day` : "—"}
+                  </td>
+                  <td style={{ padding: "8px 4px", textAlign: "right", color: "#9b8f7e", fontSize: 11 }}>
+                    {r.sampleJobs > 0 ? `${r.sampleJobs} job${r.sampleJobs === 1 ? "" : "s"}, ${r.sampleDays}d` : "no data yet"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {hasAnyData && (
+            <div style={{ fontSize: 11, color: "#9b8f7e", marginTop: 12, lineHeight: 1.5 }}>
+              Based on {sampleDates.length} day{sampleDates.length === 1 ? "" : "s"} of floor board data, {fmtUK(parseISO(sampleDates[0]))}–{fmtUK(parseISO(sampleDates[sampleDates.length - 1]))}.
+            </div>
+          )}
         </div>
       </div>
     </div>
