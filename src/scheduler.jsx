@@ -1511,15 +1511,47 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
       const { benchStart: latestBenchStartDate } = backwardFromInstall(
         pinnedInstallDate, benchDays, job.machiningDays || 1, impact, holidays, settings
       );
-      const desiredLatestBenchStart = { date: latestBenchStartDate, used: 0 };
-      const slackWorkingDays = workingDaysBetween(asapSlot.date, desiredLatestBenchStart.date, holidays);
-      if (slackWorkingDays >= SLACK_THRESHOLD_WORKING_DAYS) {
-        const latestSlot = findLatestFreeBenchSlot(desiredLatestBenchStart, benchActualDays, state.benchOccupied, holidays);
-        // Only actually defer if the backward search landed later than ASAP —
-        // if congestion pushed it back to (or before) the ASAP slot anyway,
-        // there's no benefit, just use ASAP.
-        if (compareFractionalSlot(latestSlot, asapSlot) > 0) {
-          benchStartSlot = latestSlot;
+      let desiredLatestBenchStart = { date: latestBenchStartDate, used: 0 };
+      // Clamp to the earliest the schedule can start at all. If the deadline
+      // implies starting before that, forcing a slot doesn't help — that's
+      // not a capacity fight with other jobs, it's genuinely not enough
+      // calendar time between now and the date no matter what, and
+      // install-feasibility (further down) already handles that properly by
+      // nudging the install date forward with its own clear warning.
+      const clampedToStart = compareFractionalSlot(desiredLatestBenchStart, earliestBenchSlot) < 0;
+      if (clampedToStart) desiredLatestBenchStart = earliestBenchSlot;
+      if (!clampedToStart && compareFractionalSlot(asapSlot, desiredLatestBenchStart) > 0) {
+        // The install date is the fixed commitment — the earliest genuinely
+        // FREE bench slot already lands after the point production needs to
+        // have started to hit it, which means there's no free capacity left
+        // in time at all (searching further back would just walk into the
+        // same wall-to-wall occupancy). Pin bench directly to the latest
+        // position that can still make the date, the same way a manual pin
+        // would — even if that overlaps another job's bench time — rather
+        // than silently letting the install date drift out to whenever
+        // capacity happens to next be free. Loudly warn instead.
+        benchStartSlot = desiredLatestBenchStart;
+        const forcedEnd = advanceFractionalDay(desiredLatestBenchStart, benchActualDays, holidays);
+        for (const existing of state.benchOccupied) {
+          if (slotsOverlap(desiredLatestBenchStart, forcedEnd, existing.startSlot, existing.endSlot)) {
+            warnings.push({
+              jobId: job.id,
+              jobName: job.name,
+              type: "buffer_too_tight",
+              message: `Bench doesn't fit before the ${fmtUK(pinnedInstallDate)} install target without overlapping ${existing.jobName}'s bench — scheduled anyway to protect the install date, review capacity`,
+            });
+          }
+        }
+      } else {
+        const slackWorkingDays = workingDaysBetween(asapSlot.date, desiredLatestBenchStart.date, holidays);
+        if (slackWorkingDays >= SLACK_THRESHOLD_WORKING_DAYS) {
+          const latestSlot = findLatestFreeBenchSlot(desiredLatestBenchStart, benchActualDays, state.benchOccupied, holidays);
+          // Only actually defer if the backward search landed later than ASAP —
+          // if congestion pushed it back to (or before) the ASAP slot anyway,
+          // there's no benefit, just use ASAP.
+          if (compareFractionalSlot(latestSlot, asapSlot) > 0) {
+            benchStartSlot = latestSlot;
+          }
         }
       }
     }
