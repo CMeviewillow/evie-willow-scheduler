@@ -2617,6 +2617,17 @@ function App() {
   const [updateFeedback, setUpdateFeedback] = useState(null); // { ok, message, updates, unparsed, offset }
   const [loading, setLoading] = useState(true);
 
+  // Drag-freeze: when a Gantt bar is dragged/resized/reset, every OTHER job's
+  // bench/finishing position gets temporarily pinned to wherever it's
+  // CURRENTLY rendered — session-only, never saved to storage — so the one
+  // job you're actually touching can move without the shared bench/finishing
+  // capacity search reflowing the whole rest of the year along with it. Any
+  // other kind of edit (form field, add/delete job, settings, import,
+  // undo/redo) clears it, so normal auto-flow resumes for real changes.
+  // { jobId: { benchOverride?, benchDaysOverride?, benchOverrideUsed?,
+  //            finishingOverride?, finishingDaysOverride?, finishingOverrideUsed? } }
+  const [dragFreeze, setDragFreeze] = useState(null);
+
   // Undo/redo history — a stack of { jobs, settings } snapshots. jobs/settings
   // are always replaced (never mutated) elsewhere in this component, so
   // storing the reference is enough; no cloning needed.
@@ -2638,7 +2649,7 @@ function App() {
 
   // Load from storage (reusable function for realtime sync)
   const reloadFromStorage = async () => {
-    try { const j = await window.storage.get("ew-jobs"); if (j?.value) setJobs(JSON.parse(j.value)); } catch {}
+    try { const j = await window.storage.get("ew-jobs"); if (j?.value) { setDragFreeze(null); setJobs(JSON.parse(j.value)); } } catch {}
     try { const s = await window.storage.get("ew-settings"); if (s?.value) setSettings(JSON.parse(s.value)); } catch {}
     try { const r = await window.storage.get("ew-dismissed-reminders"); if (r?.value) setDismissedReminders(JSON.parse(r.value)); } catch {}
     try { const w = await window.storage.get("ew-dismissed-warnings"); if (w?.value) setDismissedWarnings(JSON.parse(w.value)); } catch {}
@@ -2742,6 +2753,7 @@ function App() {
     setRedoStack(r => [...r, { jobs, settings }]);
     setHistoryStack(h => h.slice(0, -1));
     isUndoRedoActionRef.current = true;
+    setDragFreeze(null);
     setJobs(prev.jobs);
     setSettings(prev.settings);
     setTimeout(() => { isUndoRedoActionRef.current = false; }, 0);
@@ -2752,6 +2764,7 @@ function App() {
     setHistoryStack(h => [...h, { jobs, settings }]);
     setRedoStack(r => r.slice(0, -1));
     isUndoRedoActionRef.current = true;
+    setDragFreeze(null);
     setJobs(next.jobs);
     setSettings(next.settings);
     setTimeout(() => { isUndoRedoActionRef.current = false; }, 0);
@@ -2777,6 +2790,7 @@ function App() {
             const existing = JSON.parse(r.value);
             if (Array.isArray(existing) && existing.length === 0) return;
             console.warn("Refusing to save empty jobs array over existing data. Reloading from Supabase.");
+            setDragFreeze(null);
             setJobs(existing);
           } catch (e) {
             console.error("Failed to parse existing jobs:", e);
@@ -2814,10 +2828,14 @@ function App() {
     return set;
   }, [settings.holidays]);
 
-  const { scheduled, warnings, dayLayout } = useMemo(
-    () => scheduleJobs(jobs, holidaySet, settings),
-    [jobs, holidaySet, settings]
-  );
+  const { scheduled, warnings, dayLayout } = useMemo(() => {
+    // Apply the drag-freeze as synthetic, unsaved overrides for this
+    // computation only — jobs itself (what gets persisted) is untouched.
+    const jobsForCompute = dragFreeze
+      ? jobs.map(j => dragFreeze[j.id] ? { ...j, ...dragFreeze[j.id] } : j)
+      : jobs;
+    return scheduleJobs(jobsForCompute, holidaySet, settings);
+  }, [jobs, holidaySet, settings, dragFreeze]);
 
   // Build warning fingerprints. A warning's identity = type + job + message,
   // so when the schedule shifts and produces a different message for the same
@@ -3168,6 +3186,7 @@ function App() {
 
   const addJob = () => {
     const j = newJob();
+    setDragFreeze(null);
     setJobs(prev => [...prev, j]);
     setEditingJobId(j.id);
   };
@@ -3175,11 +3194,49 @@ function App() {
   const updateJob = (id, patch) => {
     // Use the functional form so rapid successive updates (e.g. typing into a
     // text field) always see the latest state, not a stale closure value.
+    // A real content edit — not a Gantt-bar gesture — so any drag-freeze in
+    // effect is no longer relevant; let normal auto-flow resume.
+    setDragFreeze(null);
     setJobs(prev => prev.map(j => j.id === id ? { ...j, ...patch } : j));
+  };
+
+  // Used only by onStageDrag/onStageResize/onStageReset — deliberately does
+  // NOT clear dragFreeze (see its definition), since those are exactly the
+  // gestures the freeze exists to protect.
+  const dragUpdateJob = (id, patch) => {
+    setJobs(prev => prev.map(j => j.id === id ? { ...j, ...patch } : j));
+  };
+
+  // Snapshot every OTHER job's currently-rendered bench/finishing position as
+  // a session-only synthetic override, so the shared-capacity search can't
+  // reflow them just because this one job's stage moved. Only freezes jobs
+  // that aren't already really overridden (nothing to protect there — they
+  // already hold their position regardless).
+  const freezeOtherJobs = (exceptJobId) => {
+    const freeze = { ...(dragFreeze || {}) };
+    scheduled.forEach(j => {
+      if (j.id === exceptJobId) return;
+      const entry = { ...(freeze[j.id] || {}) };
+      const benchTask = j.tasks?.find(t => t.stage === "bench");
+      if (benchTask && !j.benchOverride) {
+        entry.benchOverride = dayKey(benchTask.start);
+        entry.benchDaysOverride = benchTask.days;
+        entry.benchOverrideUsed = benchTask.startSlot?.used || 0;
+      }
+      const finishTask = j.tasks?.find(t => t.stage === "finishing");
+      if (finishTask && !j.finishingOverride) {
+        entry.finishingOverride = dayKey(finishTask.start);
+        entry.finishingDaysOverride = finishTask.days;
+        entry.finishingOverrideUsed = finishTask.startSlot?.used || 0;
+      }
+      if (Object.keys(entry).length) freeze[j.id] = entry;
+    });
+    setDragFreeze(freeze);
   };
 
   const deleteJob = (id) => {
     if (confirm("Delete this job?")) {
+      setDragFreeze(null);
       setJobs(prev => prev.filter(j => j.id !== id));
       if (editingJobId === id) setEditingJobId(null);
     }
@@ -3217,7 +3274,7 @@ function App() {
     reader.onload = (ev) => {
       try {
         const data = JSON.parse(ev.target.result);
-        if (data.jobs) setJobs(data.jobs);
+        if (data.jobs) { setDragFreeze(null); setJobs(data.jobs); }
         if (data.settings) setSettings(data.settings);
       } catch (err) { alert("Invalid file"); }
     };
@@ -3396,21 +3453,24 @@ function App() {
           onStageDrag={(jobId, stage, isoDate, usedFraction) => {
             const cfg = DRAGGABLE_STAGES[stage];
             if (!cfg) return;
+            freezeOtherJobs(jobId);
             const patch = { [cfg.dateField]: isoDate };
             if (cfg.usedField) patch[cfg.usedField] = usedFraction || 0;
-            updateJob(jobId, patch);
+            dragUpdateJob(jobId, patch);
           }}
           onStageResize={(jobId, stage, days) => {
             const cfg = DRAGGABLE_STAGES[stage];
             if (!cfg) return;
-            updateJob(jobId, { [cfg.daysField]: days });
+            freezeOtherJobs(jobId);
+            dragUpdateJob(jobId, { [cfg.daysField]: days });
           }}
           onStageReset={(jobId, stage) => {
             const cfg = DRAGGABLE_STAGES[stage];
             if (!cfg) return;
+            freezeOtherJobs(jobId);
             const patch = { [cfg.dateField]: "", [cfg.daysField]: 0 };
             if (cfg.usedField) patch[cfg.usedField] = 0;
-            updateJob(jobId, patch);
+            dragUpdateJob(jobId, patch);
           }}
           onToggleLock={(jobId, scheduledJob) => {
             // When locking: snapshot the current install date, duration, and fitter
@@ -3536,6 +3596,7 @@ function App() {
           settings={settings}
           onClose={() => setShowWhatIf(false)}
           onConvertToJob={(hypoJob) => {
+            setDragFreeze(null);
             setJobs([...jobs, hypoJob]);
             setEditingJobId(hypoJob.id);
             setShowWhatIf(false);
