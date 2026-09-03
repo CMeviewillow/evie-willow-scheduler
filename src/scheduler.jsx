@@ -6949,9 +6949,9 @@ const FLOOR_BOARD_CSS = `
   .floor-board-root .sub{font-size:14px;color:var(--ink3);letter-spacing:.09em;font-style:italic;margin-top:4px}
   .floor-board-root .today-date{font-size:26px;font-weight:500;text-align:right}
   .floor-board-root .today-sub{font-size:13px;color:var(--ink2);letter-spacing:.08em;text-transform:uppercase;text-align:right;margin-top:3px}
-  .floor-board-root .pipe{display:flex;align-items:flex-end;gap:10px;margin:22px 0 20px}
+  .floor-board-root .pipe{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px;margin:22px 0 20px}
   .floor-board-root .pipe-seg{background:var(--panel);border:1px solid var(--rule);border-radius:4px;
-    padding:11px 13px 13px;flex:1;min-width:0}
+    padding:11px 13px 13px;flex:1 1 200px;min-width:0}
   .floor-board-root .pipe-name{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink2);font-weight:500}
   .floor-board-root .pipe-cap{font-size:34px;font-weight:500;line-height:1.05;margin-top:5px}
   .floor-board-root .pipe-cap span{font-size:14px;color:var(--ink2);letter-spacing:.05em;font-weight:400}
@@ -6965,8 +6965,9 @@ const FLOOR_BOARD_CSS = `
   .floor-board-root .wk.behind .wk-num{color:var(--clay)}
   .floor-board-root h2.sec{font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:var(--ink3);
     font-weight:600;margin:0 0 12px;font-family:Inter,sans-serif}
-  .floor-board-root .stages{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}
-  .floor-board-root .card{background:var(--panel);border:1px solid var(--rule);border-radius:6px;padding:15px 16px 17px}
+  .floor-board-root .stages{display:flex;flex-wrap:wrap;gap:14px}
+  .floor-board-root .card{background:var(--panel);border:1px solid var(--rule);border-radius:6px;padding:15px 16px 17px;
+    flex:1 1 260px;min-width:0}
   .floor-board-root .card.done{background:var(--sage-bg);border-color:var(--sage)}
   .floor-board-root .card.behind{background:var(--clay-bg);border-color:var(--clay)}
   .floor-board-root .card-head{display:flex;justify-content:space-between;align-items:baseline}
@@ -7044,7 +7045,6 @@ const FLOOR_BOARD_CSS = `
   .floor-board-root .batch-toggle button.yes[aria-pressed="true"]{background:var(--sage-bg);color:#5a6e50;border-color:var(--sage);font-weight:600}
   .floor-board-root .batch-toggle button.no[aria-pressed="true"]{background:var(--clay-bg);color:var(--clay);border-color:var(--clay);font-weight:600}
   .floor-board-root .batch-empty{font-size:12px;color:var(--ink3);font-style:italic}
-  @media (max-width:1100px){.floor-board-root .pipe{flex-wrap:wrap}.floor-board-root .pipe-seg{flex:1 1 30%}}
   @media (prefers-reduced-motion:reduce){.floor-board-root *{transition:none!important}}
 `;
 
