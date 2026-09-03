@@ -1578,46 +1578,69 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
   } else {
     // Auto: bench prep is always the working day right before THIS job's
     // own bench start — "bench prep is the cabinets for tomorrow's bench" —
-    // independent of every other job. CNC cutting is a separate, continuous
-    // queue (see findFreeMachiningSlot) that keeps pulling the next job
-    // forward the moment the line frees up, instead of waiting on some
-    // OTHER job's prep day the way one shared block used to force it to.
+    // independent of every other job.
     prepDay = addDays(benchStartSlot.date, -1);
     while (isWeekend(prepDay) || holidays.has(dayKey(prepDay))) {
       prepDay = addDays(prepDay, -1);
     }
+
+    // The machining CELL itself is a fixed-width nominal block (machDays
+    // working days) ending at prepDay — same as every other stage. It never
+    // stretches or shrinks on screen based on how busy the CNC line actually
+    // is; that congestion is tracked separately below, purely to warn when
+    // the line can't keep pace, never to resize what's shown on the calendar.
+    let nominalStart = prepDay;
+    for (let i = 1; i < machDays; i++) {
+      nominalStart = addDays(nominalStart, -1);
+      while (isWeekend(nominalStart) || holidays.has(dayKey(nominalStart))) {
+        nominalStart = addDays(nominalStart, -1);
+      }
+    }
+    machiningStartActual = nominalStart;
+    machiningEnd = addDays(prepDay, 1);
+
+    // Separately (not used for the cell's position): where would this job's
+    // cutting actually land if the CNC line were a strict first-come queue?
+    // Only feeds the "CNC queue is running behind" warning below.
     if (cncDays > 0) {
       const earliestMach = nextWorkingDay(parseISO(settings.startDate), holidays);
       cncStart = findFreeMachiningSlot(earliestMach, cncDays, state.machiningOccupied, holidays);
       const cncSeq = workingDaysSeq(cncStart, cncDays, holidays);
       cncEnd = addDays(cncSeq[cncSeq.length - 1], 1);
     }
-    machiningStartActual = cncDays > 0 ? cncStart : prepDay;
-    machiningEnd = addDays(prepDay, 1);
   }
 
-  // Sanity warning: if user has manually positioned machining such that it ends
-  // AFTER bench has started, flag it (production order broken). Same physical
-  // problem can be caused from either side — machining pinned too late, or
-  // bench pinned too early — so check both, but only warn once. Auto jobs'
-  // prep day is always valid relative to bench by construction, so this only
-  // ever fires for a manual pin on one side or the other.
-  if (machiningEnd > benchStartSlot.date) {
-    if (job.machiningOverride) {
+  // Sanity warning: flag it if machining and bench are genuinely out of
+  // order. Same physical problem can be caused from either side — machining
+  // pinned too late, or bench pinned too early — so check both, but only
+  // warn once. Auto jobs' prep day is always valid relative to bench by
+  // construction, so this only ever fires for a manual pin on one side.
+  //
+  // When machining itself was pinned, that's a human's judgement call on
+  // how the two stages actually overlap in practice (a quick job can be cut
+  // and benched the same day) — same as the finishing→bench and
+  // reassembly→finishing checks below, only the actual START is compared,
+  // not the formula's full multi-day estimate. Only a genuine inversion
+  // (bench already underway before machining even began) is worth flagging.
+  // When machining is auto-calculated instead, its computed end date IS the
+  // system's own estimate, so a bench pin landing before that estimate
+  // finishes is still worth a warning.
+  if (machiningWasPinned) {
+    if (machiningStartActual > benchStartSlot.date) {
       warnings.push({
         jobId: job.id,
         jobName: job.name,
         type: "buffer_too_tight",
-        message: `Machining ends ${fmtUK(addDays(machiningEnd, -1))} but bench starts ${fmtUK(benchStartSlot.date)} — production order broken`,
-      });
-    } else if (benchWasPinned) {
-      warnings.push({
-        jobId: job.id,
-        jobName: job.name,
-        type: "buffer_too_tight",
-        message: `Bench pinned to start ${fmtUK(benchStartSlot.date)} but machining doesn't finish until ${fmtUK(addDays(machiningEnd, -1))} — production order broken`,
+        message: `Machining pinned to start ${fmtUK(machiningStartActual)} but bench already starts ${fmtUK(benchStartSlot.date)} — production order broken`,
       });
     }
+  } else if (benchWasPinned && machiningEnd > benchStartSlot.date) {
+    warnings.push({
+      jobId: job.id,
+      jobName: job.name,
+      type: "buffer_too_tight",
+      message: `Bench pinned to start ${fmtUK(benchStartSlot.date)} but machining doesn't finish until ${fmtUK(addDays(machiningEnd, -1))} — production order broken`,
+    });
   }
   // Auto jobs with a real cutting portion: the CNC line is its own
   // independent queue now, so on a congested line it's genuinely possible
@@ -2156,7 +2179,11 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
   });
 
   // Buffer check: count working days between reassembly end and install start.
-  // Warn if below the ideal workshop buffer; refuse if below minimum.
+  // Only the "below minimum" case is worth surfacing now — the softer
+  // "below ideal, tight squeeze" warning was firing on nearly every job and
+  // added no decision-useful signal, so it's gone. This only touches the
+  // warning; workshopBufferIdeal itself still governs actual install
+  // placement elsewhere (line ~1820), untouched.
   {
     let bufferActual = 0;
     let cur = new Date(reassemblyEndDate.getTime());
@@ -2165,14 +2192,6 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
       bufferActual++;
       cur = addDays(cur, 1);
       cur = nextWorkingDay(cur, holidays);
-    }
-    if (bufferActual < workshopBufferIdeal) {
-      warnings.push({
-        jobId: job.id,
-        jobName: job.name,
-        type: "buffer_tight",
-        message: `Workshop buffer is ${bufferActual} working day${bufferActual === 1 ? "" : "s"} (ideal: ${workshopBufferIdeal}). Tight squeeze.`,
-      });
     }
     if (bufferActual < workshopBufferMin) {
       warnings.push({
