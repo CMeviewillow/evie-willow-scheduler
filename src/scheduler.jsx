@@ -6942,38 +6942,38 @@ const FLOOR_BOARD_CSS = `
     font-family:Inter,-apple-system,'Segoe UI',sans-serif;-webkit-font-smoothing:antialiased;
     min-height:100vh;}
   .floor-board-root .serif{font-family:'Cormorant Garamond',Georgia,serif}
-  .floor-board-root .wrap{max-width:1880px;margin:0 auto;padding:20px 28px 32px}
+  .floor-board-root .wrap{max-width:1880px;margin:0 auto;padding:10px 24px 12px}
   .floor-board-root .top{display:flex;justify-content:space-between;align-items:flex-end;
-    border-bottom:1px solid var(--rule);padding-bottom:14px}
-  .floor-board-root .brand{font-size:30px;letter-spacing:.2em;font-weight:400}
-  .floor-board-root .sub{font-size:14px;color:var(--ink3);letter-spacing:.09em;font-style:italic;margin-top:4px}
-  .floor-board-root .today-date{font-size:26px;font-weight:500;text-align:right}
-  .floor-board-root .today-sub{font-size:13px;color:var(--ink2);letter-spacing:.08em;text-transform:uppercase;text-align:right;margin-top:3px}
-  .floor-board-root .pipe{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px;margin:22px 0 20px}
+    border-bottom:1px solid var(--rule);padding-bottom:10px}
+  .floor-board-root .brand{font-size:26px;letter-spacing:.2em;font-weight:400}
+  .floor-board-root .sub{font-size:13px;color:var(--ink3);letter-spacing:.09em;font-style:italic;margin-top:3px}
+  .floor-board-root .today-date{font-size:22px;font-weight:500;text-align:right}
+  .floor-board-root .today-sub{font-size:12px;color:var(--ink2);letter-spacing:.08em;text-transform:uppercase;text-align:right;margin-top:2px}
+  .floor-board-root .pipe{display:flex;flex-wrap:wrap;align-items:flex-end;gap:8px;margin:14px 0 12px}
   .floor-board-root .pipe-seg{background:var(--panel);border:1px solid var(--rule);border-radius:4px;
-    padding:11px 13px 13px;flex:1 1 200px;min-width:0}
-  .floor-board-root .pipe-name{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink2);font-weight:500}
-  .floor-board-root .pipe-cap{font-size:34px;font-weight:500;line-height:1.05;margin-top:5px}
-  .floor-board-root .pipe-cap span{font-size:14px;color:var(--ink2);letter-spacing:.05em;font-weight:400}
+    padding:8px 11px 10px;flex:1 1 150px;min-width:0}
+  .floor-board-root .pipe-name{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink2);font-weight:500}
+  .floor-board-root .pipe-cap{font-size:27px;font-weight:500;line-height:1.05;margin-top:4px}
+  .floor-board-root .pipe-cap span{font-size:13px;color:var(--ink2);letter-spacing:.05em;font-weight:400}
   .floor-board-root .pipe-style{font-size:11px;color:var(--ink3);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .floor-board-root .weekstrip{display:flex;gap:14px;margin-bottom:24px}
-  .floor-board-root .wk{background:var(--panel);border:1px solid var(--rule);border-radius:6px;padding:14px 17px}
-  .floor-board-root .wk-num{font-size:38px;font-weight:500;line-height:1}
-  .floor-board-root .wk-lbl{font-size:13px;color:var(--ink2);margin-top:4px}
-  .floor-board-root .wk-note{font-size:12px;color:var(--ink3);margin-top:3px}
+  .floor-board-root .weekstrip{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:14px}
+  .floor-board-root .wk{background:var(--panel);border:1px solid var(--rule);border-radius:6px;padding:10px 15px}
+  .floor-board-root .wk-num{font-size:30px;font-weight:500;line-height:1}
+  .floor-board-root .wk-lbl{font-size:12px;color:var(--ink2);margin-top:3px}
+  .floor-board-root .wk-note{font-size:11px;color:var(--ink3);margin-top:2px}
   .floor-board-root .wk.behind{border-color:var(--clay);background:var(--clay-bg)}
   .floor-board-root .wk.behind .wk-num{color:var(--clay)}
   .floor-board-root h2.sec{font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:var(--ink3);
-    font-weight:600;margin:0 0 12px;font-family:Inter,sans-serif}
-  .floor-board-root .stages{display:flex;flex-wrap:wrap;gap:14px}
-  .floor-board-root .card{background:var(--panel);border:1px solid var(--rule);border-radius:6px;padding:15px 16px 17px;
-    flex:1 1 260px;min-width:0}
+    font-weight:600;margin:0 0 8px;font-family:Inter,sans-serif}
+  .floor-board-root .stages{display:flex;flex-wrap:wrap;gap:10px}
+  .floor-board-root .card{background:var(--panel);border:1px solid var(--rule);border-radius:6px;padding:11px 13px 12px;
+    flex:1 1 190px;min-width:0}
   .floor-board-root .card.done{background:var(--sage-bg);border-color:var(--sage)}
   .floor-board-root .card.behind{background:var(--clay-bg);border-color:var(--clay)}
   .floor-board-root .card-head{display:flex;justify-content:space-between;align-items:baseline}
   .floor-board-root .card-name{font-size:16px;font-weight:500;letter-spacing:.02em}
   .floor-board-root .card-tgt{font-size:12px;color:var(--ink2);letter-spacing:.06em}
-  .floor-board-root .chips{display:flex;flex-wrap:wrap;gap:7px;margin:8px 0 4px;min-height:26px}
+  .floor-board-root .chips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 3px;min-height:24px}
   .floor-board-root .chip{background:var(--panel2);border:1px solid var(--rule2);border-radius:4px;
     padding:4px 8px;font-size:12px;color:var(--ink2);display:flex;align-items:center;gap:6px;
     font-family:Inter,sans-serif;cursor:pointer;font-weight:400}
@@ -6983,37 +6983,40 @@ const FLOOR_BOARD_CSS = `
   .floor-board-root .chip-n{font-weight:500;color:var(--ink)}
   .floor-board-root .swatch{display:inline-block;width:11px;height:11px;border-radius:2px;
     border:1px solid rgba(58,52,44,.25);flex:none}
-  .floor-board-root .count-row{display:flex;align-items:flex-end;gap:12px;margin-top:8px}
-  .floor-board-root .count{font-size:56px;font-weight:500;line-height:.9;min-width:64px}
-  .floor-board-root .of{font-size:17px;color:var(--ink2);padding-bottom:6px}
+  .floor-board-root .count-row{display:flex;align-items:flex-end;gap:10px;margin-top:5px}
+  .floor-board-root .count{font-size:44px;font-weight:500;line-height:.9;min-width:52px}
+  .floor-board-root .of{font-size:15px;color:var(--ink2);padding-bottom:5px}
   .floor-board-root .behind-pill{font-size:11px;letter-spacing:.1em;text-transform:uppercase;padding:3px 8px;
     border-radius:3px;background:var(--clay-bg);color:var(--clay);font-weight:600;margin-bottom:8px}
   .floor-board-root .done-pill{font-size:11px;letter-spacing:.1em;text-transform:uppercase;padding:3px 8px;
     border-radius:3px;background:var(--sage-bg);color:#5a6e50;font-weight:600;margin-bottom:8px}
-  .floor-board-root .bar{height:9px;background:var(--rule2);border-radius:5px;margin-top:13px;position:relative}
-  .floor-board-root .bar-fill{height:9px;background:var(--sage);border-radius:5px;transition:width .25s}
+  .floor-board-root .bar{height:8px;background:var(--rule2);border-radius:4px;margin-top:9px;position:relative}
+  .floor-board-root .bar-fill{height:8px;background:var(--sage);border-radius:4px;transition:width .25s}
   .floor-board-root .bar-fill.late{background:var(--clay)}
   .floor-board-root .bar-fill.over{background:var(--honey)}
-  .floor-board-root .pace{position:absolute;top:-3px;width:2px;height:15px;background:var(--ink2);border-radius:1px}
-  .floor-board-root .btns{display:flex;gap:8px;margin-top:13px}
+  .floor-board-root .pace{position:absolute;top:-3px;width:2px;height:14px;background:var(--ink2);border-radius:1px}
+  .floor-board-root .btns{display:flex;gap:8px;margin-top:9px}
   .floor-board-root button{font-family:Inter,sans-serif;cursor:pointer;border-radius:4px;font-weight:500}
   .floor-board-root .plus{flex:1;background:var(--sage);color:var(--panel);border:none;
-    font-size:26px;padding:14px 0;letter-spacing:.02em;min-height:56px}
+    font-size:22px;padding:10px 0;letter-spacing:.02em;min-height:46px}
   .floor-board-root .plus:active{background:#68785e}
-  .floor-board-root .minus{width:64px;background:transparent;color:var(--ink2);border:1px solid var(--rule);font-size:22px;min-height:56px}
+  .floor-board-root .minus{width:56px;background:transparent;color:var(--ink2);border:1px solid var(--rule);font-size:20px;min-height:46px}
   .floor-board-root .plus:focus-visible,.floor-board-root .minus:focus-visible,.floor-board-root .chip:focus-visible{outline:3px solid var(--slate);outline-offset:2px}
   .floor-board-root .yrow{display:flex;justify-content:space-between;align-items:center;
-    padding:11px 2px;border-bottom:1px solid var(--rule2);font-size:15px}
+    padding:5px 2px;border-bottom:1px solid var(--rule2);font-size:14px}
   .floor-board-root .ynum{display:flex;align-items:baseline;gap:9px}
-  .floor-board-root .yactual{font-size:22px;font-weight:500;min-width:34px;text-align:right}
-  .floor-board-root .ytgt{font-size:13px;color:var(--ink3)}
+  .floor-board-root .yactual{font-size:18px;font-weight:500;min-width:34px;text-align:right}
+  .floor-board-root .ytgt{font-size:12px;color:var(--ink3)}
   .floor-board-root .pill{font-size:11px;letter-spacing:.12em;padding:3px 9px;border-radius:3px;font-weight:600;min-width:52px;text-align:center}
   .floor-board-root .hit{background:var(--sage-bg);color:#5a6e50}
   .floor-board-root .miss{background:var(--clay-bg);color:var(--clay)}
-  .floor-board-root .notice{margin-top:22px;padding:10px 14px;border:1px dashed var(--rule);border-radius:4px;
-    font-size:12px;color:var(--ink3);line-height:1.6}
-  .floor-board-root .yesterday-wrap{margin-top:30px;max-width:900px}
-  .floor-board-root .notes-wrap{margin-top:30px;max-width:900px}
+  .floor-board-root .notice{margin-top:8px;padding:6px 12px;border:1px dashed var(--rule);border-radius:4px;
+    font-size:11px;color:var(--ink3);line-height:1.4}
+  .floor-board-root .bottom-row{display:flex;flex-wrap:wrap;gap:24px;margin-top:10px}
+  .floor-board-root .yesterday-wrap{flex:1 1 320px;min-width:0;max-width:520px}
+  .floor-board-root .notes-wrap{flex:1 1 320px;min-width:0;max-width:420px}
+  .floor-board-root #yesterday{display:flex;flex-wrap:wrap;column-gap:20px}
+  .floor-board-root #yesterday .yrow{flex:1 1 45%}
   .floor-board-root .note-row{display:flex;gap:8px;margin-bottom:10px}
   .floor-board-root .note-row input{flex:1;border:1px solid var(--rule);border-radius:4px;padding:9px 12px;
     font-size:13px;background:#fff;color:var(--ink);font-family:Inter,sans-serif}
@@ -7480,17 +7483,19 @@ function FloorBoard({ scheduled, dayLayout }) {
           <h2 className="sec">Today · tap as each cabinet clears a stage</h2>
           <div className="stages" id="stages" />
           <div className="notice" id="notice" />
-          <div className="notes-wrap">
-            <h2 className="sec">Notes</h2>
-            <div className="note-row">
-              <input id="note-input" type="text" placeholder="Add a note about today..." maxLength={200} />
-              <button data-addnote="1">Add</button>
+          <div className="bottom-row">
+            <div className="notes-wrap">
+              <h2 className="sec">Notes</h2>
+              <div className="note-row">
+                <input id="note-input" type="text" placeholder="Add a note about today..." maxLength={200} />
+                <button data-addnote="1">Add</button>
+              </div>
+              <div id="notes-list" />
             </div>
-            <div id="notes-list" />
-          </div>
-          <div className="yesterday-wrap">
-            <h2 className="sec">Yesterday</h2>
-            <div id="yesterday" />
+            <div className="yesterday-wrap">
+              <h2 className="sec">Yesterday</h2>
+              <div id="yesterday" />
+            </div>
           </div>
         </div>
         <div id="panel-drawers" style={{ display: "none" }}>
