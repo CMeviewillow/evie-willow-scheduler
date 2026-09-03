@@ -69,7 +69,7 @@ const DRAGGABLE_STAGES = {
   install:    { dateField: "installOverride",    daysField: "installDaysOverride" },
 };
 
-const FITTERS = ["Steve", "Thompson", "Chris"];
+const FITTERS = ["Steve", "Thompson"];
 const NON_FITTERS = ["Callum"];
 
 // UK bank holidays for 2025-2027 (England & Wales). These are always respected
@@ -1067,33 +1067,20 @@ function scheduleJobs(jobs, holidays, settings) {
       }
     });
   });
-  const heavyDays = Object.entries(finishingByDate).filter(([_, c]) => c >= 3);
-  if (heavyDays.length > 0) {
+  // Only count days that haven't happened yet — a heavy day already in the
+  // past is moot, the workshop already got through it.
+  const todayKeyForLoad = dayKey(new Date());
+  const futureHeavyDays = Object.entries(finishingByDate)
+    .filter(([k, c]) => c >= 3 && k >= todayKeyForLoad)
+    .map(([k]) => k)
+    .sort();
+  if (futureHeavyDays.length > 0) {
     warnings.push({
       type: "load",
-      message: `Heavy finishing load: ${heavyDays.length} day(s) with 3+ jobs in finishing simultaneously`,
+      message: `Heavy finishing load: ${futureHeavyDays.length} day(s) with 3+ jobs in finishing simultaneously`,
+      refDate: parseISO(futureHeavyDays[0]),
     });
   }
-
-  // Detect install bunching: 2+ installs starting in the same calendar week
-  const installsByWeek = {};
-  scheduled.forEach(job => {
-    const installTask = job.tasks?.find(t => t.stage === "install");
-    if (!installTask) return;
-    // Get ISO week key (year-week)
-    const d = new Date(installTask.start.getTime());
-    const wk = getWeekKey(d);
-    if (!installsByWeek[wk]) installsByWeek[wk] = [];
-    installsByWeek[wk].push(job.name || "(unnamed)");
-  });
-  Object.entries(installsByWeek).forEach(([wk, names]) => {
-    if (names.length >= 2) {
-      warnings.push({
-        type: "install_load",
-        message: `Week of ${fmtUK(wk)}: ${names.length} installs scheduled (${names.join(", ")})`,
-      });
-    }
-  });
 
   // Detect bench gaps caused by pinning: 2+ working days idle between
   // consecutive bench blocks. This can only happen when a pin creates a hole
@@ -1110,6 +1097,7 @@ function scheduleJobs(jobs, holidays, settings) {
         warnings.push({
           type: "bench_gap",
           message: `Bench gap of ${gap} working days between ${sortedBench[i - 1].jobName} and ${sortedBench[i].jobName}`,
+          refDate: nextStartDate,
         });
       }
     }
@@ -1128,25 +1116,29 @@ function scheduleJobs(jobs, holidays, settings) {
     });
     Object.entries(boothGroups).forEach(([boothRunId, members]) => {
       if (members.length < 2) return;
+      const installStarts = members
+        .map(j => j.tasks?.find(t => t.stage === "install"))
+        .filter(Boolean)
+        .map(t => t.start);
+      const maxD = installStarts.length
+        ? new Date(Math.max(...installStarts.map(d => d.getTime())))
+        : null;
       const colourKeys = new Set(members.map(j => `${j.colour?.hex || ""}|${j.colour?.name || ""}`));
       if (colourKeys.size > 1) {
         warnings.push({
           type: "booth_run_mismatch",
           message: `Booth run "${boothRunId}" pairs jobs with different colours: ${members.map(j => `${j.name} (${j.colour?.name || "no colour set"})`).join(", ")}`,
+          refDate: maxD,
         });
       }
-      const installStarts = members
-        .map(j => j.tasks?.find(t => t.stage === "install"))
-        .filter(Boolean)
-        .map(t => t.start);
       if (installStarts.length >= 2) {
         const minD = new Date(Math.min(...installStarts.map(d => d.getTime())));
-        const maxD = new Date(Math.max(...installStarts.map(d => d.getTime())));
         const spreadDays = workingDaysBetween(minD, maxD, holidays);
         if (spreadDays > 14) {
           warnings.push({
             type: "booth_run_mismatch",
             message: `Booth run "${boothRunId}" installs are ${spreadDays} working days apart (${members.map(j => j.name).join(", ")}) — more than the 14-day pairing window`,
+            refDate: maxD,
           });
         }
       }
@@ -1157,6 +1149,10 @@ function scheduleJobs(jobs, holidays, settings) {
   // nothing about a completed job needs manual review, and re-surfacing it
   // (e.g. because upstream drift nudged its computed dates slightly) is just
   // noise. Doesn't touch scheduling itself, only which warnings are reported.
+  // Same idea for the board-wide (no jobId) warnings above: each one carries
+  // a refDate for whatever it's actually about, and anything wholly in the
+  // past is dropped the same way — a bench gap or booth-run mismatch that
+  // already happened isn't something to review, it's history.
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const installDoneJobIds = new Set(
@@ -1167,7 +1163,11 @@ function scheduleJobs(jobs, holidays, settings) {
       })
       .map(j => j.id)
   );
-  const liveWarnings = warnings.filter(w => !(w.jobId && installDoneJobIds.has(w.jobId)));
+  const liveWarnings = warnings.filter(w => {
+    if (w.jobId && installDoneJobIds.has(w.jobId)) return false;
+    if (w.refDate && w.refDate < today) return false;
+    return true;
+  });
 
   return { scheduled, warnings: liveWarnings, dayLayout: computeDayLayout(scheduled, holidays, settings) };
 }
@@ -1780,8 +1780,30 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
   const workshopBufferIdeal = settings.workshopBufferIdealDays ?? 3;
   const workshopBufferMin = settings.workshopBufferMinDays ?? 1;
 
+  // If finishing and/or reassembly were pinned to dates earlier than this
+  // job's own bench actually landed (a stale pin, or bench pushed out by
+  // congestion after the pin was set — see the "production order broken"
+  // warnings above), reassemblyEndDate is not trustworthy as "when
+  // production is really done": it reflects the stale pin, not reality.
+  // Recompute what reassembly's earliest completion would be if it flowed
+  // naturally from bench's TRUE position, and never let install feasibility
+  // trust a date earlier than that. This never touches the finishing/
+  // reassembly CELLS themselves (they stay exactly where pinned) — it only
+  // affects how early install is allowed to be considered feasible. For any
+  // job whose chain is already consistent, chainImpliedReassemblyEnd is
+  // always <= the real reassemblyEndDate, so this is a no-op.
+  const chainFinishStart = nextWorkingDay(addDays(benchStartSlot.date, 1), holidays);
+  const chainReassemblyStart = nextWorkingDay(addDays(chainFinishStart, 1), holidays);
+  const chainReassemblyEndSlot = advanceFractionalDay({ date: chainReassemblyStart, used: 0 }, benchDays, holidays);
+  const chainImpliedReassemblyEnd = chainReassemblyEndSlot.used <= DAY_EPSILON
+    ? chainReassemblyEndSlot.date
+    : addDays(chainReassemblyEndSlot.date, 1);
+  const effectiveReassemblyEndDate = chainImpliedReassemblyEnd > reassemblyEndDate
+    ? chainImpliedReassemblyEnd
+    : reassemblyEndDate;
+
   // Earliest feasible install date = reassembly end + minimum buffer (working days)
-  let earliestFeasible = nextWorkingDay(reassemblyEndDate, holidays);
+  let earliestFeasible = nextWorkingDay(effectiveReassemblyEndDate, holidays);
   for (let i = 0; i < Math.max(dispatchGap, workshopBufferMin); i++) {
     earliestFeasible = addDays(earliestFeasible, 1);
     earliestFeasible = nextWorkingDay(earliestFeasible, holidays);
@@ -1801,7 +1823,7 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
         jobId: job.id,
         jobName: job.name,
         type: "install_nudged",
-        message: `Install nudged from ${fmtUK(pinnedInstallDate)} to ${fmtUK(earliestFeasible)} — production doesn't finish until ${fmtUK(reassemblyEndDate)}`,
+        message: `Install nudged from ${fmtUK(pinnedInstallDate)} to ${fmtUK(earliestFeasible)} — production doesn't finish until ${fmtUK(effectiveReassemblyEndDate)}`,
       });
     } else {
       earliestInstallStart = pinnedInstallDate;
@@ -1817,7 +1839,7 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
         jobId: job.id,
         jobName: job.name,
         type: "target_unreachable",
-        message: `Target ${fmtUK(pinnedInstallDate)} can't be hit — production finishes ${fmtUK(reassemblyEndDate)}, earliest install ${fmtUK(earliestFeasible)}`,
+        message: `Target ${fmtUK(pinnedInstallDate)} can't be hit — production finishes ${fmtUK(effectiveReassemblyEndDate)}, earliest install ${fmtUK(earliestFeasible)}`,
       });
     }
     if (targetOverflowWarning) {
@@ -1830,7 +1852,7 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     }
   } else {
     // Non-targeted: install = reassembly end + ideal workshop buffer.
-    earliestInstallStart = nextWorkingDay(reassemblyEndDate, holidays);
+    earliestInstallStart = nextWorkingDay(effectiveReassemblyEndDate, holidays);
     const bufferDays = Math.max(dispatchGap, workshopBufferIdeal);
     for (let i = 0; i < bufferDays; i++) {
       earliestInstallStart = addDays(earliestInstallStart, 1);
@@ -1875,19 +1897,37 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
   }
 
   // Determine primary candidate fitter from user selection or auto-assign
-  // Rules: Steve is lead (preferred), Thompson is second, Chris is support (sibling only).
+  // Rules: Steve is lead (preferred), Thompson is second.
   // "auto" or empty → pick best available; otherwise respect user choice.
-  // Team installs: all three fitters on site — skip the per-fitter logic.
+  // Team installs: all fitters on site — skip the per-fitter logic.
   const userPick = job.installer;
   const isAuto = !userPick || userPick === "auto";
   const isTeam = !!job.teamInstall;
   let installer;
 
   if (isTeam) {
-    // Team install: all three fitters on site. Use a special installer label so
+    // Team install: all fitters on site. Use a special installer label so
     // the rest of the pipeline knows this is a team booking. Skip sibling
     // and auto-assign logic.
     installer = "Team";
+  } else if (userPick === "Chris" && dayKey(earliestInstallStart) >= dayKey(new Date())) {
+    // Chris no longer installs. Job data may still have him from before —
+    // for anything not yet installed, reassign to Steve (same pattern as a
+    // retired non-fitter) rather than crash or silently drop the job's
+    // fitter, and flag it loudly so it gets a deliberate human review rather
+    // than staying on Steve by accident. A job that's ALREADY been installed
+    // by him is real history, not something to rewrite — see the
+    // `userPick === "Chris"` pass-through below, which leaves it alone.
+    installer = "Steve";
+    warnings.push({
+      jobId: job.id,
+      jobName: job.name,
+      type: "installer",
+      message: `Chris no longer installs — reassigned to Steve, please review`,
+    });
+  } else if (userPick === "Chris") {
+    // Already installed historically — leave the record as Chris, it's fact.
+    installer = "Chris";
   } else if (userPick && NON_FITTERS.includes(userPick)) {
     // Non-fitter explicitly chosen (e.g. Callum) — reassign with warning
     installer = "Steve";
@@ -1901,7 +1941,7 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     // Use the fitter that the target-week slot finder picked
     installer = pinnedInstaller;
   } else if (isAuto) {
-    // Auto-assign: try Steve, then Thompson. Chris never auto-assigned as primary.
+    // Auto-assign: try Steve, then Thompson.
     installer = null; // decided below based on availability
   } else if (FITTERS.includes(userPick)) {
     installer = userPick;
@@ -1923,9 +1963,8 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     // explicitly chose a fitter for this job, respect it absolutely — even if
     // it conflicts with the sibling.
     if (isAuto) {
-      // No user pick: auto-assign. Prefer Chris as support, then Thompson/Steve
-      // — anyone who ISN'T the sibling's fitter.
-      const preferredOrder = ["Chris", "Thompson", "Steve"].filter(f => f !== sibling.installer);
+      // No user pick: auto-assign whichever fitter ISN'T the sibling's.
+      const preferredOrder = ["Thompson", "Steve"].filter(f => f !== sibling.installer);
       installer = preferredOrder[0];
       warnings.push({
         jobId: job.id,
@@ -1952,18 +1991,9 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     }
   } else {
     // No sibling: need to pick a primary fitter
-    // Warn if Chris was manually assigned as solo (he's support-only)
-    if (installer === "Chris" && !isAuto) {
-      warnings.push({
-        jobId: job.id,
-        jobName: job.name,
-        type: "installer",
-        message: `Chris is a support fitter — solo install flagged for review`,
-      });
-    }
     if (isAuto) {
       // Find the fitter who's free earliest from earliestInstallStart,
-      // preferring Steve, then Thompson (not Chris).
+      // preferring Steve, then Thompson.
       const candidates = ["Steve", "Thompson"];
       let best = null;
       for (const f of candidates) {
@@ -2124,6 +2154,20 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
   // Only applies to non-team, non-sibling jobs. Must be a real fitter and
   // different from the primary.
   let secondaryInstaller = "";
+  const installAlreadyHappened = dayKey(earliestInstallStart) < dayKey(new Date());
+  if (job.secondaryInstaller === "Chris" && installAlreadyHappened) {
+    // Already installed historically — leave the record as-is, it's fact.
+    secondaryInstaller = "Chris";
+  } else if (job.secondaryInstaller === "Chris") {
+    // Chris no longer installs — job data may still list him from before.
+    // Just drop him rather than crash, but flag it so it's not silent.
+    warnings.push({
+      jobId: job.id,
+      jobName: job.name,
+      type: "installer",
+      message: `Chris no longer installs — dropped as secondary fitter, please review`,
+    });
+  }
   if (!isTeam && !sibling && job.secondaryInstaller && FITTERS.includes(job.secondaryInstaller)
       && job.secondaryInstaller !== installer) {
     secondaryInstaller = job.secondaryInstaller;
@@ -2420,8 +2464,7 @@ function findBestSlot(hypoJob, existingJobs, holidays, settings, options = {}) {
     deepCloneState(state), holidays, settings, impact
   );
 
-  // Option B: Try each fitter individually — but Chris only shown if sibling exists
-  // (support fitter rule). We still compute Chris for completeness but mark him.
+  // Option B: Try each fitter individually.
   const fitterOptions = FITTERS.map(fitter => {
     const job = { ...hypoJob, installer: fitter };
     const result = scheduleSingleJob(job, deepCloneState(state), holidays, settings, impact);
@@ -2441,7 +2484,6 @@ function findBestSlot(hypoJob, existingJobs, holidays, settings, options = {}) {
   let targetOption = null;
   if (hypoJob.targetInstallWeek) {
     const target = parseISO(hypoJob.targetInstallWeek);
-    // Only consider non-support fitters for target-hit (Chris solo would need a flag)
     const eligible = fitterOptions.filter(o => !o.isSupport);
     const hits = eligible.filter(o =>
       workingDaysBetween(target, o.installStart, holidays) <= 0
@@ -4418,12 +4460,12 @@ function JobEditor({ job, onUpdate, onDelete }) {
               style={{ cursor: "pointer" }}
             />
             <span style={{ flex: 1 }}>
-              <strong>Team install</strong> — all 3 fitters on site (for distant jobs)
+              <strong>Team install</strong> — both fitters on site (for distant jobs)
             </span>
           </label>
           {job.teamInstall && (
             <div style={{ marginTop: 6, marginLeft: 24, fontSize: 10, color: "#7a6a55", lineHeight: 1.5 }}>
-              Steve, Thompson and Chris all blocked out for this install.
+              Steve and Thompson both blocked out for this install.
               Set the install length manually using the drag handle on the bar.
             </div>
           )}
@@ -4862,7 +4904,7 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
         </div>
         <div style={styles.legendItem}>
           <span style={{ ...styles.legendSwatch, background: FITTER_CONFIG.Chris.color }} />
-          <span>Chris (install, support only)</span>
+          <span>Chris (historical installs only)</span>
         </div>
       </div>
     </div>
@@ -4938,16 +4980,15 @@ const GanttRow = React.memo(function GanttRow({
         const hasSecondary = isInstall && !isTeamInstall && t.secondaryInstaller && FITTER_CONFIG[t.secondaryInstaller];
         const isDraggingThis = dragState && dragState.jobId === job.id && dragState.stage === t.stage;
         const isResizingThis = resizeState && resizeState.jobId === job.id && resizeState.stage === t.stage;
-        const tooltip = `${STAGE_LABELS[t.stage]}: ${dayKey(t.start)}${t.days ? ` · ${t.days}d` : ""}${t.installer ? ` · ${t.installer === "Team" ? "Steve + Thompson + Chris" : t.installer}${hasSecondary ? " + " + t.secondaryInstaller : ""}` : ""}${t.siblingOf ? ` · parallel w/ ${t.siblingOf}` : ""}${isInstall ? " · drag to move, drag right edge to resize" : ""}`;
+        const tooltip = `${STAGE_LABELS[t.stage]}: ${dayKey(t.start)}${t.days ? ` · ${t.days}d` : ""}${t.installer ? ` · ${t.installer === "Team" ? "Steve + Thompson" : t.installer}${hasSecondary ? " + " + t.secondaryInstaller : ""}` : ""}${t.siblingOf ? ` · parallel w/ ${t.siblingOf}` : ""}${isInstall ? " · drag to move, drag right edge to resize" : ""}`;
         // Install bars coloured by fitter
         let barColor;
         let barBackground;
         if (isTeamInstall) {
-          // Diagonal stripes of all three fitter colours
+          // Diagonal stripes of both fitter colours
           const sc = FITTER_CONFIG.Steve.color;
           const tc = FITTER_CONFIG.Thompson.color;
-          const cc = FITTER_CONFIG.Chris.color;
-          barBackground = `repeating-linear-gradient(135deg, ${sc} 0 8px, ${tc} 8px 16px, ${cc} 16px 24px)`;
+          barBackground = `repeating-linear-gradient(135deg, ${sc} 0 8px, ${tc} 8px 16px)`;
           barColor = sc; // fallback for drag ghost
         } else if (hasSecondary) {
           // Two-fitter install: split bar — primary on top 65%, secondary stripe on bottom 35%
@@ -5650,7 +5691,6 @@ function WhatIfModal({ existingJobs, holidays, settings, onClose, onConvertToJob
                   <div style={{ marginTop: 14 }}>
                     <div style={styles.fieldGroupLabel}>Earliest by fitter</div>
                     {(() => {
-                      // Exclude Chris from the primary comparison (support-only)
                       const primaryOptions = result.fitterOptions.filter(o => !o.isSupport);
                       const sorted = [...primaryOptions].sort((a, b) => a.installStart - b.installStart);
                       const allSame = sorted.every(o =>
@@ -5919,7 +5959,6 @@ function FitterHolidaySettings({ settings, setSettings }) {
         >
           <option value="Steve">Steve</option>
           <option value="Thompson">Thompson</option>
-          <option value="Chris">Chris</option>
         </select>
         <input
           type="date"
