@@ -10,12 +10,20 @@ create table if not exists people (
   id uuid primary key default gen_random_uuid(),
   name text not null,
   active boolean not null default true,
-  pin text,
+  pin text unique check (pin is null or pin ~ '^[0-9]{4}$'),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
 
 create index if not exists idx_people_active on people (active);
+
+-- pin is how someone confirms it's really them on the floor board, after
+-- tapping their name — a 4-digit code, unique per person (postgres treats
+-- each null as distinct, so people who haven't been assigned one yet
+-- don't collide with each other). Nobody is seeded with one here: making
+-- up placeholder numbers in a migration would read as real data. Assign
+-- real PINs per person via the admin screen before phase 3 goes live —
+-- someone with no pin simply can't be selected to clock on.
 
 -- Seed: the real current team, confirmed directly against the business
 -- (2026-09). No job title/role field — people aren't boxed into one
