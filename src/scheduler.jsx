@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { Plus, Trash2, AlertTriangle, Calendar, Settings, Download, Upload, X, Truck, Undo2, Redo2, TrendingUp } from "lucide-react";
 import "./storage.js"; // installs window.storage backed by Supabase
+import PersonAliasAdmin from "./timetracker/PersonAliasAdmin.jsx";
 
 // Read-only mode: append ?readonly=1 to the URL to disable all edits.
 const IS_READONLY = typeof window !== "undefined"
@@ -11,6 +12,11 @@ const IS_READONLY = typeof window !== "undefined"
 // isn't worth adding one for a second view.
 const IS_BOARD = typeof window !== "undefined"
   && new URLSearchParams(window.location.search).get("board") === "1";
+
+// Time tracker admin screens, reached with ?admin=<name> on the same
+// URL, same pattern as ?board=1. Only "aliases" exists so far.
+const ADMIN_SCREEN = typeof window !== "undefined"
+  && new URLSearchParams(window.location.search).get("admin");
 
 // ============================================================
 // EVIE WILLOW WORKSHOP SCHEDULER
@@ -3280,6 +3286,10 @@ function App() {
     };
     reader.readAsText(file);
   };
+
+  if (ADMIN_SCREEN === "aliases") {
+    return <PersonAliasAdmin />;
+  }
 
   if (loading) {
     return <div style={styles.loading}>Loading workshop schedule…</div>;

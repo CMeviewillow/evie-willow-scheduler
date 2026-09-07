@@ -99,3 +99,7 @@ export const storage = {
 if (typeof window !== "undefined") {
   window.storage = storage;
 }
+
+// Exposed so other modules (the time tracker) can query its own tables
+// without standing up a second Supabase client.
+export { supabase };
