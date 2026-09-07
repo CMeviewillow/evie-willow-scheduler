@@ -31,7 +31,7 @@ executed yet.
 | 0003 | `jobs` | `da_number`, client, and a status ladder: `quoted → setup → released → in_production → delivered → complete`. `setup` means an A4 import is under way; `released` means every cabinet on the job has a type. |
 | 0004 | `rooms` | Cabinet numbering restarts per room (`Kitchen`, `Utility`, ...), so cabinet numbers are only unique within a room. |
 | 0005 | `cabinet_types` | The master list — the thing that makes cross-job pooling possible. Only ever created via the phase 2 import review screen or an admin screen, both office-side. Anything created during an import is flagged `needs_office_review`. |
-| 0006 | `stages` | The 11 production stages. `is_cabinet_stage` (only `Cabinet bench` and `Cabinet reassembly`) drives whether the floor board asks which cabinet a timer is against. |
+| 0006 | `stages` | The 11 production stages. `is_cabinet_stage` (`Cabinet bench`, `Cabinet reassembly`, and `Remakes and fix-ups`) drives whether the floor board asks which cabinet a timer is against. |
 | 0007 | `a4_imports` | One row per A4 import attempt (phase 2 writes here). Keeps the raw extracted text so a parse can be re-run without asking for the file again. |
 | 0008 | `cabinets` | One row per physical cabinet. `cabinet_type_id` is nullable at import, required before the job can release. Decimal numbers (`#14`, `#14.1`) are real, distinct components — confirmed against a real Cabinet Vision export — not a typo or a duplicate. |
 | 0009 | `time_entries` | The actual clock on/off records. See concurrency rules below. |
@@ -55,6 +55,23 @@ executed yet.
   needed. `cabinet_stage_totals` exposes both labour and elapsed minutes,
   because the scheduler needs elapsed span for capacity while costing needs
   labour minutes.
+
+## Remedials
+
+A remedial coming back from site is logged the same way as any other cabinet
+time, just against the `Remakes and fix-ups` stage instead of `Cabinet bench`
+or `Cabinet reassembly` — so it never dilutes the normal production rate for
+that cabinet type. Two things make that work:
+
+- `Remakes and fix-ups` is a cabinet stage (`is_cabinet_stage = true`), so
+  the floor board always asks which cabinet the remedial is against, the
+  same as bench/reassembly. Loose, un-attributed remedial hours were the
+  alternative and were deliberately ruled out — pinning it to a cabinet
+  means the office can later see which cabinet or type comes back for
+  rework most often.
+- The floor board's job picker isn't limited to `released`/`in_production`
+  jobs — any released job stays selectable regardless of `status`, since a
+  remedial can land months after a job shows `delivered` or `complete`.
 
 ## Auth
 
