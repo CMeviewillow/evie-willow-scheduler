@@ -21,10 +21,10 @@ create index if not exists idx_people_active on people (active);
 -- Seed: the real current team, confirmed directly against the business
 -- (2026-09). Role is a first guess where it wasn't stated outright — the
 -- office should correct it via an admin screen rather than treat it as
--- fixed, same as cabinet_types.category. Some names below replace an
--- earlier, wrong draft of this list; where a name changed, the old one
--- is carried forward as an alias in the next migration so imported
--- Clockify history still pools correctly. Nobody here is deleted, ever.
+-- fixed, same as cabinet_types.category. Nobody here is deleted, ever.
+-- Old Clockify name variants aren't seeded as aliases — add them via the
+-- ?admin=aliases screen (or the person_aliases table directly) if and
+-- when reconciling old history actually needs them.
 --
 -- This migration is meant to run exactly once, like every migration here —
 -- there's no natural unique key on name alone (two people could genuinely

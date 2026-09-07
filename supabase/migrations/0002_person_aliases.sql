@@ -20,8 +20,3 @@ create index if not exists idx_person_aliases_person_id on person_aliases (perso
 -- has at least a self-referential alias to resolve against from day one.
 insert into person_aliases (person_id, alias)
 select id, name from people;
-
--- Plus known historical name variants from before the team list was
--- corrected — so a Clockify export using the old name still resolves.
-insert into person_aliases (person_id, alias)
-select id, 'Victoria Pearce' from people where name = 'Victoria';
