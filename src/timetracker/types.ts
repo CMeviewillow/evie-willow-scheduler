@@ -6,20 +6,9 @@
 // shape ahead of phases 2 and 3, and for editor autocomplete in the
 // meantime.
 
-export type PersonRole =
-  | "cnc"
-  | "bench"
-  | "spray"
-  | "reassembly"
-  | "logistics"
-  | "design"
-  | "admin"
-  | "general";
-
 export interface Person {
   id: string;
   name: string;
-  role: PersonRole;
   active: boolean;
   pin: string | null;
   created_at: string;
