@@ -7384,6 +7384,23 @@ function mountFloorBoard(root, planRef, holidaysSet) {
   let unsubscribe = null;
   let interval = null;
 
+  // This is a wall-mounted, always-on display, so it needs to hold the
+  // screen awake itself — a plain webpage doesn't get the "don't sleep,
+  // something's actively happening" treatment a video app gets from the
+  // TV's OS, even though its content keeps updating. The lock is released
+  // automatically whenever the tab is hidden, so it has to be re-acquired
+  // on visibilitychange too, not just once at load.
+  let wakeLock = null;
+  async function requestWakeLock() {
+    if (!("wakeLock" in navigator)) return;
+    try { wakeLock = await navigator.wakeLock.request("screen"); }
+    catch (e) { /* not available right now (e.g. backgrounded) — visibilitychange will retry */ }
+  }
+  const onVisibilityChange = () => {
+    if (document.visibilityState === "visible") requestWakeLock();
+  };
+  document.addEventListener("visibilitychange", onVisibilityChange);
+
   async function rollOverIfNewDay() {
     const nowDay = iso(new Date());
     if (nowDay === currentDay) return;
@@ -7397,6 +7414,7 @@ function mountFloorBoard(root, planRef, holidaysSet) {
   }
 
   (async function init() {
+    requestWakeLock();
     renderDate(); renderNotice();
     const t = await load(dayKeyFor(new Date()));
     if (t) { offPlan = t.offPlan || []; notes = t.notes || []; delete t.offPlan; delete t.notes; today = t; }
@@ -7426,6 +7444,8 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     teardown() {
       root.removeEventListener("click", onClick);
       root.removeEventListener("keydown", onKeydown);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      if (wakeLock) wakeLock.release().catch(() => {});
       if (unsubscribe) unsubscribe();
       if (interval) clearInterval(interval);
       clearTimeout(flushTimer);
