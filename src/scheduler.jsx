@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
-import { Plus, Trash2, AlertTriangle, Calendar, Settings, Download, Upload, X, Truck, Undo2, Redo2, TrendingUp } from "lucide-react";
+import { Plus, Trash2, AlertTriangle, Calendar, Settings, Download, Upload, X, Truck, Undo2, Redo2, TrendingUp, GripVertical } from "lucide-react";
 import "./storage.js"; // installs window.storage backed by Supabase
 
 // Read-only mode: append ?readonly=1 to the URL to disable all edits.
@@ -391,6 +391,7 @@ function newJob() {
     manualStart: "",         // optional manual start date (ISO)
     colour: { name: "", hex: "" }, // paint/finish colour — floor board groups booth runs by this
     boothRunId: "",          // jobs sprayed together to save a colour changeover (see booth-run warnings)
+    priorityRank: null,      // manual production-priority order, set by dragging the job's name in the Gantt. null = not yet manually ordered, falls back to deadline-driven order.
   };
 }
 
@@ -905,17 +906,28 @@ function findLatestFreeBenchSlot(beforeSlot, daysNeeded, occupied, holidays) {
 //  - bank holidays and weekends
 // ============================================================
 
+// Decides which job claims shared bench/machining/finishing capacity first.
+// A manually-set priorityRank (dragged in the Gantt) fully overrides deadline
+// order for the job(s) that have one; jobs that have never been dragged keep
+// flowing by deadline among themselves, exactly as before. When no job has
+// ever been ranked, every comparison falls through to the original pinned
+// install / manualStart logic — this is a deliberate no-op for that case.
+function compareJobPriority(a, b) {
+  const aHas = a.priorityRank != null, bHas = b.priorityRank != null;
+  if (aHas && bHas) return a.priorityRank - b.priorityRank;
+  if (aHas !== bHas) return aHas ? -1 : 1;
+  // Pinned jobs (installOverride or targetInstallWeek) come first as hard
+  // commitments. Then manual-start jobs, then flexible jobs.
+  const aPin = a.installOverride || a.targetInstallWeek;
+  const bPin = b.installOverride || b.targetInstallWeek;
+  if (!!aPin !== !!bPin) return aPin ? -1 : 1;
+  const aDate = aPin || a.manualStart || "9999-12-31";
+  const bDate = bPin || b.manualStart || "9999-12-31";
+  return aDate.localeCompare(bDate);
+}
+
 function scheduleJobs(jobs, holidays, settings) {
-  const sorted = [...jobs].sort((a, b) => {
-    // Pinned jobs (installOverride or targetInstallWeek) come first as hard
-    // commitments. Then manual-start jobs, then flexible jobs.
-    const aPin = a.installOverride || a.targetInstallWeek;
-    const bPin = b.installOverride || b.targetInstallWeek;
-    if (!!aPin !== !!bPin) return aPin ? -1 : 1;
-    const aDate = aPin || a.manualStart || "9999-12-31";
-    const bDate = bPin || b.manualStart || "9999-12-31";
-    return aDate.localeCompare(bDate);
-  });
+  const sorted = [...jobs].sort(compareJobPriority);
 
   const state = {
     machiningOccupied: [], // [{start, end, jobName, jobId}] — pinned + placed CNC blocks (end exclusive)
@@ -3498,6 +3510,13 @@ function App() {
           onDeliveryDrag={(jobId, isoDate) => {
             updateJob(jobId, { deliveryDate: isoDate });
           }}
+          onReorderJobs={(newOrderedIds) => {
+            // A real, committed change — not a bar-drag preview — so any
+            // drag-freeze in effect is no longer relevant.
+            setDragFreeze(null);
+            const rankById = Object.fromEntries(newOrderedIds.map((id, idx) => [id, idx]));
+            setJobs(prev => prev.map(j => rankById[j.id] != null ? { ...j, priorityRank: rankById[j.id] } : j));
+          }}
         />
       </div>
 
@@ -4732,7 +4751,7 @@ function ganttSegmentsFor(task, ganttStart, colWidth, holidays) {
   return segments;
 }
 
-function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onStageResize, onStageReset, onToggleLock, onDeliveryDrag }) {
+function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onStageResize, onStageReset, onToggleLock, onDeliveryDrag, onReorderJobs }) {
   const COL_WIDTH = 36;       // wider so day numbers are readable
   const ROW_HEIGHT = 64;
 
@@ -4747,6 +4766,12 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
   // Drag state for delivery icon
   const [deliveryDragState, setDeliveryDragState] = useState(null);
   // deliveryDragState: { jobId, currentLeft, currentDate }
+
+  // Drag state for reordering a job's manual production priority (dragging
+  // its name up/down). Local to this component — only committed to real job
+  // state (via onReorderJobs) on drop.
+  const [reorderDrag, setReorderDrag] = useState(null);
+  // reorderDrag: { jobId, dragIndex, offsetY, targetIndex }
 
   // Chart geometry (day columns, month/week groupings) depends only on the
   // jobs' dates and the workshop start date — memoized so a drag (which only
@@ -4806,14 +4831,58 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
   // Rows flow top-to-bottom in the order each job's earliest stage actually
   // starts, so dragging a job's bench (etc.) earlier than another job visibly
   // moves it up the chart to match — an even flow down the page instead of a
-  // fixed, drag-independent order.
+  // fixed, drag-independent order. A manually-set priorityRank (dragged by
+  // its name, see GanttRow's grip handle) overrides that for jobs that have
+  // one, floating them to the top in rank order; unranked jobs keep flowing
+  // by earliest stage start exactly as before, and always sort after any
+  // ranked job.
   const orderedJobs = useMemo(() => {
     const earliestStart = (job) => {
       if (!job.tasks || !job.tasks.length) return Infinity;
       return Math.min(...job.tasks.map(t => t.start.getTime()));
     };
-    return [...jobs].sort((a, b) => earliestStart(a) - earliestStart(b));
+    return [...jobs].sort((a, b) => {
+      const aHas = a.priorityRank != null, bHas = b.priorityRank != null;
+      if (aHas && bHas) return a.priorityRank - b.priorityRank;
+      if (aHas !== bHas) return aHas ? -1 : 1;
+      return earliestStart(a) - earliestStart(b);
+    });
   }, [jobs]);
+
+  // Dragging a job's name up/down sets its manual production priority —
+  // which job claims shared bench/machining/finishing capacity first — but
+  // never touches install dates. Same rAF-throttled mousedown/mousemove/
+  // mouseup-on-window pattern as the delivery-icon drag below.
+  const startRowDrag = (e, job, index) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const startY = e.clientY;
+    let rafId = null;
+    let pending = null;
+    const flush = () => { rafId = null; if (pending) setReorderDrag(pending); };
+    const onMove = (ev) => {
+      const dy = ev.clientY - startY;
+      const rawTarget = index + Math.round(dy / ROW_HEIGHT);
+      const targetIndex = Math.max(0, Math.min(orderedJobs.length - 1, rawTarget));
+      pending = { jobId: job.id, dragIndex: index, offsetY: dy, targetIndex };
+      if (rafId === null) rafId = requestAnimationFrame(flush);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      const finalTarget = pending ? pending.targetIndex : index;
+      setReorderDrag(null);
+      if (finalTarget !== index && onReorderJobs) {
+        const ids = orderedJobs.map(j => j.id);
+        ids.splice(index, 1);
+        ids.splice(finalTarget, 0, job.id);
+        onReorderJobs(ids);
+      }
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
 
   if (!chart) {
     return (
@@ -4972,8 +5041,20 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
                 onStageReset={onStageReset}
                 onToggleLock={onToggleLock}
                 onDeliveryDrag={onDeliveryDrag}
+                isReordering={!!(reorderDrag && reorderDrag.jobId === job.id)}
+                reorderOffsetY={reorderDrag && reorderDrag.jobId === job.id ? reorderDrag.offsetY : 0}
+                onRowDragStart={onReorderJobs ? startRowDrag : null}
               />
             ))}
+            {reorderDrag && (
+              <div
+                style={{
+                  position: "absolute", left: 0, right: 0,
+                  top: reorderDrag.targetIndex * ROW_HEIGHT - 1,
+                  height: 2, background: "#7a8b6f", zIndex: 5, pointerEvents: "none",
+                }}
+              />
+            )}
           </div>
         </div>
       </div>
@@ -5015,6 +5096,7 @@ const GanttRow = React.memo(function GanttRow({
   dragState, resizeState, deliveryDragState,
   setDragState, setResizeState, setDeliveryDragState,
   onStageDrag, onStageResize, onStageReset, onToggleLock, onDeliveryDrag,
+  isReordering, reorderOffsetY, onRowDragStart,
 }) {
   return (
     <div
@@ -5524,7 +5606,28 @@ const GanttRow = React.memo(function GanttRow({
         return out;
       })}
       {/* Job label overlay */}
-      <div style={styles.ganttJobLabel}>
+      <div
+        style={{
+          ...styles.ganttJobLabel,
+          display: "flex",
+          alignItems: "center",
+          gap: 3,
+          ...(isReordering ? {
+            transform: `translateY(${reorderOffsetY}px)`,
+            zIndex: 6,
+            boxShadow: "0 3px 8px rgba(58,52,44,0.25)",
+          } : {}),
+        }}
+      >
+        {!IS_READONLY && onRowDragStart && (
+          <span
+            style={{ pointerEvents: "auto", cursor: "grab", display: "flex", color: "#9b8f7e" }}
+            onMouseDown={(e) => onRowDragStart(e, job, i)}
+            title="Drag to reorder production priority"
+          >
+            <GripVertical size={12} strokeWidth={2} />
+          </span>
+        )}
         {job.name || "—"}
       </div>
     </div>
