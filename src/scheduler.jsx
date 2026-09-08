@@ -3518,29 +3518,28 @@ function App() {
           onDeliveryDrag={(jobId, isoDate) => {
             updateJob(jobId, { deliveryDate: isoDate });
           }}
-          onReorderJobs={(newOrderedIds, draggedJobId) => {
+          onReorderJobs={(draggedJobId, newRank) => {
             // A real, committed change — not a bar-drag preview — so any
-            // drag-freeze in effect is no longer relevant.
+            // drag-freeze in effect is no longer relevant. Only the dragged
+            // job's own data changes here — never any other job's — so one
+            // drag can never reshuffle jobs you didn't touch.
             setDragFreeze(null);
-            const rankById = Object.fromEntries(newOrderedIds.map((id, idx) => [id, idx]));
             setJobs(prev => prev.map(j => {
-              if (rankById[j.id] == null) return j;
-              const patch = { priorityRank: rankById[j.id] };
-              if (j.id === draggedJobId) {
-                // The whole point of dragging a job's name is to let its
-                // production flow automatically at its new priority — a
-                // leftover manual pin on any of these stages (from an
-                // earlier bar-drag) would keep the job locked to its old
-                // date and silently make the reorder do nothing. Install
-                // is deliberately untouched: that's the customer
-                // commitment, set manually, separately.
-                ["machining", "bench", "finishing", "reassembly"].forEach(stage => {
-                  const cfg = DRAGGABLE_STAGES[stage];
-                  patch[cfg.dateField] = "";
-                  patch[cfg.daysField] = 0;
-                  if (cfg.usedField) patch[cfg.usedField] = 0;
-                });
-              }
+              if (j.id !== draggedJobId) return j;
+              const patch = { priorityRank: newRank };
+              // The whole point of dragging a job's name is to let its
+              // production flow automatically at its new priority — a
+              // leftover manual pin on any of these stages (from an
+              // earlier bar-drag) would keep the job locked to its old
+              // date and silently make the reorder do nothing. Install is
+              // deliberately untouched: that's the customer commitment,
+              // set manually, separately.
+              ["machining", "bench", "finishing", "reassembly"].forEach(stage => {
+                const cfg = DRAGGABLE_STAGES[stage];
+                patch[cfg.dateField] = "";
+                patch[cfg.daysField] = 0;
+                if (cfg.usedField) patch[cfg.usedField] = 0;
+              });
               return { ...j, ...patch };
             }));
           }}
@@ -4908,10 +4907,23 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
       const finalTarget = pending ? pending.targetIndex : index;
       setReorderDrag(null);
       if (finalTarget !== index && onReorderJobs) {
-        const ids = orderedJobs.map(j => j.id);
-        ids.splice(index, 1);
-        ids.splice(finalTarget, 0, job.id);
-        onReorderJobs(ids, job.id);
+        // Only the dragged job's own priorityRank is ever touched — never
+        // the whole list's. Its new rank is interpolated between whatever's
+        // now immediately above/below it; a neighbor with no rank of its
+        // own (still on the deadline-driven auto-flow) is treated as "not
+        // ranked" rather than given one, since ranked jobs already always
+        // sort ahead of unranked ones regardless of the exact number.
+        const withoutDragged = orderedJobs.filter((_, idx) => idx !== index);
+        const above = withoutDragged[finalTarget - 1];
+        const below = withoutDragged[finalTarget];
+        const aboveRank = above && above.priorityRank != null ? above.priorityRank : null;
+        const belowRank = below && below.priorityRank != null ? below.priorityRank : null;
+        let newRank;
+        if (aboveRank != null && belowRank != null) newRank = (aboveRank + belowRank) / 2;
+        else if (aboveRank != null) newRank = aboveRank + 1;
+        else if (belowRank != null) newRank = belowRank - 1;
+        else newRank = 0; // first job ever ranked — establishes the priority queue
+        onReorderJobs(job.id, newRank);
       }
     };
     window.addEventListener("mousemove", onMove);
