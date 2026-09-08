@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from "react";
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { Plus, Trash2, AlertTriangle, Calendar, Settings, Download, Upload, X, Truck, Undo2, Redo2, TrendingUp, GripVertical } from "lucide-react";
 import "./storage.js"; // installs window.storage backed by Supabase
 
@@ -4861,7 +4861,14 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
   // which job claims shared bench/machining/finishing capacity first — but
   // never touches install dates. Same rAF-throttled mousedown/mousemove/
   // mouseup-on-window pattern as the delivery-icon drag below.
-  const startRowDrag = (e, job, index) => {
+  //
+  // useCallback matters here, not just as tidiness: reorderDrag updates (via
+  // setReorderDrag below) re-render GanttView on every rAF tick while a drag
+  // is in progress, and every GanttRow is React.memo'd specifically so that
+  // re-rendering doesn't cascade to all of them. Without this, a plain inline
+  // function would get a new identity every tick, defeating that memo for
+  // every row — fine with a handful of jobs, visibly janky with dozens.
+  const startRowDrag = useCallback((e, job, index) => {
     e.preventDefault();
     e.stopPropagation();
     const startY = e.clientY;
@@ -4890,7 +4897,7 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
-  };
+  }, [orderedJobs, onReorderJobs, ROW_HEIGHT]);
 
   if (!chart) {
     return (
