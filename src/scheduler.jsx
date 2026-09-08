@@ -3518,12 +3518,31 @@ function App() {
           onDeliveryDrag={(jobId, isoDate) => {
             updateJob(jobId, { deliveryDate: isoDate });
           }}
-          onReorderJobs={(newOrderedIds) => {
+          onReorderJobs={(newOrderedIds, draggedJobId) => {
             // A real, committed change — not a bar-drag preview — so any
             // drag-freeze in effect is no longer relevant.
             setDragFreeze(null);
             const rankById = Object.fromEntries(newOrderedIds.map((id, idx) => [id, idx]));
-            setJobs(prev => prev.map(j => rankById[j.id] != null ? { ...j, priorityRank: rankById[j.id] } : j));
+            setJobs(prev => prev.map(j => {
+              if (rankById[j.id] == null) return j;
+              const patch = { priorityRank: rankById[j.id] };
+              if (j.id === draggedJobId) {
+                // The whole point of dragging a job's name is to let its
+                // production flow automatically at its new priority — a
+                // leftover manual pin on any of these stages (from an
+                // earlier bar-drag) would keep the job locked to its old
+                // date and silently make the reorder do nothing. Install
+                // is deliberately untouched: that's the customer
+                // commitment, set manually, separately.
+                ["machining", "bench", "finishing", "reassembly"].forEach(stage => {
+                  const cfg = DRAGGABLE_STAGES[stage];
+                  patch[cfg.dateField] = "";
+                  patch[cfg.daysField] = 0;
+                  if (cfg.usedField) patch[cfg.usedField] = 0;
+                });
+              }
+              return { ...j, ...patch };
+            }));
           }}
         />
       </div>
@@ -4892,7 +4911,7 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
         const ids = orderedJobs.map(j => j.id);
         ids.splice(index, 1);
         ids.splice(finalTarget, 0, job.id);
-        onReorderJobs(ids);
+        onReorderJobs(ids, job.id);
       }
     };
     window.addEventListener("mousemove", onMove);
