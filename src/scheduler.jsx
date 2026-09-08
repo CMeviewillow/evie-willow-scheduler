@@ -4953,26 +4953,19 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
       setReorderDrag(null);
       if (finalTarget !== index && onReorderJobs) {
         // Only the dragged job's own priorityRank is ever touched — never
-        // the whole list's. Its new rank is interpolated between whatever's
-        // now immediately above/below it — using each neighbor's own
-        // deadline (install/target/manualStart), the exact same fallback
-        // scheduleJobs itself falls back to for every unranked job, not
-        // the bench-based earliestStart the rows are visually ordered by.
-        // Bench always sits weeks before install, so interpolating on
-        // bench time would land a new rank on a systematically "earlier"
-        // number line than every unranked job's own deadline-based
-        // fallback — meaning a job dragged DOWN would still out-rank
-        // (schedule before) almost everything, the opposite of "delay
-        // this job, let others fall forward." Matching scheduleJobs'
-        // fallback scale here is what makes both directions actually
-        // work. Half a day's worth of milliseconds is the fallback nudge
-        // when there's only one neighbor to go on.
+        // the whole list's. Its new rank nestles its bench dates exactly
+        // between whatever's now immediately above/below it, using each
+        // neighbor's own bench timing (priorityRank if it has one,
+        // earliestStart if not) — the same number line the rows are
+        // visually ordered by, so it lands where it looks like it should.
+        // scheduleSingleJob's auto-bench branch anchors a ranked job's
+        // search to this same rank value (not settings.startDate), which
+        // is what actually makes it settle next to these two neighbors
+        // instead of grabbing the first free gap anywhere in the year.
+        // Half a day's worth of milliseconds is the fallback nudge when
+        // there's only one neighbor to go on.
         const HALF_DAY_MS = 12 * 60 * 60 * 1000;
-        const deadlineKeyOf = (j) => {
-          const pin = j.installOverride || j.targetInstallWeek;
-          return new Date(pin || j.manualStart || "9999-12-31").getTime();
-        };
-        const keyOf = (j) => j.priorityRank != null ? j.priorityRank : deadlineKeyOf(j);
+        const keyOf = (j) => j.priorityRank != null ? j.priorityRank : earliestStart(j);
         const withoutDragged = orderedJobs.filter((_, idx) => idx !== index);
         const above = withoutDragged[finalTarget - 1];
         const below = withoutDragged[finalTarget];
