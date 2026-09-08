@@ -906,24 +906,31 @@ function findLatestFreeBenchSlot(beforeSlot, daysNeeded, occupied, holidays) {
 //  - bank holidays and weekends
 // ============================================================
 
+// A job with no manual priorityRank falls back to its deadline — pinned
+// install/target week first, then manual-start, then whatever's left, same
+// commitment-driven order as always. Expressed as a millisecond timestamp
+// so it shares one comparable number line with priorityRank itself (see
+// compareJobPriority below) — an ISO date string sorts identically either
+// way, so this is a no-op for the deadline-vs-deadline case.
+function deadlineSortKey(job) {
+  const pin = job.installOverride || job.targetInstallWeek;
+  const dateStr = pin || job.manualStart || "9999-12-31";
+  return new Date(dateStr).getTime();
+}
+
 // Decides which job claims shared bench/machining/finishing capacity first.
-// A manually-set priorityRank (dragged in the Gantt) fully overrides deadline
-// order for the job(s) that have one; jobs that have never been dragged keep
-// flowing by deadline among themselves, exactly as before. When no job has
-// ever been ranked, every comparison falls through to the original pinned
-// install / manualStart logic — this is a deliberate no-op for that case.
+// A manually-set priorityRank (dragged in the Gantt) sits on the exact same
+// number line as everyone else's deadline-driven fallback, rather than
+// unconditionally beating every unranked job — that's what lets dragging a
+// job DOWN actually push it behind unranked jobs too (a delayed job letting
+// others fall forward into the gap), not just move ranked jobs around each
+// other. When no job has ever been ranked, every comparison falls through
+// to the original pinned install / manualStart logic — a deliberate no-op
+// for that case.
 function compareJobPriority(a, b) {
-  const aHas = a.priorityRank != null, bHas = b.priorityRank != null;
-  if (aHas && bHas) return a.priorityRank - b.priorityRank;
-  if (aHas !== bHas) return aHas ? -1 : 1;
-  // Pinned jobs (installOverride or targetInstallWeek) come first as hard
-  // commitments. Then manual-start jobs, then flexible jobs.
-  const aPin = a.installOverride || a.targetInstallWeek;
-  const bPin = b.installOverride || b.targetInstallWeek;
-  if (!!aPin !== !!bPin) return aPin ? -1 : 1;
-  const aDate = aPin || a.manualStart || "9999-12-31";
-  const bDate = bPin || b.manualStart || "9999-12-31";
-  return aDate.localeCompare(bDate);
+  const aKey = a.priorityRank != null ? a.priorityRank : deadlineSortKey(a);
+  const bKey = b.priorityRank != null ? b.priorityRank : deadlineSortKey(b);
+  return aKey - bKey;
 }
 
 function scheduleJobs(jobs, holidays, settings) {
@@ -4858,20 +4865,19 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
   // starts, so dragging a job's bench (etc.) earlier than another job visibly
   // moves it up the chart to match — an even flow down the page instead of a
   // fixed, drag-independent order. A manually-set priorityRank (dragged by
-  // its name, see GanttRow's grip handle) overrides that for jobs that have
-  // one, floating them to the top in rank order; unranked jobs keep flowing
-  // by earliest stage start exactly as before, and always sort after any
-  // ranked job.
+  // its name, see GanttRow's grip handle) sits on that same number line
+  // instead of unconditionally beating every unranked job, so dragging a
+  // job down among unranked ones actually delays it rather than just
+  // reordering it against other ranked jobs.
+  const earliestStart = (job) => {
+    if (!job.tasks || !job.tasks.length) return Infinity;
+    return Math.min(...job.tasks.map(t => t.start.getTime()));
+  };
   const orderedJobs = useMemo(() => {
-    const earliestStart = (job) => {
-      if (!job.tasks || !job.tasks.length) return Infinity;
-      return Math.min(...job.tasks.map(t => t.start.getTime()));
-    };
     return [...jobs].sort((a, b) => {
-      const aHas = a.priorityRank != null, bHas = b.priorityRank != null;
-      if (aHas && bHas) return a.priorityRank - b.priorityRank;
-      if (aHas !== bHas) return aHas ? -1 : 1;
-      return earliestStart(a) - earliestStart(b);
+      const aKey = a.priorityRank != null ? a.priorityRank : earliestStart(a);
+      const bKey = b.priorityRank != null ? b.priorityRank : earliestStart(b);
+      return aKey - bKey;
     });
   }, [jobs]);
 
@@ -4909,20 +4915,22 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
       if (finalTarget !== index && onReorderJobs) {
         // Only the dragged job's own priorityRank is ever touched — never
         // the whole list's. Its new rank is interpolated between whatever's
-        // now immediately above/below it; a neighbor with no rank of its
-        // own (still on the deadline-driven auto-flow) is treated as "not
-        // ranked" rather than given one, since ranked jobs already always
-        // sort ahead of unranked ones regardless of the exact number.
+        // now immediately above/below it, on the same number line
+        // orderedJobs itself sorts by (a ranked neighbor's priorityRank, or
+        // an unranked one's own earliestStart) — so dropping a job among
+        // still-unranked ones actually slots it into that flow instead of
+        // always jumping ahead of it. Half a day's worth of milliseconds is
+        // the fallback nudge when there's only one neighbor to go on.
+        const HALF_DAY_MS = 12 * 60 * 60 * 1000;
+        const keyOf = (j) => j.priorityRank != null ? j.priorityRank : earliestStart(j);
         const withoutDragged = orderedJobs.filter((_, idx) => idx !== index);
         const above = withoutDragged[finalTarget - 1];
         const below = withoutDragged[finalTarget];
-        const aboveRank = above && above.priorityRank != null ? above.priorityRank : null;
-        const belowRank = below && below.priorityRank != null ? below.priorityRank : null;
         let newRank;
-        if (aboveRank != null && belowRank != null) newRank = (aboveRank + belowRank) / 2;
-        else if (aboveRank != null) newRank = aboveRank + 1;
-        else if (belowRank != null) newRank = belowRank - 1;
-        else newRank = 0; // first job ever ranked — establishes the priority queue
+        if (above && below) newRank = (keyOf(above) + keyOf(below)) / 2;
+        else if (above) newRank = keyOf(above) + HALF_DAY_MS;
+        else if (below) newRank = keyOf(below) - HALF_DAY_MS;
+        else newRank = Date.now();
         onReorderJobs(job.id, newRank);
       }
     };
