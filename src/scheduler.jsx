@@ -1554,7 +1554,15 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
             });
           }
         }
-      } else {
+      } else if (job.priorityRank == null) {
+        // Only jobs still on the deadline-driven auto-flow get deferred
+        // toward their own install date when there's slack — a manually
+        // ranked job (dragged in the Gantt) stays at its ASAP slot instead,
+        // chaining immediately behind whatever's ahead of it in the
+        // priority queue rather than floating off toward its own deadline.
+        // That's the whole point of dragging it: it moves up the schedule
+        // to run right after the last bench slot, not just "sometime before
+        // install."
         const slackWorkingDays = workingDaysBetween(asapSlot.date, desiredLatestBenchStart.date, holidays);
         if (slackWorkingDays >= SLACK_THRESHOLD_WORKING_DAYS) {
           const latestSlot = findLatestFreeBenchSlot(desiredLatestBenchStart, benchActualDays, state.benchOccupied, holidays);
