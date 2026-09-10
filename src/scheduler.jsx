@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useMemo, useRef } from "react";
-import { Plus, Trash2, AlertTriangle, Calendar, Settings, Download, Upload, X, Truck, Undo2, Redo2, TrendingUp } from "lucide-react";
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import { Plus, Trash2, AlertTriangle, Calendar, Settings, Download, Upload, X, Truck, Undo2, Redo2, TrendingUp, GripVertical } from "lucide-react";
 import "./storage.js"; // installs window.storage backed by Supabase
 
 // Read-only mode: append ?readonly=1 to the URL to disable all edits.
@@ -391,6 +391,7 @@ function newJob() {
     manualStart: "",         // optional manual start date (ISO)
     colour: { name: "", hex: "" }, // paint/finish colour — floor board groups booth runs by this
     boothRunId: "",          // jobs sprayed together to save a colour changeover (see booth-run warnings)
+    priorityRank: null,      // manual production-priority order, set by dragging the job's name in the Gantt. null = not yet manually ordered, falls back to deadline-driven order.
   };
 }
 
@@ -905,16 +906,38 @@ function findLatestFreeBenchSlot(beforeSlot, daysNeeded, occupied, holidays) {
 //  - bank holidays and weekends
 // ============================================================
 
-// Decides which job claims shared bench/machining/finishing capacity first:
-// pinned install/target week, then manual-start, then whatever's left.
+// A job with no manual priorityRank falls back to its deadline — pinned
+// install/target week first, then manual-start, then whatever's left, the
+// exact same commitment-driven order as always (unchanged from before
+// priorityRank existed — verified as a no-op against real data). Expressed
+// as a millisecond timestamp so a manually-set priorityRank, which is
+// computed on this same deadline-ish scale (see GanttView's drag handler,
+// which interpolates using this same function, not bench timing), is
+// genuinely comparable to it — an ISO date string sorts identically either
+// way, so this is a no-op for the deadline-vs-deadline case.
 function deadlineSortKey(job) {
   const pin = job.installOverride || job.targetInstallWeek;
   const dateStr = pin || job.manualStart || "9999-12-31";
   return new Date(dateStr).getTime();
 }
 
+// Decides which job claims shared bench/machining/finishing capacity first.
+// A manually-set priorityRank (dragged in the Gantt) sits on the exact same
+// number line as everyone else's deadline-driven fallback, rather than
+// unconditionally beating every unranked job — that's what lets dragging a
+// job DOWN actually push it behind unranked jobs too (a delayed job letting
+// others fall forward into the gap), not just move ranked jobs around each
+// other. When no job has ever been ranked, every comparison falls through
+// to the original pinned install / manualStart logic — a deliberate no-op
+// for that case.
+function compareJobPriority(a, b) {
+  const aKey = a.priorityRank != null ? a.priorityRank : deadlineSortKey(a);
+  const bKey = b.priorityRank != null ? b.priorityRank : deadlineSortKey(b);
+  return aKey - bKey;
+}
+
 function scheduleJobs(jobs, holidays, settings) {
-  const sorted = [...jobs].sort((a, b) => deadlineSortKey(a) - deadlineSortKey(b));
+  const sorted = [...jobs].sort(compareJobPriority);
 
   const state = {
     machiningOccupied: [], // [{start, end, jobName, jobId}] — pinned + placed CNC blocks (end exclusive)
@@ -923,6 +946,13 @@ function scheduleJobs(jobs, holidays, settings) {
     installerSchedules: {},
     installBookings: [],   // [{customer, jobName, start, end, installer, cabCount, weekKey}]
     vanBookings: [],       // [{date, jobName, isSibling}] — 1 van can do 1 delivery per day
+    // Where the manually-ranked queue currently ends, updated as each
+    // ranked job's bench gets placed. A ranked job's ASAP search starts
+    // here instead of at settings.startDate, so it chains onto the back
+    // of the priority queue specifically — not onto the first gap
+    // anywhere in the whole year, which could easily be an early slot
+    // that has nothing to do with its actual rank.
+    rankedBenchFrontier: null,
   };
   FITTERS.forEach(f => state.installerSchedules[f] = []);
 
@@ -1504,7 +1534,25 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     benchStartSlot = interval.startSlot;
     benchEndSlot = interval.endSlot;
   } else {
-    const asapSlot = findFreeBenchSlot(earliestBenchSlot, benchActualDays, state.benchOccupied, holidays);
+    // A manually-ranked job's ASAP search starts at the LATER of (a) where
+    // its own rank places it on the calendar and (b) the back of the
+    // priority queue so far (wherever the last ranked job's bench ended)
+    // — never at settings.startDate the way an unranked job's does.
+    // Searching from the very beginning would just find the first free
+    // gap anywhere in the whole year regardless of how "delayed" this
+    // job's rank actually is, which defeats "delay this job, let others
+    // fall forward" outright — a lone delayed job would still grab
+    // whatever early capacity happens to be free. Unranked jobs are
+    // completely unaffected by any of this.
+    let searchFrom = earliestBenchSlot;
+    if (job.priorityRank != null) {
+      const rankSlot = { date: new Date(job.priorityRank), used: 0 };
+      if (compareFractionalSlot(rankSlot, searchFrom) > 0) searchFrom = rankSlot;
+      if (state.rankedBenchFrontier && compareFractionalSlot(state.rankedBenchFrontier, searchFrom) > 0) {
+        searchFrom = state.rankedBenchFrontier;
+      }
+    }
+    const asapSlot = findFreeBenchSlot(searchFrom, benchActualDays, state.benchOccupied, holidays);
     benchStartSlot = asapSlot;
     if (pinnedInstallDate) {
       const { benchStart: latestBenchStartDate } = backwardFromInstall(
@@ -1541,7 +1589,15 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
             });
           }
         }
-      } else {
+      } else if (job.priorityRank == null) {
+        // Only jobs still on the deadline-driven auto-flow get deferred
+        // toward their own install date when there's slack — a manually
+        // ranked job (dragged in the Gantt) stays at its ASAP slot instead,
+        // chaining immediately behind whatever's ahead of it in the
+        // priority queue rather than floating off toward its own deadline.
+        // That's the whole point of dragging it: it moves up the schedule
+        // to run right after the last bench slot, not just "sometime before
+        // install."
         const slackWorkingDays = workingDaysBetween(asapSlot.date, desiredLatestBenchStart.date, holidays);
         if (slackWorkingDays >= SLACK_THRESHOLD_WORKING_DAYS) {
           const latestSlot = findLatestFreeBenchSlot(desiredLatestBenchStart, benchActualDays, state.benchOccupied, holidays);
@@ -1556,6 +1612,9 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     }
   }
   benchEndSlot = advanceFractionalDay(benchStartSlot, benchActualDays, holidays);
+  if (job.priorityRank != null && (!state.rankedBenchFrontier || compareFractionalSlot(benchEndSlot, state.rankedBenchFrontier) > 0)) {
+    state.rankedBenchFrontier = benchEndSlot;
+  }
   const benchInterval = { startSlot: benchStartSlot, endSlot: benchEndSlot };
   tasks.push({
     stage: "bench",
@@ -3497,6 +3556,31 @@ function App() {
           onDeliveryDrag={(jobId, isoDate) => {
             updateJob(jobId, { deliveryDate: isoDate });
           }}
+          onReorderJobs={(draggedJobId, newRank) => {
+            // A real, committed change — not a bar-drag preview — so any
+            // drag-freeze in effect is no longer relevant. Only the dragged
+            // job's own data changes here — never any other job's — so one
+            // drag can never reshuffle jobs you didn't touch.
+            setDragFreeze(null);
+            setJobs(prev => prev.map(j => {
+              if (j.id !== draggedJobId) return j;
+              const patch = { priorityRank: newRank };
+              // The whole point of dragging a job's name is to let its
+              // production flow automatically at its new priority — a
+              // leftover manual pin on any of these stages (from an
+              // earlier bar-drag) would keep the job locked to its old
+              // date and silently make the reorder do nothing. Install is
+              // deliberately untouched: that's the customer commitment,
+              // set manually, separately.
+              ["machining", "bench", "finishing", "reassembly"].forEach(stage => {
+                const cfg = DRAGGABLE_STAGES[stage];
+                patch[cfg.dateField] = "";
+                patch[cfg.daysField] = 0;
+                if (cfg.usedField) patch[cfg.usedField] = 0;
+              });
+              return { ...j, ...patch };
+            }));
+          }}
         />
       </div>
 
@@ -4731,7 +4815,7 @@ function ganttSegmentsFor(task, ganttStart, colWidth, holidays) {
   return segments;
 }
 
-function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onStageResize, onStageReset, onToggleLock, onDeliveryDrag }) {
+function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onStageResize, onStageReset, onToggleLock, onDeliveryDrag, onReorderJobs }) {
   const COL_WIDTH = 36;       // wider so day numbers are readable
   const ROW_HEIGHT = 64;
 
@@ -4746,6 +4830,12 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
   // Drag state for delivery icon
   const [deliveryDragState, setDeliveryDragState] = useState(null);
   // deliveryDragState: { jobId, currentLeft, currentDate }
+
+  // Drag state for reordering a job's manual production priority (dragging
+  // its name up/down). Local to this component — only committed to real job
+  // state (via onReorderJobs) on drop.
+  const [reorderDrag, setReorderDrag] = useState(null);
+  // reorderDrag: { jobId, dragIndex, offsetY, targetIndex }
 
   // Chart geometry (day columns, month/week groupings) depends only on the
   // jobs' dates and the workshop start date — memoized so a drag (which only
@@ -4805,10 +4895,17 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
   // Rows flow top-to-bottom in the order each job's earliest PRODUCTION
   // stage actually starts, so dragging a job's bench (etc.) earlier than
   // another job visibly moves it up the chart to match — an even flow down
-  // the page. Deliberately only machining/bench/finishing/reassembly count
-  // here, not every task type — final_survey in particular is always
-  // exactly 25 working days before install, nothing to do with when
-  // production actually starts.
+  // the page instead of a fixed, drag-independent order. Deliberately only
+  // machining/bench/finishing/reassembly count here, not every task type —
+  // final_survey in particular is always exactly 25 working days before
+  // install, nothing to do with when production actually starts, and
+  // mixing it in used to make a job's row (and what a drag-computed
+  // priorityRank number actually means) drift out of step with its own
+  // bench. A manually-set priorityRank (dragged by its name, see
+  // GanttRow's grip handle) sits on that same number line instead of
+  // unconditionally beating every unranked job, so dragging a job down
+  // among unranked ones actually delays it rather than just reordering it
+  // against other ranked jobs.
   const PRODUCTION_STAGES = ["machining", "bench", "finishing", "reassembly"];
   const earliestStart = (job) => {
     const prod = (job.tasks || []).filter(t => PRODUCTION_STAGES.includes(t.stage));
@@ -4816,8 +4913,73 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
     return Math.min(...prod.map(t => t.start.getTime()));
   };
   const orderedJobs = useMemo(() => {
-    return [...jobs].sort((a, b) => earliestStart(a) - earliestStart(b));
+    return [...jobs].sort((a, b) => {
+      const aKey = a.priorityRank != null ? a.priorityRank : earliestStart(a);
+      const bKey = b.priorityRank != null ? b.priorityRank : earliestStart(b);
+      return aKey - bKey;
+    });
   }, [jobs]);
+
+  // Dragging a job's name up/down sets its manual production priority —
+  // which job claims shared bench/machining/finishing capacity first — but
+  // never touches install dates. Same rAF-throttled mousedown/mousemove/
+  // mouseup-on-window pattern as the delivery-icon drag below.
+  //
+  // useCallback matters here, not just as tidiness: reorderDrag updates (via
+  // setReorderDrag below) re-render GanttView on every rAF tick while a drag
+  // is in progress, and every GanttRow is React.memo'd specifically so that
+  // re-rendering doesn't cascade to all of them. Without this, a plain inline
+  // function would get a new identity every tick, defeating that memo for
+  // every row — fine with a handful of jobs, visibly janky with dozens.
+  const startRowDrag = useCallback((e, job, index) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const startY = e.clientY;
+    let rafId = null;
+    let pending = null;
+    const flush = () => { rafId = null; if (pending) setReorderDrag(pending); };
+    const onMove = (ev) => {
+      const dy = ev.clientY - startY;
+      const rawTarget = index + Math.round(dy / ROW_HEIGHT);
+      const targetIndex = Math.max(0, Math.min(orderedJobs.length - 1, rawTarget));
+      pending = { jobId: job.id, dragIndex: index, offsetY: dy, targetIndex };
+      if (rafId === null) rafId = requestAnimationFrame(flush);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      const finalTarget = pending ? pending.targetIndex : index;
+      setReorderDrag(null);
+      if (finalTarget !== index && onReorderJobs) {
+        // Only the dragged job's own priorityRank is ever touched — never
+        // the whole list's. Its new rank nestles its bench dates exactly
+        // between whatever's now immediately above/below it, using each
+        // neighbor's own bench timing (priorityRank if it has one,
+        // earliestStart if not) — the same number line the rows are
+        // visually ordered by, so it lands where it looks like it should.
+        // scheduleSingleJob's auto-bench branch anchors a ranked job's
+        // search to this same rank value (not settings.startDate), which
+        // is what actually makes it settle next to these two neighbors
+        // instead of grabbing the first free gap anywhere in the year.
+        // Half a day's worth of milliseconds is the fallback nudge when
+        // there's only one neighbor to go on.
+        const HALF_DAY_MS = 12 * 60 * 60 * 1000;
+        const keyOf = (j) => j.priorityRank != null ? j.priorityRank : earliestStart(j);
+        const withoutDragged = orderedJobs.filter((_, idx) => idx !== index);
+        const above = withoutDragged[finalTarget - 1];
+        const below = withoutDragged[finalTarget];
+        let newRank;
+        if (above && below) newRank = (keyOf(above) + keyOf(below)) / 2;
+        else if (above) newRank = keyOf(above) + HALF_DAY_MS;
+        else if (below) newRank = keyOf(below) - HALF_DAY_MS;
+        else newRank = Date.now();
+        onReorderJobs(job.id, newRank);
+      }
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, [orderedJobs, onReorderJobs, ROW_HEIGHT]);
 
   if (!chart) {
     return (
@@ -4976,8 +5138,20 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
                 onStageReset={onStageReset}
                 onToggleLock={onToggleLock}
                 onDeliveryDrag={onDeliveryDrag}
+                isReordering={!!(reorderDrag && reorderDrag.jobId === job.id)}
+                reorderOffsetY={reorderDrag && reorderDrag.jobId === job.id ? reorderDrag.offsetY : 0}
+                onRowDragStart={onReorderJobs ? startRowDrag : null}
               />
             ))}
+            {reorderDrag && (
+              <div
+                style={{
+                  position: "absolute", left: 0, right: 0,
+                  top: reorderDrag.targetIndex * ROW_HEIGHT - 1,
+                  height: 2, background: "#7a8b6f", zIndex: 5, pointerEvents: "none",
+                }}
+              />
+            )}
           </div>
         </div>
       </div>
@@ -5019,6 +5193,7 @@ const GanttRow = React.memo(function GanttRow({
   dragState, resizeState, deliveryDragState,
   setDragState, setResizeState, setDeliveryDragState,
   onStageDrag, onStageResize, onStageReset, onToggleLock, onDeliveryDrag,
+  isReordering, reorderOffsetY, onRowDragStart,
 }) {
   return (
     <div
@@ -5534,8 +5709,22 @@ const GanttRow = React.memo(function GanttRow({
           display: "flex",
           alignItems: "center",
           gap: 3,
+          ...(isReordering ? {
+            transform: `translateY(${reorderOffsetY}px)`,
+            zIndex: 6,
+            boxShadow: "0 3px 8px rgba(58,52,44,0.25)",
+          } : {}),
         }}
       >
+        {!IS_READONLY && onRowDragStart && (
+          <span
+            style={{ pointerEvents: "auto", cursor: "grab", display: "flex", color: "#9b8f7e" }}
+            onMouseDown={(e) => onRowDragStart(e, job, i)}
+            title="Drag to reorder production priority"
+          >
+            <GripVertical size={12} strokeWidth={2} />
+          </span>
+        )}
         {job.name || "—"}
       </div>
     </div>
