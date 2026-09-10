@@ -2642,6 +2642,64 @@ function deepCloneState(state) {
 }
 
 // ============================================================
+// MULTI-DEVICE SYNC MERGE
+// ============================================================
+
+// Reconciles this device's local job list against whatever the server
+// currently has before a save (or after a realtime notification) blindly
+// overwrites one with the other. Without this, two devices open at once —
+// e.g. a workshop tablet and someone's laptop — can silently clobber each
+// other: each periodically saves its ENTIRE job list, so device B saving
+// its own (older) copy a moment after device A drags a bar wipes out A's
+// change, which then "snaps back" once A's own sync notices B's write.
+//
+// `base` is the last job list this device knows was in sync with the
+// server (see lastSyncedJobsRef); `mine` is this device's current local
+// jobs; `theirs` is what was just read from the server. Every job update
+// in this codebase replaces the object (`{...j, ...patch}` / `.map(...)`),
+// never mutates in place, so an UNCHANGED job keeps the exact same object
+// reference across renders — comparing `mine`'s entries against `base` by
+// reference is enough to tell exactly which jobs this device actually
+// touched, with no deep-equality needed. Anything touched locally wins;
+// anything untouched takes whatever the server has (picking up remote
+// edits, or a remote delete).
+function mergeJobs(base, mine, theirs) {
+  const baseById = new Map((base || []).map(j => [j.id, j]));
+  const theirsById = new Map((theirs || []).map(j => [j.id, j]));
+  const merged = [];
+  const handled = new Set();
+  for (const m of (mine || [])) {
+    handled.add(m.id);
+    const touchedLocally = baseById.get(m.id) !== m; // new (no base entry) or edited (different ref)
+    if (touchedLocally) {
+      merged.push(m);
+    } else {
+      const t = theirsById.get(m.id);
+      if (t !== undefined) merged.push(t); // untouched — take the server's copy
+      // else: untouched locally, server no longer has it — respect the remote delete
+    }
+  }
+  for (const t of (theirs || [])) {
+    if (handled.has(t.id) || baseById.has(t.id)) continue;
+    merged.push(t); // a job added on another device we've never seen
+  }
+  return merged;
+}
+
+// Cheap post-merge check: did merging in the server's copy actually change
+// anything this device is displaying? Reference-equal, order-preserving in
+// the common (no-conflict) case by construction of mergeJobs above, so this
+// avoids an unnecessary setJobs (and the save-effect re-run it would cause)
+// when the merge found nothing new to pick up.
+function sameJobs(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+// ============================================================
 // UI COMPONENTS
 // ============================================================
 
@@ -2705,9 +2763,29 @@ function App() {
   // would otherwise trigger a reload and overwrite local state).
   const lastWriteAtRef = useRef(0);
 
+  // Always-current mirror of `jobs`, for code (the debounced save effect,
+  // reloadFromStorage) that needs the latest local state but can't rely on
+  // its own closure being fresh — see mergeJobs above.
+  const jobsRef = useRef(jobs);
+  useEffect(() => { jobsRef.current = jobs; }, [jobs]);
+  // The last job list this device knows matched the server — the merge
+  // base for reconciling local edits against whatever another device may
+  // have written since. Updated after every successful load, save, and
+  // merge-reload.
+  const lastSyncedJobsRef = useRef(null);
+
   // Load from storage (reusable function for realtime sync)
   const reloadFromStorage = async () => {
-    try { const j = await window.storage.get("ew-jobs"); if (j?.value) { setDragFreeze(null); setJobs(JSON.parse(j.value)); } } catch {}
+    try {
+      const j = await window.storage.get("ew-jobs");
+      if (j?.value) {
+        const serverJobs = JSON.parse(j.value);
+        const merged = mergeJobs(lastSyncedJobsRef.current, jobsRef.current, serverJobs);
+        lastSyncedJobsRef.current = merged;
+        setDragFreeze(null);
+        if (!sameJobs(merged, jobsRef.current)) setJobs(merged);
+      }
+    } catch {}
     try { const s = await window.storage.get("ew-settings"); if (s?.value) setSettings(JSON.parse(s.value)); } catch {}
     try { const r = await window.storage.get("ew-dismissed-reminders"); if (r?.value) setDismissedReminders(JSON.parse(r.value)); } catch {}
     try { const w = await window.storage.get("ew-dismissed-warnings"); if (w?.value) setDismissedWarnings(JSON.parse(w.value)); } catch {}
@@ -2833,10 +2911,15 @@ function App() {
   // empty-array safety guard so a transient empty state can't wipe data —
   // except when undo/redo deliberately restored an empty array, which is a
   // real historical state to persist, not a race to guard against.
+  //
+  // Before writing, merges against whatever's currently on the server (see
+  // mergeJobs) instead of blindly overwriting it — otherwise this device's
+  // periodic whole-list save can silently erase an edit another device made
+  // in the meantime (see project_multi_device_sync_merge).
   const wasUndoRedoForSave = isUndoRedoActionRef.current;
   useEffect(() => {
     if (loading || IS_READONLY) return;
-    const t = setTimeout(() => {
+    const t = setTimeout(async () => {
       if (jobs.length === 0 && !wasUndoRedoForSave) {
         // Safety check: don't overwrite non-empty Supabase data with an empty array
         window.storage.get("ew-jobs").then(r => {
@@ -2856,7 +2939,18 @@ function App() {
         }).catch(console.error);
         return;
       }
-      safeSet("ew-jobs", JSON.stringify(jobs));
+      let toSave = jobs;
+      try {
+        const server = await window.storage.get("ew-jobs");
+        if (server?.value) {
+          const serverJobs = JSON.parse(server.value);
+          const merged = mergeJobs(lastSyncedJobsRef.current, jobs, serverJobs);
+          toSave = merged;
+          if (!sameJobs(merged, jobs)) setJobs(merged);
+        }
+      } catch (e) { console.error(e); }
+      lastSyncedJobsRef.current = toSave;
+      safeSet("ew-jobs", JSON.stringify(toSave));
     }, 600);
     return () => clearTimeout(t);
   }, [jobs, loading]);
