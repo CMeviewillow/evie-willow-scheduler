@@ -216,7 +216,8 @@ function dayCapacity(date) {
 
 // Friday's REAL capacity (07:00-11:00 minus a break = 3.75 of an 8.5-hour
 // day) — used only for the floor board's own day-by-day cabinet breakdown
-// (dayLayoutForRatedInterval), never for the core scheduler's date math.
+// (cncQueueDayLayout/stageQueueDayLayout), never for the core scheduler's
+// date math.
 function fridayAwareCapacity(date) {
   return date.getDay() === 5 ? FRIDAY_DAY_FRACTION : 1;
 }
@@ -421,9 +422,10 @@ function featureImpact(features) {
 // Core scheduling rounds each job's total bench/finishing/reassembly time up
 // to the nearest half day (with a 0.5-day floor), same as before the
 // fractional rewrite. The floor board's own day-by-day cabinet breakdown
-// (dayLayoutForRatedInterval/cabinetEntriesFor) still works from each style's
-// EXACT count and rate, independent of this rounding — so partial-day
-// sharing between jobs still displays precisely. Rounding here is about
+// (cncQueueDayLayout/stageQueueDayLayout/cabinetEntriesFor) still works
+// from each style's EXACT count and rate, independent of this rounding —
+// so partial-day sharing between jobs still displays precisely. Rounding
+// here is about
 // keeping the overall schedule's month-spanning positions stable: an exact,
 // unrounded total compounds small savings across months of backlog into
 // large, disruptive drift versus what the workshop is used to seeing.
@@ -534,47 +536,17 @@ function roundedCabinetsForDisplay(raw) {
   return Math.max(1, Math.round(raw));
 }
 
-// Walk a job's cabinet mix, style by style at that style's own rate, across a
-// fractional-day interval starting at `startSlot`. Returns
-// Map<dateKey, [{style, cabinets}]> — used for bench, finishing and
-// reassembly, which all run at real per-style rates and can share a day
-// across two different jobs.
-function dayLayoutForRatedInterval(startSlot, cabinetEntries, holidays) {
-  const byDate = new Map();
-  let cursor = normalizeToWorkingDay(startSlot, holidays);
-  for (const { style, count, rate } of cabinetEntries) {
-    let remaining = count;
-    while (remaining > DAY_EPSILON) {
-      const availableToday = fridayAwareCapacity(cursor.date) - cursor.used;
-      if (availableToday <= DAY_EPSILON) {
-        cursor = normalizeToWorkingDay({ date: nextWorkingDay(addDays(cursor.date, 1), holidays), used: 0 }, holidays);
-        continue;
-      }
-      const daysForRemaining = remaining / rate;
-      const daysConsumedToday = Math.min(daysForRemaining, availableToday);
-      const cabinetsToday = roundDay(daysConsumedToday * rate);
-      const k = dayKey(cursor.date);
-      if (!byDate.has(k)) byDate.set(k, []);
-      byDate.get(k).push({ style, cabinets: cabinetsToday });
-      remaining = roundDay(remaining - cabinetsToday);
-      cursor = advanceFractionalDay(cursor, daysConsumedToday, holidays);
-    }
-  }
-  return byDate;
-}
-
-// CNC cutting is the one truly continuous resource in the workshop — unlike
-// bench (which needs a distinct block per job for assembly to make sense),
-// raw cutting flows seamlessly from one job's panels straight into the
-// next's. So the floor board's CNC target isn't positioned as a per-job
-// block at all: this walks EVERY job's cabinets, in the same queue order
-// used everywhere else, through the CNC line at each style's standard rate
-// — the same rate-and-fill model bench already uses via
-// dayLayoutForRatedInterval, just spanning the whole backlog in one
-// continuous pass from settings.startDate instead of restarting at each
-// job's own start date. That's what keeps a target on the CNC card every
-// working day there's still backlog to cut, instead of it going idle
-// between one job's own machining block and the next's.
+// CNC cutting is the one truly continuous resource in the workshop — raw
+// cutting flows seamlessly from one job's panels straight into the next's.
+// So the floor board's CNC target isn't positioned as a per-job block at
+// all: this walks EVERY job's cabinets, in the same queue order used
+// everywhere else, through the CNC line at each style's standard rate,
+// spanning the whole backlog in one continuous pass from settings.startDate
+// instead of restarting at each job's own start date. That's what keeps a
+// target on the CNC card every working day there's still backlog to cut,
+// instead of it going idle between one job's own machining block and the
+// next's. Bench/finishing/reassembly use the same continuous-queue model —
+// see stageQueueDayLayout below — for the same reason.
 function cncQueueDayLayout(scheduledJobs, holidays, startDate) {
   const byDate = new Map();
   let cursor = normalizeToWorkingDay({ date: startDate, used: 0 }, holidays);
@@ -604,6 +576,65 @@ function cncQueueDayLayout(scheduledJobs, holidays, startDate) {
   return byDate;
 }
 
+// Same continuous-queue model as CNC (above), for bench, finishing, and
+// reassembly — display-only, never touches the real scheduled task dates
+// (the Gantt bars, which stay exactly as computed: each job's own
+// dedicated block, unchanged). Without this, a job whose real cabinet
+// work finishes early within its own block (e.g. most of its cabinets
+// went through on the first few days, leaving only a sliver on the last)
+// makes the floor board's target for that day crater to near-zero, even
+// though there's a next job in the queue that's genuinely ready to fill
+// the rest of the day — see project_floor_board_queue_fill.
+//
+// Each job's own task.startSlot for the stage is still respected as a
+// floor — this never pulls a job's cabinets in before that job's own
+// prerequisites (previous stage, pins, capacity conflicts — all already
+// resolved by scheduleJobs) say it can genuinely begin. But if the queue
+// still has capacity left on a day after an earlier job's cabinets run
+// out, the next job whose own start has already arrived slots straight
+// into that gap instead of waiting for its own block to start.
+//
+// Jobs are walked in order of their own startSlot for THIS stage, not
+// scheduledJobs' install-priority order — a job with a later install date
+// can easily have an earlier bench/finishing/reassembly slot (slack,
+// pinned dates, etc.), and the shared cursor only ever moves forward, so
+// processing in priority order could skip a job's real start entirely and
+// misattribute its cabinets to whatever later day the cursor had already
+// reached.
+function stageQueueDayLayout(scheduledJobs, stageKey, rateScaleFor, holidays) {
+  const byDate = new Map();
+  const withTask = scheduledJobs
+    .map(job => ({ job, task: (job.tasks || []).find(t => t.stage === stageKey) }))
+    .filter(({ job, task }) => task?.startSlot && totalCabinets(job) > 0)
+    .sort((a, b) => compareFractionalSlot(a.task.startSlot, b.task.startSlot));
+  let cursor = null;
+  withTask.forEach(({ job, task }) => {
+    const jobStart = normalizeToWorkingDay(task.startSlot, holidays);
+    if (!cursor || compareFractionalSlot(jobStart, cursor) > 0) cursor = jobStart;
+    const colour = job.colour || { name: "", hex: "" };
+    const entries = cabinetEntriesFor(job, rateScaleFor(job, task));
+    entries.forEach(({ style, count, rate }) => {
+      let remaining = count;
+      while (remaining > DAY_EPSILON) {
+        const availableToday = fridayAwareCapacity(cursor.date) - cursor.used;
+        if (availableToday <= DAY_EPSILON) {
+          cursor = normalizeToWorkingDay({ date: nextWorkingDay(addDays(cursor.date, 1), holidays), used: 0 }, holidays);
+          continue;
+        }
+        const daysForRemaining = remaining / rate;
+        const daysConsumedToday = Math.min(daysForRemaining, availableToday);
+        const cabinetsToday = roundDay(daysConsumedToday * rate);
+        const k = dayKey(cursor.date);
+        if (!byDate.has(k)) byDate.set(k, []);
+        byDate.get(k).push({ jobId: job.id, jobName: job.name, colour, style, cabinets: cabinetsToday });
+        remaining = roundDay(remaining - cabinetsToday);
+        cursor = advanceFractionalDay(cursor, daysConsumedToday, holidays);
+      }
+    });
+  });
+  return byDate;
+}
+
 
 function mixFromEntries(entries) {
   const mix = {};
@@ -611,15 +642,37 @@ function mixFromEntries(entries) {
   return mix;
 }
 
+// Groups a stage's queue-day-layout entries by job for one day and emits
+// one rounded entry per job via addEntry — shared by cnc/bench/finishing/
+// reassembly below so they batch and round identically.
+function emitQueueDay(addEntry, stage, dateKey, dayEntries, extra) {
+  const byJob = new Map();
+  dayEntries.forEach(e => {
+    if (!byJob.has(e.jobId)) byJob.set(e.jobId, { jobName: e.jobName, colour: e.colour, entries: [] });
+    byJob.get(e.jobId).entries.push(e);
+  });
+  let batch = 0;
+  byJob.forEach(({ jobName, colour, entries }, jobId) => {
+    batch++;
+    const cabinets = roundedCabinetsForDisplay(entries.reduce((a, e) => a + e.cabinets, 0));
+    if (cabinets > 0) addEntry(dateKey, stage, { jobId, jobName, batch, cabinets, colour, mix: mixFromEntries(entries), ...(extra ? extra(entries) : {}) });
+  });
+}
+
 // Build the full day layout: { dateKey: { stage: [{jobId,jobName,batch,cabinets,colour,mix}] } }.
-// CNC is computed once up front as one continuous queue across the whole
-// backlog (see cncQueueDayLayout) rather than per job. "Bench prep" — frame,
-// door and drawer making — is the cabinets going to bench the next working
-// day, so it's derived straight from bench's own day-by-day numbers, shifted
-// back one working day, rather than paced separately. Finishing splits into
-// "spray" and "pad" (pad is whichever painted-family cabinets land on a
-// given finishing day) — display-only, the scheduler itself still has one
-// finishing stage.
+// CNC, bench, finishing and reassembly are each computed once up front as
+// one continuous queue across the whole backlog (see cncQueueDayLayout /
+// stageQueueDayLayout) rather than per job, so a target never craters to
+// near-zero just because one job's own cabinets happen to run out partway
+// through a day — the next job in the queue fills the rest, same as a real
+// bench/spray booth/reassembly area would in practice. This is entirely
+// display-only: the Gantt's own per-job blocks (job.tasks) are untouched.
+// "Bench prep" — frame, door and drawer making — is the cabinets going to
+// bench the next working day, so it's derived straight from bench's own
+// day-by-day numbers, shifted back one working day, rather than paced
+// separately. Finishing splits into "spray" and "pad" (pad is whichever
+// painted-family cabinets land on a given finishing day) — display-only,
+// the scheduler itself still has one finishing stage.
 function computeDayLayout(scheduled, holidays, settings) {
   const layout = {};
   const addEntry = (dateKey, stage, entry) => {
@@ -629,81 +682,43 @@ function computeDayLayout(scheduled, holidays, settings) {
   };
 
   const cncByDate = cncQueueDayLayout(scheduled, holidays, nextWorkingDay(parseISO(settings.startDate), holidays));
-  [...cncByDate.keys()].sort().forEach(k => {
-    const byJob = new Map();
-    cncByDate.get(k).forEach(e => {
-      if (!byJob.has(e.jobId)) byJob.set(e.jobId, { jobName: e.jobName, colour: e.colour, entries: [] });
-      byJob.get(e.jobId).entries.push(e);
-    });
-    let batch = 0;
-    byJob.forEach(({ jobName, colour, entries }, jobId) => {
-      batch++;
-      const cabinets = roundedCabinetsForDisplay(entries.reduce((a, e) => a + e.cabinets, 0));
-      if (cabinets > 0) addEntry(k, "cnc", { jobId, jobName, batch, cabinets, colour, mix: mixFromEntries(entries) });
-    });
-  });
+  [...cncByDate.keys()].sort().forEach(k => emitQueueDay(addEntry, "cnc", k, cncByDate.get(k)));
 
-  scheduled.forEach(job => {
-    if (!job.tasks?.length) return;
-    if (totalCabinets(job) === 0) return;
-    const colour = job.colour || { name: "", hex: "" };
-    // A stage whose actual days (task.days, which reflects any
-    // benchDaysOverride/finishingDaysOverride/reassemblyDaysOverride) is
-    // smaller than its nominal cabinet-math days has been overbooked — extra
-    // hours/hands thrown at it to clear faster than the standard rate. Scale
-    // that stage's own day-layout rate up to match, so the floor board's
-    // cabinets/day reflects the actual pace rather than the standard one.
-    // Unoverridden stages have task.days === nominal, so scale is exactly 1.
+  // A stage whose actual days (task.days, which reflects any
+  // benchDaysOverride/finishingDaysOverride/reassemblyDaysOverride) is
+  // smaller than its nominal cabinet-math days has been overbooked — extra
+  // hours/hands thrown at it to clear faster than the standard rate. Scale
+  // that stage's own day-layout rate up to match, so the floor board's
+  // cabinets/day reflects the actual pace rather than the standard one.
+  // Unoverridden stages have task.days === nominal, so scale is exactly 1.
+  const benchByDate = stageQueueDayLayout(scheduled, "bench", (job, task) => {
     const nominalBenchDays = benchDaysForJob(job);
-    const nominalFinishDays = nominalBenchDays + featureImpact(job.features).flatExtra;
-
-    const benchTask = job.tasks.find(t => t.stage === "bench");
-    if (benchTask?.startSlot) {
-      const benchScale = benchTask.days > 0 ? nominalBenchDays / benchTask.days : 1;
-      const dl = dayLayoutForRatedInterval(benchTask.startSlot, cabinetEntriesFor(job, benchScale), holidays);
-      let batch = 0;
-      [...dl.keys()].sort().forEach(k => {
-        batch++;
-        const dayEntries = dl.get(k);
-        const cabinets = roundedCabinetsForDisplay(dayEntries.reduce((a, e) => a + e.cabinets, 0));
-        if (cabinets > 0) {
-          addEntry(k, "bench", { jobId: job.id, jobName: job.name, batch, cabinets, colour, mix: mixFromEntries(dayEntries) });
-          let prepDate = addDays(parseISO(k), -1);
-          while (isWeekend(prepDate) || holidays.has(dayKey(prepDate))) prepDate = addDays(prepDate, -1);
-          addEntry(dayKey(prepDate), "prep", { jobId: job.id, jobName: job.name, batch, cabinets, colour, mix: mixFromEntries(dayEntries) });
-        }
-      });
-    }
-
-    const finishTask = job.tasks.find(t => t.stage === "finishing");
-    if (finishTask?.startSlot) {
-      const finishScale = finishTask.days > 0 ? nominalFinishDays / finishTask.days : 1;
-      const fdl = dayLayoutForRatedInterval(finishTask.startSlot, cabinetEntriesFor(job, finishScale), holidays);
-      let batch = 0;
-      [...fdl.keys()].sort().forEach(k => {
-        batch++;
-        const dayEntries = fdl.get(k);
-        const padEntries = dayEntries.filter(e => PADDED_STYLES.includes(e.style));
-        const sprayCabinets = roundedCabinetsForDisplay(dayEntries.reduce((a, e) => a + e.cabinets, 0));
-        const padCabinets = roundedCabinetsForDisplay(padEntries.reduce((a, e) => a + e.cabinets, 0));
-        if (sprayCabinets > 0) addEntry(k, "spray", { jobId: job.id, jobName: job.name, batch, cabinets: sprayCabinets, colour, mix: mixFromEntries(dayEntries) });
-        if (padCabinets > 0) addEntry(k, "pad", { jobId: job.id, jobName: job.name, batch, cabinets: padCabinets, colour, mix: mixFromEntries(padEntries) });
-      });
-    }
-
-    const reasmTask = job.tasks.find(t => t.stage === "reassembly");
-    if (reasmTask?.startSlot) {
-      const reasmScale = reasmTask.days > 0 ? nominalBenchDays / reasmTask.days : 1;
-      const rdl = dayLayoutForRatedInterval(reasmTask.startSlot, cabinetEntriesFor(job, reasmScale), holidays);
-      let batch = 0;
-      [...rdl.keys()].sort().forEach(k => {
-        batch++;
-        const dayEntries = rdl.get(k);
-        const cabinets = roundedCabinetsForDisplay(dayEntries.reduce((a, e) => a + e.cabinets, 0));
-        if (cabinets > 0) addEntry(k, "reasm", { jobId: job.id, jobName: job.name, batch, cabinets, colour, mix: mixFromEntries(dayEntries) });
-      });
-    }
+    return task.days > 0 ? nominalBenchDays / task.days : 1;
+  }, holidays);
+  [...benchByDate.keys()].sort().forEach(k => {
+    emitQueueDay(addEntry, "bench", k, benchByDate.get(k));
+    (layout[k]?.bench || []).forEach(({ jobId, jobName, batch, cabinets, colour, mix }) => {
+      let prepDate = addDays(parseISO(k), -1);
+      while (isWeekend(prepDate) || holidays.has(dayKey(prepDate))) prepDate = addDays(prepDate, -1);
+      addEntry(dayKey(prepDate), "prep", { jobId, jobName, batch, cabinets, colour, mix });
+    });
   });
+
+  const finishByDate = stageQueueDayLayout(scheduled, "finishing", (job, task) => {
+    const nominalFinishDays = benchDaysForJob(job) + featureImpact(job.features).flatExtra;
+    return task.days > 0 ? nominalFinishDays / task.days : 1;
+  }, holidays);
+  [...finishByDate.keys()].sort().forEach(k => {
+    const dayEntries = finishByDate.get(k);
+    emitQueueDay(addEntry, "spray", k, dayEntries);
+    emitQueueDay(addEntry, "pad", k, dayEntries.filter(e => PADDED_STYLES.includes(e.style)));
+  });
+
+  const reasmByDate = stageQueueDayLayout(scheduled, "reassembly", (job, task) => {
+    const nominalBenchDays = benchDaysForJob(job);
+    return task.days > 0 ? nominalBenchDays / task.days : 1;
+  }, holidays);
+  [...reasmByDate.keys()].sort().forEach(k => emitQueueDay(addEntry, "reasm", k, reasmByDate.get(k)));
 
   return layout;
 }
