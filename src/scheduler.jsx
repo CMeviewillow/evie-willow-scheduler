@@ -523,6 +523,17 @@ function computeRateReview(floorActuals, jobs) {
   });
 }
 
+// Rounds a day's raw cabinet total for display, but never rounds a genuinely
+// nonzero remainder down to 0 — the tail end of a job's stage (e.g. its last
+// working day, where a fraction of a cabinet's worth of rated time is left)
+// would otherwise vanish from the floor board entirely, even though the
+// main Gantt still shows the job occupying that stage that day. See
+// project_floor_board_reasm_rounding.
+function roundedCabinetsForDisplay(raw) {
+  if (raw <= DAY_EPSILON) return 0;
+  return Math.max(1, Math.round(raw));
+}
+
 // Walk a job's cabinet mix, style by style at that style's own rate, across a
 // fractional-day interval starting at `startSlot`. Returns
 // Map<dateKey, [{style, cabinets}]> — used for bench, finishing and
@@ -627,7 +638,7 @@ function computeDayLayout(scheduled, holidays, settings) {
     let batch = 0;
     byJob.forEach(({ jobName, colour, entries }, jobId) => {
       batch++;
-      const cabinets = Math.round(entries.reduce((a, e) => a + e.cabinets, 0));
+      const cabinets = roundedCabinetsForDisplay(entries.reduce((a, e) => a + e.cabinets, 0));
       if (cabinets > 0) addEntry(k, "cnc", { jobId, jobName, batch, cabinets, colour, mix: mixFromEntries(entries) });
     });
   });
@@ -654,7 +665,7 @@ function computeDayLayout(scheduled, holidays, settings) {
       [...dl.keys()].sort().forEach(k => {
         batch++;
         const dayEntries = dl.get(k);
-        const cabinets = Math.round(dayEntries.reduce((a, e) => a + e.cabinets, 0));
+        const cabinets = roundedCabinetsForDisplay(dayEntries.reduce((a, e) => a + e.cabinets, 0));
         if (cabinets > 0) {
           addEntry(k, "bench", { jobId: job.id, jobName: job.name, batch, cabinets, colour, mix: mixFromEntries(dayEntries) });
           let prepDate = addDays(parseISO(k), -1);
@@ -673,8 +684,8 @@ function computeDayLayout(scheduled, holidays, settings) {
         batch++;
         const dayEntries = fdl.get(k);
         const padEntries = dayEntries.filter(e => PADDED_STYLES.includes(e.style));
-        const sprayCabinets = Math.round(dayEntries.reduce((a, e) => a + e.cabinets, 0));
-        const padCabinets = Math.round(padEntries.reduce((a, e) => a + e.cabinets, 0));
+        const sprayCabinets = roundedCabinetsForDisplay(dayEntries.reduce((a, e) => a + e.cabinets, 0));
+        const padCabinets = roundedCabinetsForDisplay(padEntries.reduce((a, e) => a + e.cabinets, 0));
         if (sprayCabinets > 0) addEntry(k, "spray", { jobId: job.id, jobName: job.name, batch, cabinets: sprayCabinets, colour, mix: mixFromEntries(dayEntries) });
         if (padCabinets > 0) addEntry(k, "pad", { jobId: job.id, jobName: job.name, batch, cabinets: padCabinets, colour, mix: mixFromEntries(padEntries) });
       });
@@ -688,7 +699,7 @@ function computeDayLayout(scheduled, holidays, settings) {
       [...rdl.keys()].sort().forEach(k => {
         batch++;
         const dayEntries = rdl.get(k);
-        const cabinets = Math.round(dayEntries.reduce((a, e) => a + e.cabinets, 0));
+        const cabinets = roundedCabinetsForDisplay(dayEntries.reduce((a, e) => a + e.cabinets, 0));
         if (cabinets > 0) addEntry(k, "reasm", { jobId: job.id, jobName: job.name, batch, cabinets, colour, mix: mixFromEntries(dayEntries) });
       });
     }
