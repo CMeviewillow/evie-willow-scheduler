@@ -69,6 +69,25 @@ const DRAGGABLE_STAGES = {
   install:    { dateField: "installOverride",    daysField: "installDaysOverride" },
 };
 
+// When a bar drag moves one production stage, which OTHER stages should
+// follow it (their own date pin cleared so they re-chain naturally off the
+// new position, via the same conveyor-belt relationships auto jobs already
+// use)? Only lists directions the auto logic actually supports — bench is
+// the anchor everything else derives from (machining ends right before it
+// starts, finishing starts 1 day after it starts), and reassembly derives
+// from finishing the same way. The reverse isn't true (bench doesn't derive
+// from machining, nothing derives from reassembly), so those cascade to
+// nothing — clearing an unrelated stage's pin there would just reset it to
+// some other independent position, not make it "follow" the drag. Install
+// is never included: it's the customer commitment, set manually, separately.
+const STAGE_CASCADE = {
+  machining: [],
+  bench: ["machining", "finishing", "reassembly"],
+  finishing: ["reassembly"],
+  reassembly: [],
+  install: [],
+};
+
 const FITTERS = ["Steve", "Thompson"];
 const NON_FITTERS = ["Callum"];
 
@@ -3692,6 +3711,17 @@ function App() {
             freezeOtherJobs(jobId);
             const patch = { [cfg.dateField]: isoDate };
             if (cfg.usedField) patch[cfg.usedField] = usedFraction || 0;
+            // Dragging one stage is a statement about the whole job's
+            // production chain, not just that one bar — clear the OTHER
+            // stages' own date pins (duration overrides stay untouched) so
+            // they re-chain naturally off this new position. The row's
+            // position in the Gantt follows for free: it's sorted by each
+            // job's own earliest computed stage date, which just updated.
+            (STAGE_CASCADE[stage] || []).forEach(s => {
+              const sCfg = DRAGGABLE_STAGES[s];
+              patch[sCfg.dateField] = "";
+              if (sCfg.usedField) patch[sCfg.usedField] = 0;
+            });
             dragUpdateJob(jobId, patch);
           }}
           onStageResize={(jobId, stage, days) => {
@@ -5578,8 +5608,46 @@ const GanttRow = React.memo(function GanttRow({
                   rafId = null;
                   if (pendingState) setDragState(pendingState);
                 };
-                const onMove = (ev) => {
-                  const dx = ev.clientX - startX;
+                // Auto-scroll the Gantt horizontally when the drag nears either
+                // edge of the visible scroll container. Without this, a target
+                // date more than about one screenful away is unreachable — the
+                // mouse simply runs out of room to travel before the bar gets
+                // there, which reads as "it won't let me drop it where I want."
+                // `scrollAdjust` tracks total px auto-scrolled since drag start
+                // so the drag's own dx math (mouse-position-relative) still
+                // lines up with the bar's true position once the container
+                // itself has moved underneath the cursor.
+                let scrollEl = e.target;
+                while (scrollEl && !(
+                  scrollEl.scrollWidth > scrollEl.clientWidth + 1 &&
+                  /auto|scroll/.test(getComputedStyle(scrollEl).overflowX)
+                )) {
+                  scrollEl = scrollEl.parentElement;
+                }
+                let scrollAdjust = 0;
+                let scrollDir = 0;
+                let scrollTimer = null;
+                let lastClientX = e.clientX;
+                const EDGE_ZONE = 60;
+                const SCROLL_STEP = 24;
+                const stopAutoScroll = () => {
+                  if (scrollTimer !== null) { clearInterval(scrollTimer); scrollTimer = null; }
+                  scrollDir = 0;
+                };
+                const startAutoScroll = (dir) => {
+                  if (scrollDir === dir) return;
+                  stopAutoScroll();
+                  scrollDir = dir;
+                  if (dir === 0 || !scrollEl) return;
+                  scrollTimer = setInterval(() => {
+                    const before = scrollEl.scrollLeft;
+                    scrollEl.scrollLeft += dir * SCROLL_STEP;
+                    scrollAdjust += scrollEl.scrollLeft - before;
+                    processMove(lastClientX);
+                  }, 16);
+                };
+                const processMove = (clientX) => {
+                  const dx = (clientX - startX) + scrollAdjust;
                   const newLeft = barLeft + dx;
                   if (supportsHalfDay) {
                     const snappedHalfIdx = Math.round(newLeft / (COL_WIDTH / 2));
@@ -5624,10 +5692,21 @@ const GanttRow = React.memo(function GanttRow({
                   }
                   if (rafId === null) rafId = requestAnimationFrame(flush);
                 };
+                const onMove = (ev) => {
+                  lastClientX = ev.clientX;
+                  if (scrollEl) {
+                    const rect = scrollEl.getBoundingClientRect();
+                    if (ev.clientX < rect.left + EDGE_ZONE) startAutoScroll(-1);
+                    else if (ev.clientX > rect.right - EDGE_ZONE) startAutoScroll(1);
+                    else startAutoScroll(0);
+                  }
+                  processMove(ev.clientX);
+                };
                 const onUp = () => {
                   window.removeEventListener("mousemove", onMove);
                   window.removeEventListener("mouseup", onUp);
                   if (rafId !== null) cancelAnimationFrame(rafId);
+                  stopAutoScroll();
                   setDragState(null);
                   const startingUsed = t.startSlot?.used || 0;
                   const usedChanged = supportsHalfDay && Math.abs(lastUsed - startingUsed) > DAY_EPSILON;
