@@ -5175,8 +5175,18 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
         const HALF_DAY_MS = 12 * 60 * 60 * 1000;
         const keyOf = (j) => j.priorityRank != null ? j.priorityRank : earliestStart(j);
         const withoutDragged = orderedJobs.filter((_, idx) => idx !== index);
-        const above = withoutDragged[finalTarget - 1];
-        const below = withoutDragged[finalTarget];
+        // finalTarget is an index into orderedJobs (which still includes the
+        // dragged row); withoutDragged has that row removed, so every index
+        // from the dragged row's old position onward is shifted back by one.
+        // Dragging DOWN (index < finalTarget) needs that correction or the
+        // neighbor picked as "below" is one row too far — visually landing
+        // one customer further than the drop-line indicator showed, i.e.
+        // skipping whichever job sat right at the boundary. Dragging UP
+        // needs no adjustment: removing a row from AFTER the target doesn't
+        // shift anything before it.
+        const adjustedTarget = index < finalTarget ? finalTarget - 1 : finalTarget;
+        const above = withoutDragged[adjustedTarget - 1];
+        const below = withoutDragged[adjustedTarget];
         let newRank;
         if (above && below) newRank = (keyOf(above) + keyOf(below)) / 2;
         else if (above) newRank = keyOf(above) + HALF_DAY_MS;
