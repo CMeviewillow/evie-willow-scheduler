@@ -1351,8 +1351,18 @@ function findInstallDayInTargetWeek(targetISO, cabCount, state, holidays, prefer
 //   ← machining ends 1 working day before bench starts
 //   ← machining starts machiningDays before its end
 // This returns the required machining start date.
-function backwardFromInstall(installDate, benchDays, machiningDays, impact, holidays, settings) {
-  const weekBuffer = settings.workshopBufferIdealDays ?? 3;
+//
+// `bufferDaysOverride`, when given, replaces the ideal workshop buffer as
+// the retreat amount — used by the finishing safety valve below, which
+// needs the true "any later than this and install becomes infeasible"
+// boundary (the MINIMUM buffer/dispatch gap), not the ideal one. Retreating
+// from the ideal buffer would flag a job as "infeasible" the moment it eats
+// into that ideal cushion at all, even with days of real slack still left
+// before the actual deadline — bench's own existing forced-overlap fallback
+// below intentionally keeps using the ideal buffer (unchanged, long-relied-on
+// behavior), so this is opt-in per caller, not a change to the default.
+function backwardFromInstall(installDate, benchDays, machiningDays, impact, holidays, settings, bufferDaysOverride) {
+  const weekBuffer = bufferDaysOverride ?? (settings.workshopBufferIdealDays ?? 3);
   // Step back weekBuffer working days from install: that's the day reassembly ENDS
   let d = new Date(installDate.getTime());
   let stepped = 0;
@@ -1392,7 +1402,7 @@ function backwardFromInstall(installDate, benchDays, machiningDays, impact, holi
       if (!isWeekend(machiningStart) && !holidays.has(dayKey(machiningStart))) h--;
     }
   }
-  return { machiningStart, benchStart };
+  return { machiningStart, benchStart, finishStart };
 }
 
 // Schedule a single job into the current state. Returns the tasks and updated state.
@@ -1813,16 +1823,64 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
       });
     }
   } else {
-    finishStartSlot = findFreeBenchSlot(desiredFinishStart, finishActualDays, state.finishingOccupied, holidays);
-    if (compareFractionalSlot(finishStartSlot, desiredFinishStart) > 0) {
+    const asapFinishSlot = findFreeBenchSlot(desiredFinishStart, finishActualDays, state.finishingOccupied, holidays);
+    finishStartSlot = asapFinishSlot;
+    // Same safety valve bench already has above: if every other job's
+    // pinned finishing time is booked wall-to-wall with no gap, the free-slot
+    // search can walk arbitrarily far into the future looking for one —
+    // silently blowing the install date out by months instead of just a few
+    // days. Never search further than the point that would make this job's
+    // OWN install date infeasible anyway; beyond that, force the fit at the
+    // latest position that still protects install, overlapping if it must,
+    // with a loud warning — exactly like bench's forced-overlap fallback.
+    if (pinnedInstallDate) {
+      // The true "any later and install can't be hit" boundary uses the
+      // MINIMUM buffer (same figures earliestFeasible uses below for the
+      // install-nudge check), not the ideal one — see backwardFromInstall's
+      // bufferDaysOverride comment.
+      const minFeasibleBuffer = Math.max(settings.dispatchGapDays ?? 1, settings.workshopBufferMinDays ?? 1);
+      const { finishStart: latestFinishStartDate } = backwardFromInstall(
+        pinnedInstallDate, benchDays, job.machiningDays || 1, impact, holidays, settings, minFeasibleBuffer
+      );
+      let desiredLatestFinishStart = { date: latestFinishStartDate, used: 0 };
+      // Clamp to the earliest finishing can start at all — right after
+      // bench begins. If the deadline implies starting before that, forcing
+      // a slot doesn't help; install-feasibility further down already nudges
+      // the install date forward with its own clear warning in that case.
+      const clampedToStart = compareFractionalSlot(desiredLatestFinishStart, desiredFinishStart) < 0;
+      if (clampedToStart) desiredLatestFinishStart = desiredFinishStart;
+      if (!clampedToStart && compareFractionalSlot(asapFinishSlot, desiredLatestFinishStart) > 0) {
+        finishStartSlot = desiredLatestFinishStart;
+        const forcedEnd = advanceFractionalDay(desiredLatestFinishStart, finishActualDays, holidays);
+        for (const existing of state.finishingOccupied) {
+          if (slotsOverlap(desiredLatestFinishStart, forcedEnd, existing.startSlot, existing.endSlot)) {
+            warnings.push({
+              jobId: job.id,
+              jobName: job.name,
+              type: "buffer_too_tight",
+              message: `Finishing doesn't fit before the ${fmtUK(pinnedInstallDate)} install target without overlapping ${existing.jobName}'s finishing — scheduled anyway to protect the install date, review capacity`,
+            });
+          }
+        }
+      } else if (compareFractionalSlot(asapFinishSlot, desiredFinishStart) > 0) {
+        finishingPushed = true;
+        if (dayKey(asapFinishSlot.date) !== dayKey(desiredFinishStart.date)) {
+          warnings.push({
+            jobId: job.id,
+            jobName: job.name,
+            type: "bunching",
+            message: `Finishing capacity overlap: pushed back from ${fmtUK(desiredFinishStart.date)} to ${fmtUK(asapFinishSlot.date)}`,
+          });
+        }
+      }
+    } else if (compareFractionalSlot(asapFinishSlot, desiredFinishStart) > 0) {
       finishingPushed = true;
-      // Only warn if the push actually moves to a different day
-      if (dayKey(finishStartSlot.date) !== dayKey(desiredFinishStart.date)) {
+      if (dayKey(asapFinishSlot.date) !== dayKey(desiredFinishStart.date)) {
         warnings.push({
           jobId: job.id,
           jobName: job.name,
           type: "bunching",
-          message: `Finishing capacity overlap: pushed back from ${fmtUK(desiredFinishStart.date)} to ${fmtUK(finishStartSlot.date)}`,
+          message: `Finishing capacity overlap: pushed back from ${fmtUK(desiredFinishStart.date)} to ${fmtUK(asapFinishSlot.date)}`,
         });
       }
     }
