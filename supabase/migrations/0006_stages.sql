@@ -9,21 +9,25 @@
 -- loose hours against the job. The rest are overhead/shared work that
 -- isn't tracked per-unit.
 --
--- Bench prep IS a cabinet stage too (frame and door making) — a cabinet
--- isn't complete at this stage until BOTH its frame and its door are
--- done, so it needs the two-part completion model added in
--- 0013_bench_prep_parts.sql (has_parts), not just a plain done/not-done
--- like Cabinet bench.
+-- Frame manufacture, Door manufacture, Drawer manufacture and Skirting
+-- and cornice manufacture are confirmed against a real Clockify export
+-- (Helen & Alex Siviter-Platts, DA1198) as the office's actual categories
+-- — none of them ever carry a cabinet number in real history, unlike
+-- every Bench/Reassembly entry, which always does ("A4s Bench # 7",
+-- "A4s Reassembly # 27"). A frame or door is manufactured in a batch,
+-- not against one specific cabinet, and only becomes cabinet-specific at
+-- the "Bench # N" assembly step — Cabinet bench, already correctly a
+-- plain per-cabinet stage with no parts. An earlier version of this
+-- migration invented a "Bench prep" cabinet stage with a frame/door
+-- split per cabinet; that never matched real practice and has been
+-- removed (see 0013_manufacture_quantities.sql for what replaced it —
+-- a per-day quantity on Frame/Door manufacture instead).
 --
--- Drawer making is its own separate overhead stage (like CNC or
--- Edgebanding), not part of any cabinet's stage progress and not a third
--- Bench prep part — a drawer box isn't numbered/typed against one
--- specific cabinet the way a frame or door is. It exists so real clocked
--- time can eventually be costed against it. The floor board's existing
--- Drawers tab (Harry's daily batch counts) is a separate, real-time
--- production-visibility tool and stays exactly as it is — there's no
--- person or precise time on a batch count to derive labour minutes from,
--- so it doesn't feed this stage's time_entries, it just runs alongside it.
+-- tracks_quantity (see 0013) marks Frame manufacture and Door
+-- manufacture specifically: clocking off asks "how many did you
+-- complete", since that count is what lets the floor board work out how
+-- many cabinets' worth of frames/doors are ready for Cabinet bench today
+-- — each one is worth half a cabinet, the same day's cabinets need both.
 
 create table if not exists stages (
   id uuid primary key default gen_random_uuid(),
@@ -37,14 +41,16 @@ create table if not exists stages (
 
 insert into stages (name, sort_order, is_cabinet_stage, is_overhead) values
   ('CNC', 1, false, true),
-  ('Bench prep', 2, true, false),
-  ('Cabinet bench', 3, true, false),
-  ('Drawer making', 4, false, true),
-  ('Spraying and finishing', 5, false, true),
-  ('Cabinet reassembly', 6, true, false),
-  ('Edgebanding', 7, false, true),
-  ('Timber machining', 8, false, true),
-  ('Production prep', 9, false, true),
-  ('Remakes and fix-ups', 10, true, false),
-  ('Delivery and logistics', 11, false, false),
-  ('Design and admin', 12, false, false);
+  ('Frame manufacture', 2, false, true),
+  ('Door manufacture', 3, false, true),
+  ('Cabinet bench', 4, true, false),
+  ('Drawer manufacture', 5, false, true),
+  ('Skirting and cornice manufacture', 6, false, true),
+  ('Spraying and finishing', 7, false, true),
+  ('Cabinet reassembly', 8, true, false),
+  ('Edgebanding', 9, false, true),
+  ('Timber machining', 10, false, true),
+  ('Production prep', 11, false, true),
+  ('Remakes and fix-ups', 12, true, false),
+  ('Delivery and logistics', 13, false, false),
+  ('Design and admin', 14, false, false);

@@ -9,8 +9,8 @@ import {
 // (the real clock on/off wizard, PIN included) — reached with ?admin=preview,
 // same pattern as ?admin=aliases. One combined tool, not separate screens.
 // Nothing here touches Supabase: the real tables (production_imports,
-// cabinets, room_extras, cabinet_accessories, stage_completions,
-// time_entries) have never been executed against the live database, so this
+// cabinets, room_extras, cabinet_accessories, time_entries) have never
+// been executed against the live database, so this
 // runs entirely on localStorage under the "tt-preview:" prefix, seeded from
 // a real job (DA1277 Anna Reid). PINs are made up for this preview only
 // (see SAMPLE_WORKSHOP_PEOPLE) — real people don't have one until it's set
@@ -111,12 +111,9 @@ const styles = {
   extraNotes: { fontSize: 12, color: C.ink2, lineHeight: 1.5 },
   reviewRow: { display: "flex", alignItems: "center", gap: 6, marginTop: 8, fontSize: 12, color: C.clay },
   checkbox: { width: 15, height: 15 },
-  partBtn: (done) => ({
-    padding: "8px 14px", fontSize: 13, fontWeight: 600, borderRadius: 6, cursor: "pointer",
-    border: done ? `1px solid ${C.sage}` : `1px solid ${C.rule}`,
-    background: done ? C.sage : "#fff", color: done ? "#fff" : "#555",
-    fontFamily: "Inter, sans-serif",
-  }),
+  summaryBar: { display: "flex", gap: 24, background: C.sageBg, border: `1px solid ${C.sage}`, borderRadius: 10, padding: "16px 20px", marginBottom: 8 },
+  summaryNum: { fontSize: 30, fontWeight: 600, color: C.ink, lineHeight: 1 },
+  summaryLabel: { fontSize: 12, color: "#5a6e50", marginTop: 4 },
 
   // wizard
   trail: { display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, marginBottom: 22 },
@@ -315,7 +312,7 @@ function trailSteps(needsCabinet) {
   ];
 }
 
-function ClockWizard({ activeClocks, setActiveClocks, cabinets, completions, setCompletions }) {
+function ClockWizard({ activeClocks, setActiveClocks, cabinets, manufactureLog, setManufactureLog }) {
   const [wiz, setWiz] = useState({ step: WIZ_WHO, person: null, pinEntry: "", pinError: false, stage: "", cabinetItem: "" });
   const [, forceTick] = useState(0);
 
@@ -325,7 +322,10 @@ function ClockWizard({ activeClocks, setActiveClocks, cabinets, completions, set
     return () => clearInterval(t);
   }, [wiz.step]);
 
-  const cabinetOptions = cabinets.filter(c => c.typeName !== "Panel");
+  // A cabinet with no confirmed type yet can't be clocked against — nothing
+  // on the floor board ever types a cabinet, so an unreviewed one simply
+  // isn't offered until the office has matched or created its type.
+  const cabinetOptions = cabinets.filter(c => c.typeName !== "Panel" && !c.needsReview);
   const stageDef = SAMPLE_STAGES.find(s => s.name === wiz.stage);
   const needsCabinet = !!(stageDef && stageDef.isCabinetStage);
 
@@ -351,7 +351,21 @@ function ClockWizard({ activeClocks, setActiveClocks, cabinets, completions, set
     }
   };
 
+  // Frame/Door manufacture ask "how many did you complete" on stop —
+  // confirmed against real Clockify history that this is genuinely batch
+  // work, never against one cabinet, so there's nothing to tap along the
+  // way like a cabinet stage — just a count once the session's over.
   const stop = (person) => {
+    const running = activeClocks[person];
+    const runningStageDef = SAMPLE_STAGES.find(s => s.name === running?.stage);
+    if (runningStageDef?.tracksQuantity) {
+      const raw = window.prompt(`How many did you complete this session (${running.stage})?`, "0");
+      if (raw === null) return; // cancelled — keep the clock running
+      const qty = Math.max(0, parseInt(raw, 10) || 0);
+      const entry = { person, stage: running.stage, quantity: qty, completedAt: Date.now() };
+      const nextLog = [entry, ...manufactureLog];
+      setManufactureLog(nextLog); save("manufactureLog", nextLog);
+    }
     setActive(prev => { const next = { ...prev }; delete next[person]; return next; });
     resetWiz();
   };
@@ -359,12 +373,6 @@ function ClockWizard({ activeClocks, setActiveClocks, cabinets, completions, set
   const goRunning = () => {
     setActive(prev => ({ ...prev, [wiz.person]: { stage: wiz.stage, cabinetItem: needsCabinet ? wiz.cabinetItem : null, startedAt: Date.now() } }));
     setWiz({ ...wiz, step: WIZ_RUNNING });
-  };
-
-  const toggle = (item, part) => {
-    const cur = completions[item] || { frame: false, door: false };
-    const next = { ...completions, [item]: { ...cur, [part]: !cur[part] } };
-    setCompletions(next); save("completions", next);
   };
 
   // ---- who ----
@@ -528,18 +536,17 @@ function ClockWizard({ activeClocks, setActiveClocks, cabinets, completions, set
   const running = activeClocks[wiz.person];
   if (!running) { resetWiz(); return null; }
   const cab = running.cabinetItem ? cabinetOptions.find(c => c.item === running.cabinetItem) : null;
+  const runningStageDef = SAMPLE_STAGES.find(s => s.name === running.stage);
   return (
     <div style={styles.runningWrap}>
       <span style={styles.runningBadge}><span style={styles.pulse} />Running</span>
       <div style={styles.runningClock}>{fmtElapsed(Date.now() - running.startedAt)}</div>
       <div style={styles.runningWhat}>{wiz.person} · {SAMPLE_JOB.da_number} · {running.stage}{cab ? ` · #${cab.item}` : ""}</div>
 
-      {running.stage === "Bench prep" && cab && (
+      {runningStageDef?.tracksQuantity && (
         <div style={styles.partsBox}>
-          <div style={{ fontSize: 12, color: C.ink2, marginBottom: 8 }}>Mark done as you go — frame and door each count half:</div>
-          <button style={styles.partBtn((completions[cab.item] || {}).frame)} onClick={() => toggle(cab.item, "frame")}>Frame</button>
-          {" "}
-          <button style={styles.partBtn((completions[cab.item] || {}).door)} onClick={() => toggle(cab.item, "door")}>Door</button>
+          You'll be asked how many you completed when you stop — that count is what lets the floor board work
+          out how many cabinets' worth of {running.stage.toLowerCase()} are ready today.
         </div>
       )}
 
@@ -548,9 +555,17 @@ function ClockWizard({ activeClocks, setActiveClocks, cabinets, completions, set
   );
 }
 
-function LiveBoardTab({ activeClocks, cabinets }) {
+function isToday(ts) {
+  const d = new Date(ts), now = new Date();
+  return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+}
+
+function LiveBoardTab({ activeClocks, cabinets, manufactureLog }) {
   const entries = Object.entries(activeClocks);
-  const cabinetOptions = cabinets.filter(c => c.typeName !== "Panel");
+  // A cabinet with no confirmed type yet can't be clocked against — nothing
+  // on the floor board ever types a cabinet, so an unreviewed one simply
+  // isn't offered until the office has matched or created its type.
+  const cabinetOptions = cabinets.filter(c => c.typeName !== "Panel" && !c.needsReview);
   const [, forceTick] = useState(0);
   useEffect(() => {
     if (entries.length === 0) return;
@@ -561,8 +576,35 @@ function LiveBoardTab({ activeClocks, cabinets }) {
   // Flag any stage+cabinet combo two or more people are on at once.
   const shared = entries.filter(([p, r]) => r.cabinetItem && entries.some(([p2, r2]) => p2 !== p && r2.stage === r.stage && r2.cabinetItem === r.cabinetItem));
 
+  const todaysLog = manufactureLog.filter(e => isToday(e.completedAt));
+  const framesToday = todaysLog.filter(e => e.stage === "Frame manufacture").reduce((a, e) => a + e.quantity, 0);
+  const doorsToday = todaysLog.filter(e => e.stage === "Door manufacture").reduce((a, e) => a + e.quantity, 0);
+  const cabinetsReady = Math.min(framesToday, doorsToday);
+
   return (
     <div>
+      <div style={styles.sectionTitle}>Frame &amp; Door progress today</div>
+      <div style={styles.summaryBar}>
+        <div>
+          <div style={styles.summaryNum}>{framesToday}</div>
+          <div style={styles.summaryLabel}>frames completed</div>
+        </div>
+        <div>
+          <div style={styles.summaryNum}>{doorsToday}</div>
+          <div style={styles.summaryLabel}>doors completed</div>
+        </div>
+        <div>
+          <div style={styles.summaryNum}>{cabinetsReady}</div>
+          <div style={styles.summaryLabel}>cabinets' worth ready for bench</div>
+        </div>
+      </div>
+      <div style={styles.note}>
+        A cabinet needs both a frame and a door, so it's the smaller of the two totals that's genuinely ready —
+        {framesToday !== doorsToday && framesToday + doorsToday > 0
+          ? ` today ${framesToday > doorsToday ? "frames are" : "doors are"} ahead.`
+          : ""}
+      </div>
+
       <div style={styles.sectionTitle}>Running now</div>
       {entries.length === 0 ? (
         <div style={styles.emptyLive}>Nobody's clocked on right now — try the Clock on/off tab.</div>
@@ -601,24 +643,24 @@ export default function TimeTrackerPreview() {
   const [cabinets, setCabinets] = useState(() => load("cabinets", null) || initialCabinets());
   const [extras, setExtras] = useState(() => load("extras", null) || initialExtras());
   const [accessories, setAccessories] = useState(() => load("accessories", null) || initialAccessories());
-  const [completions, setCompletions] = useState(() => load("completions", null) || {});
   const [activeClocks, setActiveClocks] = useState(() => load("activeClocks", null) || {});
+  const [manufactureLog, setManufactureLog] = useState(() => load("manufactureLog", null) || []);
 
   const resetDemo = () => {
-    if (!window.confirm("Reset this preview back to the original Anna Reid sample data? This also clears who's clocked on.")) return;
+    if (!window.confirm("Reset this preview back to the original Anna Reid sample data? This also clears who's clocked on and today's manufacture counts.")) return;
     const c = initialCabinets(), e = initialExtras(), a = initialAccessories();
     setCabinets(c); save("cabinets", c);
     setExtras(e); save("extras", e);
     setAccessories(a); save("accessories", a);
-    setCompletions({}); save("completions", {});
     setActiveClocks({}); save("activeClocks", {});
+    setManufactureLog([]); save("manufactureLog", []);
   };
 
   return (
     <div style={styles.wrap}>
       <div style={styles.banner}>
         <strong>Preview, not live.</strong> The real database tables for this (cabinets, room_extras,
-        cabinet_accessories, stage_completions, time_entries) have never been run against Supabase yet —
+        cabinet_accessories, time_entries) have never been run against Supabase yet —
         everything here saves to this browser only, seeded from a real job (DA1277 Anna Reid). PINs are made
         up for this preview (see the code comment). Nothing you do on this page touches the main schedule or
         floor board. <a href="#" onClick={(e) => { e.preventDefault(); resetDemo(); }}>Reset to sample data</a>
@@ -637,10 +679,10 @@ export default function TimeTrackerPreview() {
           <ImportReviewTab cabinets={cabinets} setCabinets={setCabinets} extras={extras} setExtras={setExtras} accessories={accessories} setAccessories={setAccessories} />
         )}
         {tab === "clock" && (
-          <ClockWizard activeClocks={activeClocks} setActiveClocks={setActiveClocks} cabinets={cabinets} completions={completions} setCompletions={setCompletions} />
+          <ClockWizard activeClocks={activeClocks} setActiveClocks={setActiveClocks} cabinets={cabinets} manufactureLog={manufactureLog} setManufactureLog={setManufactureLog} />
         )}
         {tab === "live" && (
-          <LiveBoardTab activeClocks={activeClocks} cabinets={cabinets} />
+          <LiveBoardTab activeClocks={activeClocks} cabinets={cabinets} manufactureLog={manufactureLog} />
         )}
       </div>
     </div>

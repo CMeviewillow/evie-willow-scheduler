@@ -1,8 +1,8 @@
 // Local-only preview fixture for the time tracker's Phase 2/3 screens.
 //
 // The real Supabase tables (production_imports, cabinets, room_extras,
-// cabinet_accessories, stage_completions, etc.) have never been executed
-// against the live database — this preview runs entirely on localStorage
+// cabinet_accessories, time_entries.quantity_completed, etc.) have never
+// been executed against the live database — this preview runs entirely on localStorage
 // so it can be tried out before committing to that step. See
 // docs/time-tracker.md and the project_time_tracker_phase2_groundwork
 // memory for the reasoning behind every figure here.
@@ -84,7 +84,9 @@ export const SAMPLE_ACCESSORIES = [
   { label: "Spice/Jars Racks", cabinetItem: null, rawSpecText: "Spice/Jars Racks — TBC", productCode: null },
 ];
 
-// The real seeded team (0001_people.sql), workshop names only. PINs here
+// The full real seeded team (0001_people.sql) — everyone, not just the
+// workshop subset, since office people (Design and admin, Delivery and
+// logistics) and fitters (Remakes and fix-ups) clock time too. PINs here
 // are made up for this preview only — real people aren't seeded with a
 // PIN in 0001_people.sql on purpose (a placeholder number in a migration
 // would read as real data); real PINs get set per person via the
@@ -100,23 +102,37 @@ export const SAMPLE_WORKSHOP_PEOPLE = [
   { name: "Wayne", pin: "8888" },
   { name: "Glenn", pin: "9999" },
   { name: "Mark", pin: "0000" },
+  { name: "Steve", pin: "1212" },
+  { name: "Thompson", pin: "1313" },
+  { name: "Callum", pin: "1414" },
+  { name: "Abi", pin: "1515" },
+  { name: "Louise", pin: "1616" },
+  { name: "Martin", pin: "1717" },
+  { name: "Victoria", pin: "1818" },
+  { name: "Becky", pin: "1919" },
 ];
 
-// The 12 production stages (0006_stages.sql). isCabinetStage drives
-// whether a cabinet must be picked before clocking on; hasParts (Bench
-// prep only) drives whether it's a frame/door tap instead of a plain
-// timer.
+// The 14 production stages (0006_stages.sql), confirmed against a real
+// Clockify export (Helen & Alex Siviter-Platts, DA1198 — see
+// docs/time-tracker.md "Frame and Door manufacture"). isCabinetStage
+// drives whether a cabinet must be picked before clocking on. tracksQuantity
+// (Frame/Door manufacture only) drives whether stopping the clock asks
+// "how many did you complete" — real history shows these are batch work,
+// never logged against one specific cabinet, unlike Cabinet bench/
+// reassembly which always carry a cabinet number.
 export const SAMPLE_STAGES = [
-  { name: "CNC", isCabinetStage: false, hasParts: false },
-  { name: "Bench prep", isCabinetStage: true, hasParts: true },
-  { name: "Cabinet bench", isCabinetStage: true, hasParts: false },
-  { name: "Drawer making", isCabinetStage: false, hasParts: false },
-  { name: "Spraying and finishing", isCabinetStage: false, hasParts: false },
-  { name: "Cabinet reassembly", isCabinetStage: true, hasParts: false },
-  { name: "Edgebanding", isCabinetStage: false, hasParts: false },
-  { name: "Timber machining", isCabinetStage: false, hasParts: false },
-  { name: "Production prep", isCabinetStage: false, hasParts: false },
-  { name: "Remakes and fix-ups", isCabinetStage: true, hasParts: false },
-  { name: "Delivery and logistics", isCabinetStage: false, hasParts: false },
-  { name: "Design and admin", isCabinetStage: false, hasParts: false },
+  { name: "CNC", isCabinetStage: false, tracksQuantity: false },
+  { name: "Frame manufacture", isCabinetStage: false, tracksQuantity: true },
+  { name: "Door manufacture", isCabinetStage: false, tracksQuantity: true },
+  { name: "Cabinet bench", isCabinetStage: true, tracksQuantity: false },
+  { name: "Drawer manufacture", isCabinetStage: false, tracksQuantity: false },
+  { name: "Skirting and cornice manufacture", isCabinetStage: false, tracksQuantity: false },
+  { name: "Spraying and finishing", isCabinetStage: false, tracksQuantity: false },
+  { name: "Cabinet reassembly", isCabinetStage: true, tracksQuantity: false },
+  { name: "Edgebanding", isCabinetStage: false, tracksQuantity: false },
+  { name: "Timber machining", isCabinetStage: false, tracksQuantity: false },
+  { name: "Production prep", isCabinetStage: false, tracksQuantity: false },
+  { name: "Remakes and fix-ups", isCabinetStage: true, tracksQuantity: false },
+  { name: "Delivery and logistics", isCabinetStage: false, tracksQuantity: false },
+  { name: "Design and admin", isCabinetStage: false, tracksQuantity: false },
 ];

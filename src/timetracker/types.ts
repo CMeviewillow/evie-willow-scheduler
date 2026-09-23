@@ -89,13 +89,12 @@ export interface Stage {
   sort_order: number;
   is_cabinet_stage: boolean;
   is_overhead: boolean;
-  has_parts: boolean;
+  tracks_quantity: boolean;
   created_at: string;
   updated_at: string;
 }
 
 export type TimeEntrySource = "board" | "manual" | "auto_closed" | "imported";
-export type StagePart = "frame" | "door";
 
 export interface TimeEntry {
   id: string;
@@ -104,7 +103,10 @@ export interface TimeEntry {
   room_id: string | null;
   cabinet_id: string | null;
   stage_id: string;
-  part: StagePart | null;
+  // Required once stopped_at is set, for a tracks_quantity stage (Frame
+  // manufacture, Door manufacture) — "how many did you complete" this
+  // session. Null for every other stage.
+  quantity_completed: number | null;
   started_at: string;
   stopped_at: string | null;
   break_minutes_deducted: number;
@@ -148,31 +150,20 @@ export interface CabinetStageTotals {
   session_count: number;
 }
 
-// What the floor board reads to know how much of a cabinet is done at a
-// stage — 1 for a plain stage, 0.5/1 for a has_parts stage with one/both
-// parts done. Backed by the cabinet_stage_progress view.
-export interface CabinetStageProgress {
-  cabinet_id: string;
-  stage_id: string;
-  has_parts: boolean;
-  fraction_complete: number;
-  last_completed_at: string | null;
-}
-
-// The discrete "this is actually done" event — separate from TimeEntry,
-// which only ever records continuous labour time. Phase 3's floor board
-// tap writes here.
-export interface StageCompletion {
-  id: string;
-  cabinet_id: string;
-  stage_id: string;
-  part: StagePart | null;
-  completed_by: string;
-  completed_at: string;
-  source: "board" | "manual";
-  notes: string | null;
-  created_at: string;
-  updated_at: string;
+// What the floor board would read for Frame/Door manufacture: how many
+// cabinets' worth of each are done for a job/room/day, and the smaller
+// of the two — the number genuinely ready for Cabinet bench, since a
+// cabinet needs both. Backed by the frame_door_progress_by_day view.
+// Confirmed against a real Clockify export that frame/door manufacture
+// is always batch work, never logged against one specific cabinet — see
+// docs/time-tracker.md and 0013_manufacture_quantities.sql.
+export interface FrameDoorProgressByDay {
+  job_id: string;
+  room_id: string | null;
+  work_date: string;
+  frames_completed: number | null;
+  doors_completed: number | null;
+  cabinets_ready_for_bench: number;
 }
 
 export type RoomExtraKind = "skirting" | "cornice";

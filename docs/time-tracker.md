@@ -49,14 +49,14 @@ executed yet.
 | 0003 | `jobs` | `da_number`, client, and a status ladder: `quoted → setup → released → in_production → delivered → complete`. `setup` means a Production import is under way; `released` means every cabinet on the job has a type. |
 | 0004 | `rooms` | Cabinet numbering restarts per room (`Kitchen`, `Utility`, ...), so cabinet numbers are only unique within a room. |
 | 0005 | `cabinet_types` | The master list — the thing that makes cross-job pooling possible. Only ever created via the phase 2 import review screen or an admin screen, both office-side. Anything created during an import is flagged `needs_office_review`. |
-| 0006 | `stages` | The 12 production stages (including `Drawer making`, its own overhead stage — see "Bench prep: frame and door" below for why it's not a cabinet stage). `is_cabinet_stage` (`Bench prep`, `Cabinet bench`, `Cabinet reassembly`, `Remakes and fix-ups`) drives whether the floor board asks which cabinet a timer is against; `has_parts` (added in 0013) narrows that further for Bench prep. |
+| 0006 | `stages` | The 14 production stages, confirmed against a real Clockify export (see "Frame and Door manufacture" below) — `Frame manufacture`, `Door manufacture`, `Drawer manufacture` and `Skirting and cornice manufacture` are real categories the office already uses, none of them cabinet-specific. `is_cabinet_stage` (`Cabinet bench`, `Cabinet reassembly`, `Remakes and fix-ups`) drives whether the floor board asks which cabinet a timer is against; `tracks_quantity` (added in 0013) marks Frame/Door manufacture as needing a completed-count when clocking off. |
 | 0007 | `production_imports` | One row per Production-schedule import attempt (phase 2 writes here). Keeps the raw extracted text so a parse can be re-run without asking for the file again. Named source-agnostically, not `a4_imports` — see "The core idea" above. |
 | 0008 | `cabinets` | One row per physical cabinet. `cabinet_type_id` is nullable at import, required before the job can release. Decimal numbers (`#14`, `#14.1`) are real, distinct components — confirmed against a real Cabinet Vision export — not a typo or a duplicate. Rows with "Skirting" in the description are never created here — see "Skirting and cornice" below. |
-| 0009 | `time_entries` | The actual clock on/off records. See concurrency rules below. `part` (added in 0013) is required exactly when the stage `has_parts`. |
+| 0009 | `time_entries` | The actual clock on/off records. See concurrency rules below. `quantity_completed` (added in 0013) is required when stopping a `tracks_quantity` stage. |
 | 0010 | `cabinet_stage_totals` (view) | Rolls `time_entries` up per cabinet/stage into both labour minutes and elapsed minutes, for costing and capacity respectively. |
 | 0011 | job release guard (trigger) | Blocks `jobs.status` moving to `released` while any cabinet on the job still has `cabinet_type_id = null`. Enforced in the database, not just the UI. |
-| 0012 | RLS (phase 1 tables) | Enables row level security on every phase 1 table with a permissive allow-all policy, matching how the existing `kv_store` table already runs (anon key, no `auth.*` calls anywhere in the app). See "Auth" below. Tables added after this migration enable their own RLS inline instead (0013–0015), since they don't exist yet when this one runs. |
-| 0013 | `stage_completions` (+ `has_parts`, `time_entries.part`, `cabinet_stage_progress` view) | The discrete "this is actually done" event that `time_entries` never had — see "Bench prep: frame and door" below. |
+| 0012 | RLS (phase 1 tables) | Enables row level security on every phase 1 table with a permissive allow-all policy, matching how the existing `kv_store` table already runs (anon key, no `auth.*` calls anywhere in the app). See "Auth" below. Tables added after this migration enable their own RLS inline instead (0014–0015), since they don't exist yet when this one runs. |
+| 0013 | `tracks_quantity`, `time_entries.quantity_completed`, `frame_door_progress_by_day` (view) | How many cabinets' worth of frames/doors are done per job/room/day, and the smaller of the two — see "Frame and Door manufacture" below. |
 | 0014 | `room_extras` | Skirting/cornice linear metreage, per room — see "Skirting and cornice" below. |
 | 0015 | `cabinet_accessories` | Spec Sheet-sourced bought-in extras (dividers, racks, inserts, bins) — see "Spec Sheet extras" below. |
 
@@ -94,33 +94,51 @@ that cabinet type. Two things make that work:
   jobs — any released job stays selectable regardless of `status`, since a
   remedial can land months after a job shows `delivered` or `complete`.
 
-## Bench prep: frame and door
+## Frame and Door manufacture
 
-A cabinet isn't complete at Bench prep until **both its frame and its door**
-are done — so unlike Cabinet bench or Cabinet reassembly (where one done
-event means the whole cabinet), Bench prep needs two, each worth half.
-Drawer making is deliberately **not** a third part here — it's its own
-stage (`Drawer making`, `is_overhead = true`), not tied to any cabinet at
-all: a drawer box isn't numbered/typed against one specific cabinet the way
-a frame or door is. It exists purely so real clocked time can eventually be
-costed against it, same as CNC or Edgebanding. The floor board's existing
-"Drawers" tab (Harry's daily batch counts by label + quantity) is a
-separate, real-time production-visibility tool and stays exactly as it is
-— there's no person or precise time on a batch count to derive labour
-minutes from, so it runs alongside this stage rather than feeding it.
+An earlier version of this doc had a `Bench prep` cabinet stage with a
+frame/door split per cabinet (a frame tap + a door tap = one cabinet done,
+each worth half). **A real Clockify export proved that wrong.** Checked
+every task category in a full-year detailed report (Helen & Alex
+Siviter-Platts, DA1198): `Frame manufacture and assembly`, `Door
+manufacture and assembly` and `Drawer Box manufacture and assembly` never
+once carry a cabinet number in real history — they're batch work, someone
+spends a session making a batch of frames or doors, not "frame for #7".
+Every `Cabinet bench` and `Cabinet reassembly` entry, by contrast, always
+does (`A4s Bench # 7`, `A4s Reassembly # 27`) — confirming `Cabinet bench`
+was already correctly modelled from day one (plain `is_cabinet_stage`, no
+parts); the mistake was inventing a parts-model for the wrong stage.
 
-This also exposed a real gap: `time_entries` only ever recorded continuous
-clock-on/clock-off **time**, with no discrete "this is actually done" event
-— but the floor board counts finished cabinets, not minutes. `time_entries`
-stays exactly as it was (still the source for costing), and
-`stage_completions` (0013) is the new, separate discrete event Phase 3's
-floor board tap will write to. `stages.has_parts` marks which stages need a
-completion row **per part** instead of one for the whole cabinet — today
-that's Bench prep only, with exactly `frame`/`door`. `cabinet_stage_progress`
-(a view) is what the floor board actually reads: a fraction per cabinet per
-stage, `0.5`/`1` for a has-parts stage, `1` for a plain one.
+What's real instead: `Frame manufacture` and `Door manufacture` are plain
+overhead stages like CNC, but each is `tracks_quantity = true` — clocking
+off asks "how many did you complete" (mirrors the floor board's existing
+Drawers-tab pattern of a label + a count, just per session instead of per
+batch-label). The point of counting at all: a cabinet still isn't ready
+for Cabinet bench until **both** its frame and its door exist, so the
+"half each" idea from the original ask survives — it's just applied **per
+day**, not per cabinet-tap. If today's frame batch finishes 9 units and
+today's door batch finishes 9 units, that's 9 cabinets' worth of both,
+ready for bench; if frames only reach 5, only 5 are genuinely ready
+regardless of how many doors exist. `frame_door_progress_by_day` (0013,
+per job/room/day) exposes the frame total, the door total, and
+`cabinets_ready_for_bench` (the smaller of the two) — separately, not
+blended into one number, since a lopsided day (doors way ahead of frames)
+should stay visible, not hidden.
 
-Cutlery/utensil dividers built into a drawer are **not** a separate part —
+`Drawer manufacture` (renamed from `Drawer making` to match the real
+Clockify label) and `Skirting and cornice manufacture` (new, also
+confirmed from the same export) are plain time-tracked overhead stages —
+no quantity, no cabinet. Skirting/cornice specifically: `room_extras`
+(0014) already holds the *material* side (linear metres to order); this
+stage is the *labour* side (time spent manufacturing/fitting it) — related
+concepts, deliberately separate tables. The floor board's existing
+"Drawers" tab (Harry's daily batch counts by label + quantity) stays
+exactly as it is regardless — it's a separate, real-time
+production-visibility tool with no person or precise time on a count to
+derive labour minutes from, so it runs alongside `Drawer manufacture`
+rather than feeding it.
+
+Cutlery/utensil dividers built into a drawer are **not** their own line —
 confirmed against a real cutlist that a divider that's genuinely built (not
 bought-in, see "Spec Sheet extras" below) is absorbed into its host drawer's
 own cutlist with no distinct schedule line of its own.
@@ -172,7 +190,7 @@ Cutlery dividers, utensil dividers, spice rack inserts, veg crates, bins,
 and similar **bought-in** accessories are called out on the **Spec Sheet
 only** — never on the Production file (A3 or A4). Confirmed against a real
 cutlist that a divider actually built by the bench has no distinct schedule
-line of its own (see "Bench prep" above), so these carry no bench time —
+line of its own (see "Frame and Door manufacture" above), so these carry no bench time —
 `cabinet_accessories` (0015) is a plain ordered/fitted checklist, not
 another time-tracked stage.
 
@@ -204,11 +222,11 @@ control: anyone with the anon key can read and write everything. Proper auth
 ## TypeScript types
 
 `src/timetracker/types.ts` exports one interface per table plus the
-`cabinet_stage_totals` and `cabinet_stage_progress` views, all from a single
-file. Note this repo has no TypeScript build step (Vite + plain `.jsx`, no
-`tsconfig.json`) — these types aren't checked against any consuming code
-yet. They're the source of truth for the schema's shape ahead of phases 2
-and 3.
+`cabinet_stage_totals` and `frame_door_progress_by_day` views, all from a
+single file. Note this repo has no TypeScript build step (Vite + plain
+`.jsx`, no `tsconfig.json`) — these types aren't checked against any
+consuming code yet. They're the source of truth for the schema's shape
+ahead of phases 2 and 3.
 
 ## Extending the cabinet type master list
 
@@ -238,12 +256,15 @@ phase 1 — the office should correct any that are wrong.
   matching, the skirting/cornice calculation surfaced for office review, the
   Spec Sheet extras cross-check, and the review screen Abi uses before
   releasing a job.
-- Phase 3: clock on/off on the floor board, the discrete "mark this
-  frame/door/cabinet done" tap that writes `stage_completions`, the
-  live-timer view, break deduction, the runaway-timer auto-close cron, and
-  the manual-edit review queue.
-- Wiring the floor board's "This week" plan to read `cabinet_stage_progress`
-  instead of (or alongside) its current auto-computed suggestion — the
-  actual point of all of this, still ahead once phases 2 and 3 exist.
+- Phase 3: clock on/off on the floor board, the "how many did you
+  complete" prompt that writes `time_entries.quantity_completed` when
+  stopping a Frame/Door manufacture session, the live-timer view, break
+  deduction, the runaway-timer auto-close cron, and the manual-edit review
+  queue.
+- Wiring the floor board's "This week" plan to read
+  `frame_door_progress_by_day` (and `cabinet_stage_totals` for Cabinet
+  bench/reassembly) instead of (or alongside) its current auto-computed
+  suggestion — the actual point of all of this, still ahead once phases 2
+  and 3 exist.
 - Reporting views and the quoting tool — planned for a later branch, after
   phases 2 and 3.
