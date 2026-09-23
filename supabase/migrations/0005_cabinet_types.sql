@@ -33,13 +33,16 @@ create index if not exists idx_cabinet_types_needs_review on cabinet_types (need
 -- are a reasonable first guess from the name alone; the office should
 -- correct any that are wrong via the admin screen rather than treating
 -- them as fixed.
+--
+-- Deliberately NOT seeded: any "...ShP Skirting..." style name. Confirmed
+-- against a real job that these are never real cabinets — see the note
+-- in 0008_cabinets.sql.
 insert into cabinet_types (name, category, carries_reassembly) values
   ('Base 3 Drawers 60', 'base', true),
   ('Base Dwr Line 1D-PD 110', 'base', true),
   ('Base Sink PD 80', 'base', true),
   ('Base Intg DW Door 67', 'base', true),
   ('Base Double Bin 48', 'base', true),
-  ('Base Bd ShP Skirting', 'base', true),
   ('Base 2 Oak Chopping Boards', 'base', true),
   ('Tall PD 80', 'tall', true),
   ('Tall SD 67', 'tall', true),

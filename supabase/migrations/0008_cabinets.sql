@@ -11,6 +11,15 @@
 -- (a skirting/post unit) was followed by "#14.1" (a separate shaker panel
 -- that belongs with it), each independently typed. Both are their own
 -- row here.
+--
+-- EXCLUDED from import: any item whose description contains "Skirting"
+-- (e.g. "Base ShP Skirting", "Base DBL ShP Skirting RH"). Confirmed with
+-- the office (DA1277 Anna Reid): these are an end panel with a skirting-
+-- attachment strip built in for site fitting, not a real cabinet and not
+-- the continuous skirting run itself — that run is a linear-metreage
+-- figure for the whole room, tracked in room_extras, not itemized here.
+-- The importer should skip these rows entirely rather than create a
+-- cabinet row for them.
 
 create table if not exists cabinets (
   id uuid primary key default gen_random_uuid(),
@@ -18,7 +27,7 @@ create table if not exists cabinets (
   cabinet_number numeric not null,
   cabinet_type_id uuid references cabinet_types(id),
   raw_description text,
-  import_batch_id uuid references a4_imports(id),
+  import_batch_id uuid references production_imports(id),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (room_id, cabinet_number)

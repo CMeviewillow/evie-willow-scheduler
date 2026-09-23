@@ -8,6 +8,14 @@
 -- type comes back for rework most, instead of a remedial just being
 -- loose hours against the job. The rest are overhead/shared work that
 -- isn't tracked per-unit.
+--
+-- Bench prep IS a cabinet stage too (frame and door making) — a cabinet
+-- isn't complete at this stage until BOTH its frame and its door are
+-- done, so it needs the two-part completion model added in
+-- 0013_bench_prep_parts.sql (has_parts), not just a plain done/not-done
+-- like Cabinet bench. Drawer making stays off this stage entirely — the
+-- floor board already tracks drawer boxes on its own separate tab, not
+-- as part of any cabinet's stage progress.
 
 create table if not exists stages (
   id uuid primary key default gen_random_uuid(),
@@ -21,7 +29,7 @@ create table if not exists stages (
 
 insert into stages (name, sort_order, is_cabinet_stage, is_overhead) values
   ('CNC', 1, false, true),
-  ('Bench prep', 2, false, true),
+  ('Bench prep', 2, true, false),
   ('Cabinet bench', 3, true, false),
   ('Spraying and finishing', 4, false, true),
   ('Cabinet reassembly', 5, true, false),
