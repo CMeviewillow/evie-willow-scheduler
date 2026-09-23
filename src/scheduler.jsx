@@ -7539,7 +7539,13 @@ const FLOOR_BOARD_CSS = `
   .floor-board-root .wp-input{width:56px;flex:none;border:1px solid var(--rule);border-radius:4px;
     padding:5px 7px;font-size:13px;text-align:right;font-family:Inter,sans-serif;color:var(--ink);background:#fff}
   .floor-board-root .wp-input:focus{outline:2px solid var(--sage);outline-offset:1px}
-  .floor-board-root .wp-empty{font-size:12px;color:var(--ink3);font-style:italic}
+  .floor-board-root .wp-remove{flex:none;width:22px;height:22px;border:1px solid var(--rule);border-radius:4px;
+    background:#fff;color:var(--ink3);font-size:14px;line-height:1;padding:0;font-family:Inter,sans-serif}
+  .floor-board-root .wp-remove:hover{border-color:var(--clay);color:var(--clay)}
+  .floor-board-root .wp-add{width:100%;margin-top:4px;padding:5px 0;border:1px dashed var(--rule);border-radius:4px;
+    background:transparent;color:var(--ink3);font-size:11px;font-family:Inter,sans-serif}
+  .floor-board-root .wp-add:hover{border-color:var(--sage);color:#5a6e50}
+  .floor-board-root .wp-empty{font-size:12px;color:var(--ink3);font-style:italic;margin-bottom:2px}
   .floor-board-root .batch-toggle button.no[aria-pressed="true"]{background:var(--clay-bg);color:var(--clay);border-color:var(--clay);font-weight:600}
   .floor-board-root .batch-empty{font-size:12px;color:var(--ink3);font-style:italic}
   @media (prefers-reduced-motion:reduce){.floor-board-root *{transition:none!important}}
@@ -7616,16 +7622,54 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
 
   let today = {}, yesterday = {}, weekToDate = {}, offPlan = [], notes = [], extraJobs = {}, selected = {};
   let drawerBatches = [], activeTab = "today";
-  let weeklyTargets = {}; // { [dateISO]: { [stageKey]: { [jobId]: count } } }
+  // Harry/Jon's own weekly plan, all keyed by date then stage:
+  //   weeklyTargets: { [dateISO]: { [stageKey]: { [jobId]: count } } } — a saved count override
+  //   weeklyRemoved: { [dateISO]: { [stageKey]: [jobId, ...] } } — auto-scheduled jobs they've hidden
+  //     for that day (e.g. a job the schedule still lists but is actually already finished)
+  //   weeklyExtra:   { [dateISO]: { [stageKey]: [{jobId,jobName,...}, ...] } } — jobs they've picked
+  //     that the auto schedule didn't put there that day
+  // This is the ONLY way to change which jobs appear — the schedule's own auto placement is just
+  // the starting suggestion, never the final word, since it can drift from what's really on the floor.
+  let weeklyTargets = {}, weeklyRemoved = {}, weeklyExtra = {};
+
+  async function loadWeeklyPlan() {
+    const raw = await load(weekPlanKeyFor(new Date()));
+    if (raw && (raw.targets || raw.removed || raw.extra)) {
+      weeklyTargets = raw.targets || {};
+      weeklyRemoved = raw.removed || {};
+      weeklyExtra = raw.extra || {};
+    } else {
+      // Old shape (pre-add/remove): the saved value WAS the targets map.
+      weeklyTargets = raw || {};
+      weeklyRemoved = {};
+      weeklyExtra = {};
+    }
+  }
+  function saveWeeklyPlan() {
+    queueSave(weekPlanKeyFor(new Date()), { targets: weeklyTargets, removed: weeklyRemoved, extra: weeklyExtra });
+  }
+
+  // The real job list for a given day/stage: the auto suggestion, minus anything
+  // Harry/Jon removed, plus anything they added — this is what every render
+  // function should treat as "the plan," not the raw auto-scheduled list.
+  function stagePlanFor(dateISO, stageKey, autoJobs) {
+    const removed = ((weeklyRemoved[dateISO] || {})[stageKey]) || [];
+    const extra = ((weeklyExtra[dateISO] || {})[stageKey]) || [];
+    const kept = (autoJobs || []).filter(j => removed.indexOf(j.jobId) === -1);
+    const extraFiltered = extra.filter(ej => kept.every(j => j.jobId !== ej.jobId));
+    return kept.concat(extraFiltered);
+  }
 
   // Every job's `planned` count for TODAY, with Harry/Jon's own weekly-plan
-  // number (if they've set one for this job/stage/day) overriding the
+  // additions/removals/number (if they've set one for this job/stage/day) overriding the
   // auto-computed suggestion — everything downstream (targetFor, the chips,
   // yesterday's recap) reads `planned` off whatever this returns, so setting
   // the override here is enough to make it take everywhere at once.
   function jobsAt(stageKey) {
-    const base = (planRef.current.stages[stageKey] || []).concat(extraJobs[stageKey] || []);
-    const overrides = (weeklyTargets[iso(new Date())] || {})[stageKey] || {};
+    const dISO = iso(new Date());
+    const autoJobs = (planRef.current.stages[stageKey] || []).concat(extraJobs[stageKey] || []);
+    const base = stagePlanFor(dISO, stageKey, autoJobs);
+    const overrides = (weeklyTargets[dISO] || {})[stageKey] || {};
     return base.map(j => (j.jobId in overrides) ? { ...j, planned: overrides[j.jobId] } : j);
   }
   function countAt(stageKey, jobId) {
@@ -7747,22 +7791,22 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     }).join("");
   }
 
-  // "This week" tab: Monday-Friday x department grid. Each cell lists
-  // whichever job(s) the main schedule already has queued there that day
-  // (pulled straight from weekPlanRef, the same auto-computed data "Today"
-  // uses, just for every day this week instead of only today) with an
-  // editable number input next to each — pre-filled with the auto
-  // suggestion, or Harry/Jon's own saved number if they've already set one.
+  // "This week" tab: Monday-Friday x department grid. Each cell starts from
+  // whichever job(s) the main schedule has queued there that day (pulled from
+  // weekPlanRef, the same auto-computed data "Today" uses, just for every day
+  // this week instead of only today) — but that's only ever the SUGGESTION.
+  // Harry/Jon can remove a job that's wrong (e.g. the schedule still lists it
+  // but it's actually already finished) and add any other active job instead,
+  // via stagePlanFor(); the number next to each is editable the same as before.
   function renderWeekPlan() {
     const monday = mondayOf(new Date());
     const days = [0, 1, 2, 3, 4].map(i => addDays(monday, i));
     $("weekplan").innerHTML = days.map(d => {
       const dISO = iso(d);
-      const dayBrief = weekPlanRef.current[dISO] || { stages: {} };
+      const dayBrief = weekPlanRef.current[dISO] || { stages: {}, allJobs: [] };
       const dayLabel = d.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "short" });
       const stageBlocks = FLOOR_STAGES.map(s => {
-        const jobs = dayBrief.stages[s.key] || [];
-        if (!jobs.length) return "";
+        const jobs = stagePlanFor(dISO, s.key, dayBrief.stages[s.key] || []);
         const rows = jobs.map(j => {
           const saved = ((weeklyTargets[dISO] || {})[s.key] || {})[j.jobId];
           const value = saved != null ? saved : Math.round(j.planned);
@@ -7772,20 +7816,66 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
             <input class="wp-input" type="number" min="0" inputmode="numeric"
               data-wp-date="${dISO}" data-wp-stage="${s.key}" data-wp-job="${j.jobId}"
               value="${value}" aria-label="${s.name} target for ${escapeHtml(j.jobName)} on ${dayLabel}" />
+            <button class="wp-remove" data-wp-remove-date="${dISO}" data-wp-remove-stage="${s.key}" data-wp-remove-job="${j.jobId}"
+              aria-label="Remove ${escapeHtml(j.jobName)} from ${s.name} on ${dayLabel}">&times;</button>
           </div>`;
         }).join("");
         return `
         <div class="wp-stage">
           <div class="wp-stage-name">${s.name}</div>
-          ${rows}
+          ${rows || `<div class="wp-empty">Nothing booked</div>`}
+          <button class="wp-add" data-wp-add-date="${dISO}" data-wp-add-stage="${s.key}"
+            aria-label="Add a job to ${s.name} on ${dayLabel}">+ add job</button>
         </div>`;
       }).join("");
       return `
       <div class="wp-day">
         <div class="wp-day-name serif">${dayLabel}</div>
-        ${stageBlocks || `<div class="wp-empty">Nothing booked</div>`}
+        ${stageBlocks}
       </div>`;
     }).join("");
+  }
+
+  function addJobToWeekPlan(dateISO, stageKey) {
+    const dayBrief = weekPlanRef.current[dateISO] || { stages: {}, allJobs: [] };
+    const already = stagePlanFor(dateISO, stageKey, dayBrief.stages[stageKey] || []).map(j => j.jobId);
+    const options = (dayBrief.allJobs || []).filter(j => already.indexOf(j.jobId) === -1);
+    if (!options.length) return;
+    const pick = window.prompt(
+      "Add a job to " + stageKey + ":\n\n" +
+      options.map((j, i) => (i + 1) + ". " + j.jobName).join("\n") +
+      "\n\nType a number:"
+    );
+    const idx = parseInt(pick, 10) - 1;
+    if (isNaN(idx) || !options[idx]) return;
+    weeklyExtra = { ...weeklyExtra };
+    weeklyExtra[dateISO] = { ...(weeklyExtra[dateISO] || {}) };
+    weeklyExtra[dateISO][stageKey] = (weeklyExtra[dateISO][stageKey] || []).concat(options[idx]);
+    saveWeeklyPlan();
+    renderAll();
+  }
+
+  function removeJobFromWeekPlan(dateISO, stageKey, jobId) {
+    const isExtra = ((weeklyExtra[dateISO] || {})[stageKey] || []).some(j => j.jobId === jobId);
+    if (isExtra) {
+      weeklyExtra = { ...weeklyExtra };
+      weeklyExtra[dateISO] = { ...(weeklyExtra[dateISO] || {}) };
+      weeklyExtra[dateISO][stageKey] = weeklyExtra[dateISO][stageKey].filter(j => j.jobId !== jobId);
+    } else {
+      weeklyRemoved = { ...weeklyRemoved };
+      weeklyRemoved[dateISO] = { ...(weeklyRemoved[dateISO] || {}) };
+      const list = weeklyRemoved[dateISO][stageKey] || [];
+      weeklyRemoved[dateISO][stageKey] = list.indexOf(jobId) === -1 ? list.concat(jobId) : list;
+    }
+    // Drop any saved number override too — nothing left to override.
+    if ((weeklyTargets[dateISO] || {})[stageKey] && jobId in weeklyTargets[dateISO][stageKey]) {
+      weeklyTargets = { ...weeklyTargets };
+      weeklyTargets[dateISO] = { ...weeklyTargets[dateISO] };
+      weeklyTargets[dateISO][stageKey] = { ...weeklyTargets[dateISO][stageKey] };
+      delete weeklyTargets[dateISO][stageKey][jobId];
+    }
+    saveWeeklyPlan();
+    renderAll();
   }
 
   function setWeeklyTarget(dateISO, stageKey, jobId, rawValue) {
@@ -7794,7 +7884,7 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     weeklyTargets = { ...weeklyTargets };
     weeklyTargets[dateISO] = { ...(weeklyTargets[dateISO] || {}) };
     weeklyTargets[dateISO][stageKey] = { ...(weeklyTargets[dateISO][stageKey] || {}), [jobId]: clamped };
-    queueSave(weekPlanKeyFor(new Date()), weeklyTargets);
+    saveWeeklyPlan();
     // Today's live targets (Today tab) read jobsAt(), which applies this
     // same weeklyTargets map — re-render everything so a same-day edit
     // shows up immediately, not just next reload.
@@ -7931,6 +8021,8 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     if (b.dataset.tab) { setTab(b.dataset.tab); return; }
     if (b.dataset.job) { selected[b.dataset.stage] = b.dataset.job; renderAll(); return; }
     if (b.dataset.add) { addJobToStage(b.dataset.add); return; }
+    if (b.dataset.wpAddDate) { addJobToWeekPlan(b.dataset.wpAddDate, b.dataset.wpAddStage); return; }
+    if (b.dataset.wpRemoveDate) { removeJobFromWeekPlan(b.dataset.wpRemoveDate, b.dataset.wpRemoveStage, b.dataset.wpRemoveJob); return; }
     if (b.dataset.addnote) { addNote(); return; }
     if (b.dataset.addbatch) { addDrawerBatch(); return; }
     if (b.dataset.batch) { setDrawerBatchDone(b.dataset.batch, b.dataset.done === "1"); return; }
@@ -7982,7 +8074,7 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     if (prev) { delete prev.offPlan; delete prev.notes; yesterday = prev; } else { yesterday = {}; }
     today = {}; offPlan = []; notes = []; extraJobs = {}; selected = {};
     weekToDate = (await load(weekKeyFor(new Date()))) || {};
-    weeklyTargets = (await load(weekPlanKeyFor(new Date()))) || {};
+    await loadWeeklyPlan();
     renderDate(); renderAll();
   }
 
@@ -7994,7 +8086,7 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     const y = await load(dayKeyFor(prevWorkingDay(new Date())));
     if (y) { delete y.offPlan; delete y.notes; yesterday = y; }
     weekToDate = (await load(weekKeyFor(new Date()))) || {};
-    weeklyTargets = (await load(weekPlanKeyFor(new Date()))) || {};
+    await loadWeeklyPlan();
     drawerBatches = (await load(drawersKey)) || [];
     renderAll();
 
@@ -8113,7 +8205,7 @@ function FloorBoard({ scheduled, dayLayout }) {
         </div>
         <div id="panel-weekplan" style={{ display: "none" }}>
           <h2 className="sec">This week's plan · Harry &amp; Jon set each day's real target</h2>
-          <div className="wp-notice">Job names and the suggested number come straight from the main schedule — type over a number to set your own target for that day. Leave it as-is to keep the suggestion.</div>
+          <div className="wp-notice">Job names and the suggested number come straight from the main schedule — but that's only a starting point. Type over a number to set your own target, tap × to remove a job that shouldn't be there (already finished, wrong day, etc.), or "+ add job" to bring in a different one.</div>
           <div className="wp-grid" id="weekplan" />
         </div>
         <div id="panel-drawers" style={{ display: "none" }}>
