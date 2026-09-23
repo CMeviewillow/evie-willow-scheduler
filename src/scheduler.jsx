@@ -7397,6 +7397,17 @@ function buildMorningBrief(scheduled, dayLayout, todayKey) {
   return { stages, allJobs };
 }
 
+// Monday of the week containing `d` — a plain-Date version of mountFloorBoard's
+// own internal mondayOf, needed one level up (in the React FloorBoard
+// component) to build a whole week's worth of morning briefs rather than
+// just today's.
+function mondayOfDate(d) {
+  const m = new Date(d.getTime());
+  const dow = m.getDay();
+  m.setDate(m.getDate() + (dow === 0 ? -6 : 1 - dow));
+  return m;
+}
+
 const FLOOR_BOARD_CSS = `
   .floor-board-root{--linen:#f5f0e6; --panel:#faf6ec; --panel2:#fdfaf2;
     --ink:#3a342c; --ink2:#7a6a55; --ink3:#9b8f7e;
@@ -7513,6 +7524,22 @@ const FLOOR_BOARD_CSS = `
   .floor-board-root .batch-toggle button{padding:6px 14px;font-size:12px;border-radius:4px;border:1px solid var(--rule);
     background:#fff;color:var(--ink2);font-family:Inter,sans-serif;cursor:pointer}
   .floor-board-root .batch-toggle button.yes[aria-pressed="true"]{background:var(--sage-bg);color:#5a6e50;border-color:var(--sage);font-weight:600}
+  .floor-board-root .wp-notice{font-size:12px;color:var(--ink3);margin:-4px 0 14px;max-width:640px}
+  .floor-board-root .wp-grid{display:flex;flex-wrap:wrap;gap:12px}
+  .floor-board-root .wp-day{background:var(--panel);border:1px solid var(--rule);border-radius:6px;
+    padding:12px 13px 14px;flex:1 1 220px;min-width:0}
+  .floor-board-root .wp-day-name{font-size:17px;font-weight:500;margin-bottom:8px}
+  .floor-board-root .wp-stage{margin-bottom:10px}
+  .floor-board-root .wp-stage-name{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink3);
+    font-weight:600;margin-bottom:4px}
+  .floor-board-root .wp-row{display:flex;align-items:center;justify-content:space-between;gap:8px;
+    padding:4px 0}
+  .floor-board-root .wp-job{font-size:13px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;
+    white-space:nowrap;flex:1}
+  .floor-board-root .wp-input{width:56px;flex:none;border:1px solid var(--rule);border-radius:4px;
+    padding:5px 7px;font-size:13px;text-align:right;font-family:Inter,sans-serif;color:var(--ink);background:#fff}
+  .floor-board-root .wp-input:focus{outline:2px solid var(--sage);outline-offset:1px}
+  .floor-board-root .wp-empty{font-size:12px;color:var(--ink3);font-style:italic}
   .floor-board-root .batch-toggle button.no[aria-pressed="true"]{background:var(--clay-bg);color:var(--clay);border-color:var(--clay);font-weight:600}
   .floor-board-root .batch-empty{font-size:12px;color:var(--ink3);font-style:italic}
   @media (prefers-reduced-motion:reduce){.floor-board-root *{transition:none!important}}
@@ -7532,7 +7559,7 @@ const FLOOR_STAGES = [
 // skeleton once and never touches its insides again, so the board can own
 // its own imperative rendering (matching floor_board.html verbatim) without
 // fighting React's virtual DOM.
-function mountFloorBoard(root, planRef, holidaysSet) {
+function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
   const iso = fmtISO;
   const store = (typeof window !== "undefined" && window.storage) ? window.storage : null;
   const memory = {};
@@ -7559,6 +7586,11 @@ function mountFloorBoard(root, planRef, holidaysSet) {
 
   const dayKeyFor = (d) => "floor:" + iso(d);
   const weekKeyFor = (d) => "floor:wtd:" + iso(mondayOf(d));
+  // Harry/Jon's own weekly plan — a target cabinet count per job per stage
+  // per day, keyed by the Monday of that week. Read as an override on top
+  // of the auto-computed suggestion (see jobsAt below); never required —
+  // an un-set job/day just keeps showing the auto number.
+  const weekPlanKeyFor = (d) => "floor:plan:" + iso(mondayOf(d));
   const drawersKey = "floor:drawers";
   function mondayOf(d) {
     const m = new Date(d.getTime());
@@ -7584,9 +7616,17 @@ function mountFloorBoard(root, planRef, holidaysSet) {
 
   let today = {}, yesterday = {}, weekToDate = {}, offPlan = [], notes = [], extraJobs = {}, selected = {};
   let drawerBatches = [], activeTab = "today";
+  let weeklyTargets = {}; // { [dateISO]: { [stageKey]: { [jobId]: count } } }
 
+  // Every job's `planned` count for TODAY, with Harry/Jon's own weekly-plan
+  // number (if they've set one for this job/stage/day) overriding the
+  // auto-computed suggestion — everything downstream (targetFor, the chips,
+  // yesterday's recap) reads `planned` off whatever this returns, so setting
+  // the override here is enough to make it take everywhere at once.
   function jobsAt(stageKey) {
-    return (planRef.current.stages[stageKey] || []).concat(extraJobs[stageKey] || []);
+    const base = (planRef.current.stages[stageKey] || []).concat(extraJobs[stageKey] || []);
+    const overrides = (weeklyTargets[iso(new Date())] || {})[stageKey] || {};
+    return base.map(j => (j.jobId in overrides) ? { ...j, planned: overrides[j.jobId] } : j);
   }
   function countAt(stageKey, jobId) {
     return (today[stageKey] && today[stageKey][jobId]) || 0;
@@ -7707,6 +7747,60 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     }).join("");
   }
 
+  // "This week" tab: Monday-Friday x department grid. Each cell lists
+  // whichever job(s) the main schedule already has queued there that day
+  // (pulled straight from weekPlanRef, the same auto-computed data "Today"
+  // uses, just for every day this week instead of only today) with an
+  // editable number input next to each — pre-filled with the auto
+  // suggestion, or Harry/Jon's own saved number if they've already set one.
+  function renderWeekPlan() {
+    const monday = mondayOf(new Date());
+    const days = [0, 1, 2, 3, 4].map(i => addDays(monday, i));
+    $("weekplan").innerHTML = days.map(d => {
+      const dISO = iso(d);
+      const dayBrief = weekPlanRef.current[dISO] || { stages: {} };
+      const dayLabel = d.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "short" });
+      const stageBlocks = FLOOR_STAGES.map(s => {
+        const jobs = dayBrief.stages[s.key] || [];
+        if (!jobs.length) return "";
+        const rows = jobs.map(j => {
+          const saved = ((weeklyTargets[dISO] || {})[s.key] || {})[j.jobId];
+          const value = saved != null ? saved : Math.round(j.planned);
+          return `
+          <div class="wp-row">
+            <span class="wp-job">${escapeHtml(j.jobName)}</span>
+            <input class="wp-input" type="number" min="0" inputmode="numeric"
+              data-wp-date="${dISO}" data-wp-stage="${s.key}" data-wp-job="${j.jobId}"
+              value="${value}" aria-label="${s.name} target for ${escapeHtml(j.jobName)} on ${dayLabel}" />
+          </div>`;
+        }).join("");
+        return `
+        <div class="wp-stage">
+          <div class="wp-stage-name">${s.name}</div>
+          ${rows}
+        </div>`;
+      }).join("");
+      return `
+      <div class="wp-day">
+        <div class="wp-day-name serif">${dayLabel}</div>
+        ${stageBlocks || `<div class="wp-empty">Nothing booked</div>`}
+      </div>`;
+    }).join("");
+  }
+
+  function setWeeklyTarget(dateISO, stageKey, jobId, rawValue) {
+    const n = parseInt(rawValue, 10);
+    const clamped = isNaN(n) || n < 0 ? 0 : n;
+    weeklyTargets = { ...weeklyTargets };
+    weeklyTargets[dateISO] = { ...(weeklyTargets[dateISO] || {}) };
+    weeklyTargets[dateISO][stageKey] = { ...(weeklyTargets[dateISO][stageKey] || {}), [jobId]: clamped };
+    queueSave(weekPlanKeyFor(new Date()), weeklyTargets);
+    // Today's live targets (Today tab) read jobsAt(), which applies this
+    // same weeklyTargets map — re-render everything so a same-day edit
+    // shows up immediately, not just next reload.
+    renderAll();
+  }
+
   function renderYesterday() {
     $("yesterday").innerHTML = FLOOR_STAGES.map(s => {
       const m = yesterday[s.key];
@@ -7792,11 +7886,13 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     activeTab = tab;
     $("panel-today").style.display = tab === "today" ? "" : "none";
     $("panel-drawers").style.display = tab === "drawers" ? "" : "none";
+    $("panel-weekplan").style.display = tab === "weekplan" ? "" : "none";
     $("tab-today").setAttribute("aria-selected", tab === "today" ? "true" : "false");
     $("tab-drawers").setAttribute("aria-selected", tab === "drawers" ? "true" : "false");
+    $("tab-weekplan").setAttribute("aria-selected", tab === "weekplan" ? "true" : "false");
   }
 
-  function renderAll() { renderPipe(); renderWeek(); renderStages(); renderYesterday(); renderNotes(); renderDrawers(); }
+  function renderAll() { renderPipe(); renderWeek(); renderStages(); renderYesterday(); renderNotes(); renderDrawers(); renderWeekPlan(); }
 
   function bump(stageKey, delta) {
     const jobId = selected[stageKey];
@@ -7846,6 +7942,15 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     if (e.key === "Enter" && e.target && (e.target.id === "batch-label" || e.target.id === "batch-count")) addDrawerBatch();
   };
   root.addEventListener("keydown", onKeydown);
+  // "change" (fires on blur/Enter), not "input" — a weekly target shouldn't
+  // save on every keystroke while someone's still typing a number.
+  const onChange = (e) => {
+    const t = e.target;
+    if (t && t.classList && t.classList.contains("wp-input")) {
+      setWeeklyTarget(t.dataset.wpDate, t.dataset.wpStage, t.dataset.wpJob, t.value);
+    }
+  };
+  root.addEventListener("change", onChange);
 
   let currentDay = iso(new Date());
   let unsubscribe = null;
@@ -7877,6 +7982,7 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     if (prev) { delete prev.offPlan; delete prev.notes; yesterday = prev; } else { yesterday = {}; }
     today = {}; offPlan = []; notes = []; extraJobs = {}; selected = {};
     weekToDate = (await load(weekKeyFor(new Date()))) || {};
+    weeklyTargets = (await load(weekPlanKeyFor(new Date()))) || {};
     renderDate(); renderAll();
   }
 
@@ -7888,6 +7994,7 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     const y = await load(dayKeyFor(prevWorkingDay(new Date())));
     if (y) { delete y.offPlan; delete y.notes; yesterday = y; }
     weekToDate = (await load(weekKeyFor(new Date()))) || {};
+    weeklyTargets = (await load(weekPlanKeyFor(new Date()))) || {};
     drawerBatches = (await load(drawersKey)) || [];
     renderAll();
 
@@ -7911,6 +8018,7 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     teardown() {
       root.removeEventListener("click", onClick);
       root.removeEventListener("keydown", onKeydown);
+      root.removeEventListener("change", onChange);
       document.removeEventListener("visibilitychange", onVisibilityChange);
       if (wakeLock) wakeLock.release().catch(() => {});
       if (unsubscribe) unsubscribe();
@@ -7924,6 +8032,7 @@ function FloorBoard({ scheduled, dayLayout }) {
   const rootRef = useRef(null);
   const apiRef = useRef(null);
   const planRef = useRef({ stages: {}, allJobs: [] });
+  const weekPlanRef = useRef({});
   const todayKey = dayKey(new Date());
   const plan = useMemo(
     () => buildMorningBrief(scheduled, dayLayout, todayKey),
@@ -7931,10 +8040,26 @@ function FloorBoard({ scheduled, dayLayout }) {
   );
   planRef.current = plan;
 
+  // Same morning-brief data "Today" uses (which jobs/cabinets the main
+  // schedule has queued at each stage), computed for every weekday this
+  // week instead of just today — feeds the "This week" tab's auto
+  // suggestions.
+  const weekPlan = useMemo(() => {
+    const monday = mondayOfDate(new Date());
+    const out = {};
+    for (let i = 0; i < 5; i++) {
+      const d = addDays(monday, i);
+      out[dayKey(d)] = buildMorningBrief(scheduled, dayLayout, dayKey(d));
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scheduled, dayLayout]);
+  weekPlanRef.current = weekPlan;
+
   useEffect(() => {
     if (!rootRef.current) return;
     const holidaysSet = new Set(UK_BANK_HOLIDAYS);
-    apiRef.current = mountFloorBoard(rootRef.current, planRef, holidaysSet);
+    apiRef.current = mountFloorBoard(rootRef.current, planRef, weekPlanRef, holidaysSet);
     return () => {
       apiRef.current?.teardown?.();
       apiRef.current = null;
@@ -7944,7 +8069,7 @@ function FloorBoard({ scheduled, dayLayout }) {
 
   useEffect(() => {
     apiRef.current?.onPlanChanged?.();
-  }, [plan]);
+  }, [plan, weekPlan]);
 
   return (
     <div className="floor-board-root" ref={rootRef}>
@@ -7962,6 +8087,7 @@ function FloorBoard({ scheduled, dayLayout }) {
         </div>
         <div className="tabbar" role="tablist">
           <button id="tab-today" className="tabbtn" data-tab="today" role="tab" aria-selected="true">Today</button>
+          <button id="tab-weekplan" className="tabbtn" data-tab="weekplan" role="tab" aria-selected="false">This week</button>
           <button id="tab-drawers" className="tabbtn" data-tab="drawers" role="tab" aria-selected="false">Drawers</button>
         </div>
         <div id="panel-today">
@@ -7984,6 +8110,11 @@ function FloorBoard({ scheduled, dayLayout }) {
               <div id="yesterday" />
             </div>
           </div>
+        </div>
+        <div id="panel-weekplan" style={{ display: "none" }}>
+          <h2 className="sec">This week's plan · Harry &amp; Jon set each day's real target</h2>
+          <div className="wp-notice">Job names and the suggested number come straight from the main schedule — type over a number to set your own target for that day. Leave it as-is to keep the suggestion.</div>
+          <div className="wp-grid" id="weekplan" />
         </div>
         <div id="panel-drawers" style={{ display: "none" }}>
           <h2 className="sec">Drawer batches · mark complete once boxed off</h2>
