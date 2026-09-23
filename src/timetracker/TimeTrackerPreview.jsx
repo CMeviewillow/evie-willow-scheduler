@@ -6,18 +6,29 @@ import {
 } from "./sampleData.js";
 
 // Local-only try-it-out preview for Phase 2 (import review) and Phase 3
-// (clock on/off, PIN sign-in included) — reached with ?admin=preview, same
-// pattern as ?admin=aliases. One combined tool, not separate screens: the
-// office does the import review here, and the same page also has the real
-// clock in/out flow, exactly how this is meant to work for real, not two
-// disconnected admin pages. Nothing here touches Supabase: the real tables
-// (production_imports, cabinets, room_extras, cabinet_accessories,
-// stage_completions, time_entries, stage_completions) have never been
-// executed against the live database, so this runs entirely on
-// localStorage under the "tt-preview:" prefix, seeded from a real job
-// (DA1277 Anna Reid) the first time it's opened. PINs here are made up for
-// this preview only (see SAMPLE_WORKSHOP_PEOPLE) — real people don't have
-// one until it's set via ?admin=aliases. See docs/time-tracker.md and the
+// (the real clock on/off wizard, PIN included) — reached with ?admin=preview,
+// same pattern as ?admin=aliases. One combined tool, not separate screens.
+// Nothing here touches Supabase: the real tables (production_imports,
+// cabinets, room_extras, cabinet_accessories, stage_completions,
+// time_entries) have never been executed against the live database, so this
+// runs entirely on localStorage under the "tt-preview:" prefix, seeded from
+// a real job (DA1277 Anna Reid). PINs are made up for this preview only
+// (see SAMPLE_WORKSHOP_PEOPLE) — real people don't have one until it's set
+// via ?admin=aliases.
+//
+// The clock-on/off flow is kiosk-style, not "sign in and stay signed in" —
+// matches how a wall-mounted tablet actually gets used (lots of different
+// people touching it through the day, nobody "logged in" between turns).
+// Every wizard step resets back to "who's clocking on" once you stop.
+// Multiple people CAN run against the same cabinet/stage at once (see the
+// "Who's on now" tab) — that's normal, not a conflict; the total is labour
+// minutes, everyone's time added up, not wall-clock time.
+//
+// Design/interaction pattern carried over from the earlier "Clock On, Clock
+// Off" walkthrough artifact (claude.ai/artifact/JJvSpxSyj8WtoxZQGwy9fb,
+// 2026-09-07): wizard steps with a breadcrumb trail, an "already clocked
+// on" shortcut if you tap your own name mid-shift, and a live "who's on
+// now" board. See docs/time-tracker.md and the
 // project_time_tracker_phase2_groundwork memory for where every figure
 // here comes from.
 
@@ -46,74 +57,117 @@ function initialAccessories() {
   return SAMPLE_ACCESSORIES.map((a, i) => ({ ...a, id: i, ordered: false, fitted: false }));
 }
 
+function fmtElapsed(ms) {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  return h > 0
+    ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+    : `${m}:${String(s).padStart(2, "0")}`;
+}
+function initials(name) {
+  return name.slice(0, 2).toUpperCase();
+}
+
+// Same palette as the real floor board (FLOOR_BOARD_CSS in scheduler.jsx)
+// and the earlier walkthrough artifact — kept visually consistent with
+// both rather than inventing a third look.
+const C = {
+  linen: "#f5f0e6", panel: "#faf6ec", panel2: "#fdfaf2",
+  ink: "#3a342c", ink2: "#7a6a55", ink3: "#9b8f7e",
+  rule: "#d9cfba", rule2: "#e8dfca",
+  sage: "#7a8b6f", sageBg: "#ecf0e2",
+  clay: "#a5614f", clayBg: "#f5e3dc",
+  honey: "#c9a961", honeyBg: "#f4ecd9",
+};
+
 const styles = {
-  wrap: { fontFamily: "system-ui, sans-serif", maxWidth: 980, margin: "0 auto", padding: "24px 20px 60px" },
+  wrap: { fontFamily: "Inter, -apple-system, 'Segoe UI', sans-serif", maxWidth: 1040, margin: "0 auto", padding: "24px 20px 60px", background: C.linen, color: C.ink },
+  serif: { fontFamily: "'Cormorant Garamond', Georgia, serif" },
   banner: { background: "#fff3cd", border: "1px solid #e8c468", borderRadius: 8, padding: "12px 16px", fontSize: 13, color: "#6b5410", marginBottom: 24, lineHeight: 1.5 },
-  title: { fontSize: 22, fontWeight: 700, marginBottom: 2 },
-  subtitle: { color: "#666", marginBottom: 20, fontSize: 14 },
-  tabs: { display: "flex", gap: 8, marginBottom: 24, borderBottom: "1px solid #ddd" },
+  title: { fontSize: 24, fontWeight: 500, marginBottom: 2 },
+  subtitle: { color: C.ink2, marginBottom: 20, fontSize: 14 },
+  tabs: { display: "flex", gap: 8, marginBottom: 24, flexWrap: "wrap" },
   tab: (active) => ({
-    padding: "10px 16px", fontSize: 14, fontWeight: 600, cursor: "pointer", border: "none", background: "none",
-    color: active ? "#2c5f4f" : "#888", borderBottom: active ? "2px solid #2c5f4f" : "2px solid transparent",
+    padding: "11px 20px", fontSize: 14, fontWeight: 500, cursor: "pointer",
+    border: `1px solid ${active ? C.sage : C.rule}`, borderRadius: 6,
+    background: active ? C.sage : C.panel, color: active ? "#fff" : C.ink2,
   }),
+  card: { background: C.panel, border: `1px solid ${C.rule}`, borderRadius: 14, padding: "26px 28px 30px", minHeight: 420, boxShadow: "0 18px 40px -22px rgba(58,52,44,.35)" },
   sectionTitle: { fontSize: 16, fontWeight: 700, margin: "28px 0 10px" },
-  note: { fontSize: 13, color: "#666", marginBottom: 14, lineHeight: 1.5 },
+  note: { fontSize: 13, color: C.ink2, marginBottom: 14, lineHeight: 1.5 },
   table: { width: "100%", borderCollapse: "collapse", fontSize: 13 },
-  th: { textAlign: "left", padding: "7px 8px", borderBottom: "2px solid #ddd", color: "#666", fontWeight: 600 },
-  td: { padding: "7px 8px", borderBottom: "1px solid #eee", verticalAlign: "middle" },
-  select: { padding: "4px 6px", fontSize: 13, borderRadius: 4, border: "1px solid #ccc", width: "100%" },
-  reviewPill: { display: "inline-block", fontSize: 11, fontWeight: 700, letterSpacing: 0.3, padding: "2px 7px", borderRadius: 10, background: "#f5e3dc", color: "#a5614f" },
-  okPill: { display: "inline-block", fontSize: 11, fontWeight: 700, letterSpacing: 0.3, padding: "2px 7px", borderRadius: 10, background: "#ecf0e2", color: "#5a6e50" },
-  extraCard: { background: "#faf6ec", border: "1px solid #e8dfca", borderRadius: 8, padding: "14px 16px", marginBottom: 12 },
+  th: { textAlign: "left", padding: "7px 8px", borderBottom: `2px solid ${C.rule}`, color: C.ink3, fontWeight: 600, fontSize: 11, letterSpacing: 0.5, textTransform: "uppercase" },
+  td: { padding: "10px 8px", borderBottom: `1px solid ${C.rule2}`, verticalAlign: "middle" },
+  select: { padding: "8px 10px", fontSize: 13, borderRadius: 6, border: `1px solid ${C.rule}`, width: "100%", background: "#fff", color: C.ink, fontFamily: "Inter, sans-serif" },
+  reviewPill: { display: "inline-block", fontSize: 11, fontWeight: 700, letterSpacing: 0.3, padding: "2px 7px", borderRadius: 10, background: C.clayBg, color: C.clay },
+  okPill: { display: "inline-block", fontSize: 11, fontWeight: 700, letterSpacing: 0.3, padding: "2px 7px", borderRadius: 10, background: C.sageBg, color: "#5a6e50" },
+  extraCard: { background: C.panel2, border: `1px solid ${C.rule2}`, borderRadius: 8, padding: "14px 16px", marginBottom: 12 },
   extraHead: { display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 },
   extraKind: { fontSize: 14, fontWeight: 700, textTransform: "capitalize" },
   extraMetres: { display: "flex", alignItems: "baseline", gap: 4 },
-  extraInput: { width: 70, padding: "4px 6px", fontSize: 15, fontWeight: 700, borderRadius: 4, border: "1px solid #ccc", textAlign: "right" },
-  extraNotes: { fontSize: 12, color: "#7a6a55", lineHeight: 1.5 },
-  reviewRow: { display: "flex", alignItems: "center", gap: 6, marginTop: 8, fontSize: 12, color: "#a5614f" },
+  extraInput: { width: 70, padding: "4px 6px", fontSize: 15, fontWeight: 700, borderRadius: 4, border: `1px solid ${C.rule}`, textAlign: "right" },
+  extraNotes: { fontSize: 12, color: C.ink2, lineHeight: 1.5 },
+  reviewRow: { display: "flex", alignItems: "center", gap: 6, marginTop: 8, fontSize: 12, color: C.clay },
   checkbox: { width: 15, height: 15 },
-  summaryBar: { display: "flex", gap: 20, background: "#ecf0e2", border: "1px solid #7a8b6f", borderRadius: 8, padding: "14px 18px", marginBottom: 20 },
-  summaryNum: { fontSize: 26, fontWeight: 700, color: "#3a342c", lineHeight: 1 },
-  summaryLabel: { fontSize: 12, color: "#5a6e50", marginTop: 2 },
-  cabCard: { display: "flex", alignItems: "center", gap: 14, padding: "10px 14px", border: "1px solid #e8dfca", borderRadius: 8, marginBottom: 8, background: "#fff" },
-  cabCardDone: { background: "#ecf0e2", borderColor: "#7a8b6f" },
-  cabName: { flex: 1, fontSize: 14 },
-  cabNum: { color: "#7a6a55", fontWeight: 600, marginRight: 6 },
   partBtn: (done) => ({
     padding: "8px 14px", fontSize: 13, fontWeight: 600, borderRadius: 6, cursor: "pointer",
-    border: done ? "1px solid #7a8b6f" : "1px solid #ccc",
-    background: done ? "#7a8b6f" : "#fff", color: done ? "#fff" : "#555",
+    border: done ? `1px solid ${C.sage}` : `1px solid ${C.rule}`,
+    background: done ? C.sage : "#fff", color: done ? "#fff" : "#555",
+    fontFamily: "Inter, sans-serif",
   }),
-  personSelect: { padding: "6px 8px", fontSize: 13, borderRadius: 6, border: "1px solid #ccc", marginBottom: 16 },
 
-  // Clock in/out
-  signedInBar: { display: "flex", justifyContent: "space-between", alignItems: "center", background: "#ecf0e2", border: "1px solid #7a8b6f", borderRadius: 8, padding: "10px 16px", marginBottom: 20 },
-  signedInName: { fontSize: 15, fontWeight: 700, color: "#3a342c" },
-  signOutBtn: { background: "none", border: "1px solid #a5614f", color: "#a5614f", borderRadius: 6, padding: "5px 12px", fontSize: 12, cursor: "pointer" },
-  nameGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(110px, 1fr))", gap: 10, maxWidth: 560 },
-  nameBtn: { padding: "16px 8px", fontSize: 15, fontWeight: 600, borderRadius: 8, border: "1px solid #ccc", background: "#fff", cursor: "pointer" },
-  pinWrap: { maxWidth: 280 },
-  pinTarget: { fontSize: 15, marginBottom: 12 },
-  pinDots: { display: "flex", gap: 12, marginBottom: 16, justifyContent: "center" },
-  pinDot: (filled) => ({ width: 16, height: 16, borderRadius: "50%", border: "1px solid #999", background: filled ? "#2c5f4f" : "#fff" }),
-  pinError: { color: "#a5614f", fontSize: 13, textAlign: "center", marginBottom: 10, minHeight: 18 },
-  pinPad: { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10 },
-  pinKey: { padding: "16px 0", fontSize: 18, fontWeight: 600, borderRadius: 8, border: "1px solid #ccc", background: "#fff", cursor: "pointer" },
-  pinCancel: { marginTop: 14, background: "none", border: "none", color: "#888", fontSize: 13, cursor: "pointer", textDecoration: "underline" },
-  jobLine: { fontSize: 13, color: "#666", marginBottom: 16 },
-  stageGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))", gap: 8, marginBottom: 16 },
-  stageBtn: (active) => ({
-    padding: "12px 10px", fontSize: 13, fontWeight: 600, borderRadius: 8, cursor: "pointer", textAlign: "left",
-    border: active ? "2px solid #2c5f4f" : "1px solid #ccc", background: active ? "#ecf0e2" : "#fff", color: "#333",
+  // wizard
+  trail: { display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, marginBottom: 22 },
+  crumb: (state) => ({
+    fontSize: 12, letterSpacing: 0.6, textTransform: "uppercase", padding: "5px 4px",
+    color: state === "active" ? C.ink : state === "done" ? C.sage : C.ink3,
+    fontWeight: state === "active" ? 600 : 400,
   }),
-  clockOnBtn: { padding: "12px 28px", fontSize: 15, fontWeight: 700, borderRadius: 8, border: "none", background: "#2c5f4f", color: "#fff", cursor: "pointer" },
-  clockOnBtnDisabled: { opacity: 0.4, cursor: "not-allowed" },
-  runningCard: { background: "#faf6ec", border: "1px solid #e8c468", borderRadius: 10, padding: "18px 20px", marginBottom: 20 },
-  runningStage: { fontSize: 17, fontWeight: 700, marginBottom: 4 },
-  runningTime: { fontSize: 32, fontWeight: 700, color: "#2c5f4f", margin: "8px 0" },
-  clockOffBtn: { padding: "10px 24px", fontSize: 14, fontWeight: 700, borderRadius: 8, border: "none", background: "#a5614f", color: "#fff", cursor: "pointer" },
-  logRow: { display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: "1px solid #eee", fontSize: 13 },
-  logEmpty: { fontSize: 13, color: "#999", fontStyle: "italic" },
+  crumbSep: { color: C.rule, fontSize: 12 },
+  backBtn: { fontFamily: "Inter, sans-serif", fontSize: 13, color: C.ink2, background: "none", border: "none", cursor: "pointer", padding: "4px 0", marginBottom: 12 },
+  stepTitle: { fontSize: 22, fontWeight: 500, marginBottom: 16 },
+  tapGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 12 },
+  tap: { background: C.panel2, border: `1.5px solid ${C.rule}`, borderRadius: 10, padding: "18px 14px", minHeight: 76, cursor: "pointer", textAlign: "left", fontFamily: "Inter, sans-serif", color: C.ink, position: "relative" },
+  tapName: { fontSize: 16, fontWeight: 600 },
+  tapSub: { fontSize: 12, color: C.ink3, marginTop: 3 },
+  liveDot: { position: "absolute", top: 12, right: 12, width: 9, height: 9, borderRadius: "50%", background: C.clay, boxShadow: `0 0 0 3px ${C.clayBg}` },
+  pinWrap: { maxWidth: 300, margin: "0 auto" },
+  pinTarget: { fontSize: 22, marginBottom: 16, textAlign: "center", fontWeight: 500 },
+  pinDots: { display: "flex", gap: 14, marginBottom: 16, justifyContent: "center" },
+  pinDot: (filled) => ({ width: 16, height: 16, borderRadius: "50%", border: `1.5px solid ${C.rule}`, background: filled ? C.ink : "transparent" }),
+  pinError: { color: C.clay, fontSize: 13, fontWeight: 600, textAlign: "center", marginBottom: 16, minHeight: 18 },
+  pinHint: { fontSize: 12, color: C.ink3, fontStyle: "italic", textAlign: "center", marginBottom: 16 },
+  pinPad: { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10 },
+  pinKey: { fontFamily: "Inter, sans-serif", fontSize: 20, fontWeight: 500, padding: "18px 0", borderRadius: 10, border: `1.5px solid ${C.rule}`, background: C.panel2, color: C.ink, cursor: "pointer" },
+  pinKeyGhost: { fontSize: 12, color: C.ink3, background: "none" },
+  cabTapLive: { fontSize: 11, color: C.clay, fontWeight: 600, marginTop: 8, display: "flex", alignItems: "center", gap: 5 },
+  cabNum: { fontSize: 11, color: C.ink3, fontWeight: 600, letterSpacing: 0.3 },
+  cabType: { fontSize: 14.5, fontWeight: 600, marginTop: 2 },
+  groupLabel: { fontSize: 11, letterSpacing: 1, textTransform: "uppercase", color: C.ink3, margin: "16px 0 8px" },
+  confirmCard: { maxWidth: 460, margin: "20px auto 0" },
+  confirmSummary: { background: C.panel2, border: `1px solid ${C.rule2}`, borderRadius: 10, padding: "22px 20px", marginBottom: 22 },
+  confirmRow: { display: "flex", justifyContent: "space-between", fontSize: 14, padding: "6px 0", borderBottom: `1px solid ${C.rule2}` },
+  confirmK: { color: C.ink3 },
+  confirmV: { fontWeight: 600 },
+  startBtn: { width: "100%", fontFamily: "Inter, sans-serif", fontSize: 18, fontWeight: 600, padding: "18px 0", border: "none", borderRadius: 10, background: C.sage, color: "#fff", cursor: "pointer" },
+  runningWrap: { maxWidth: 460, margin: "12px auto 0", textAlign: "center" },
+  runningBadge: { display: "inline-flex", alignItems: "center", gap: 8, background: C.sageBg, color: "#5a6e50", fontSize: 11.5, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase", padding: "6px 14px", borderRadius: 20, marginBottom: 18 },
+  pulse: { width: 8, height: 8, borderRadius: "50%", background: C.sage },
+  runningClock: { fontSize: 48, fontWeight: 500, fontVariantNumeric: "tabular-nums", marginBottom: 6 },
+  runningWhat: { fontSize: 14.5, color: C.ink2, marginBottom: 20 },
+  stopBtn: { width: "100%", fontFamily: "Inter, sans-serif", fontSize: 16, fontWeight: 600, padding: "16px 0", borderRadius: 10, border: `1.5px solid ${C.clay}`, background: "#fff", color: C.clay, cursor: "pointer" },
+  partsBox: { textAlign: "left", background: "#fff", border: `1px solid ${C.rule2}`, borderRadius: 8, padding: "14px 16px", margin: "18px 0" },
+
+  // live board
+  liveTable: { width: "100%", borderCollapse: "collapse" },
+  who: { display: "flex", alignItems: "center", gap: 10 },
+  avatar: { width: 32, height: 32, borderRadius: "50%", background: C.sage, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12.5, fontWeight: 700, flex: "none" },
+  liveStageTag: { fontSize: 11, letterSpacing: 0.4, color: C.ink2, background: C.panel2, border: `1px solid ${C.rule2}`, borderRadius: 4, padding: "3px 8px", display: "inline-block" },
+  liveElapsed: { fontVariantNumeric: "tabular-nums", fontWeight: 600 },
+  sameCabNote: { marginTop: 16, fontSize: 12.5, color: C.ink2, background: C.panel2, border: `1px dashed ${C.rule}`, borderRadius: 8, padding: "12px 16px", maxWidth: 640, lineHeight: 1.6 },
+  emptyLive: { fontSize: 13, color: C.ink3, fontStyle: "italic" },
 };
 
 function ImportReviewTab({ cabinets, setCabinets, extras, setExtras, accessories, setAccessories }) {
@@ -250,109 +304,61 @@ function ImportReviewTab({ cabinets, setCabinets, extras, setExtras, accessories
   );
 }
 
-function fmtElapsed(ms) {
-  const totalSec = Math.max(0, Math.floor(ms / 1000));
-  const h = Math.floor(totalSec / 3600);
-  const m = Math.floor((totalSec % 3600) / 60);
-  const s = totalSec % 60;
-  return h > 0
-    ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
-    : `${m}:${String(s).padStart(2, "0")}`;
+const WIZ_WHO = "who", WIZ_PIN = "pin", WIZ_ALREADY = "already", WIZ_STAGE = "stage",
+  WIZ_CABINET = "cabinet", WIZ_CONFIRM = "confirm", WIZ_RUNNING = "running";
+
+function trailSteps(needsCabinet) {
+  return [
+    { k: WIZ_STAGE, label: "Stage" },
+    ...(needsCabinet ? [{ k: WIZ_CABINET, label: "Cabinet" }] : []),
+    { k: WIZ_CONFIRM, label: "Go" },
+  ];
 }
 
-// PIN sign-in — tap a name, enter the 4-digit PIN, matches against
-// SAMPLE_WORKSHOP_PEOPLE. Real PINs (people.pin) are set via ?admin=aliases;
-// these are made-up demo ones, see sampleData.js.
-function SignInScreen({ onSignedIn }) {
-  const [target, setTarget] = useState(null); // name currently entering a PIN
-  const [digits, setDigits] = useState("");
-  const [error, setError] = useState("");
-
-  if (!target) {
-    return (
-      <div>
-        <div style={{ fontSize: 14, color: "#555", marginBottom: 14 }}>Tap your name to clock on</div>
-        <div style={styles.nameGrid}>
-          {SAMPLE_WORKSHOP_PEOPLE.map(p => (
-            <button key={p.name} style={styles.nameBtn} onClick={() => { setTarget(p.name); setDigits(""); setError(""); }}>
-              {p.name}
-            </button>
-          ))}
-        </div>
-      </div>
-    );
-  }
-
-  const press = (d) => {
-    if (digits.length >= 4) return;
-    const next = digits + d;
-    setDigits(next);
-    if (next.length === 4) {
-      const person = SAMPLE_WORKSHOP_PEOPLE.find(p => p.name === target);
-      if (person.pin === next) {
-        onSignedIn(target);
-      } else {
-        setError("Wrong PIN — try again");
-        setDigits("");
-      }
-    }
-  };
-
-  return (
-    <div style={styles.pinWrap}>
-      <div style={styles.pinTarget}>PIN for <strong>{target}</strong></div>
-      <div style={styles.pinDots}>
-        {[0, 1, 2, 3].map(i => <div key={i} style={styles.pinDot(i < digits.length)} />)}
-      </div>
-      <div style={styles.pinError}>{error}</div>
-      <div style={styles.pinPad}>
-        {["1", "2", "3", "4", "5", "6", "7", "8", "9"].map(d => (
-          <button key={d} style={styles.pinKey} onClick={() => press(d)}>{d}</button>
-        ))}
-        <button style={styles.pinKey} onClick={() => setDigits(digits.slice(0, -1))}>⌫</button>
-        <button style={styles.pinKey} onClick={() => press("0")}>0</button>
-        <div />
-      </div>
-      <button style={styles.pinCancel} onClick={() => setTarget(null)}>Not {target}? Back</button>
-    </div>
-  );
-}
-
-function ClockInTab({
-  signedInPerson, setSignedInPerson,
-  activeClock, setActiveClock,
-  timeLog, setTimeLog,
-  cabinets, completions, setCompletions,
-}) {
-  const [draftStage, setDraftStage] = useState(SAMPLE_STAGES[0].name);
-  const [draftCabinet, setDraftCabinet] = useState("");
+function ClockWizard({ activeClocks, setActiveClocks, cabinets, completions, setCompletions }) {
+  const [wiz, setWiz] = useState({ step: WIZ_WHO, person: null, pinEntry: "", pinError: false, stage: "", cabinetItem: "" });
   const [, forceTick] = useState(0);
 
   useEffect(() => {
-    if (!activeClock) return;
+    if (wiz.step !== WIZ_RUNNING) return;
     const t = setInterval(() => forceTick(x => x + 1), 1000);
     return () => clearInterval(t);
-  }, [activeClock]);
-
-  const signOut = () => {
-    setSignedInPerson(null); save("signedInPerson", null);
-  };
+  }, [wiz.step]);
 
   const cabinetOptions = cabinets.filter(c => c.typeName !== "Panel");
-  const draftStageDef = SAMPLE_STAGES.find(s => s.name === draftStage);
+  const stageDef = SAMPLE_STAGES.find(s => s.name === wiz.stage);
+  const needsCabinet = !!(stageDef && stageDef.isCabinetStage);
 
-  const clockOn = () => {
-    if (draftStageDef.isCabinetStage && !draftCabinet) return;
-    const next = { person: signedInPerson, stage: draftStage, cabinetItem: draftStageDef.isCabinetStage ? draftCabinet : null, startedAt: Date.now() };
-    setActiveClock(next); save("activeClock", next);
+  const setActive = (updater) => {
+    const next = typeof updater === "function" ? updater(activeClocks) : updater;
+    setActiveClocks(next); save("activeClocks", next);
   };
 
-  const clockOff = () => {
-    const minutes = Math.round((Date.now() - activeClock.startedAt) / 60000);
-    const entry = { ...activeClock, stoppedAt: Date.now(), minutes };
-    const nextLog = [entry, ...timeLog];
-    setTimeLog(nextLog); save("timeLog", nextLog);
-    setActiveClock(null); save("activeClock", null);
+  const resetWiz = () => setWiz({ step: WIZ_WHO, person: null, pinEntry: "", pinError: false, stage: "", cabinetItem: "" });
+
+  const pickPerson = (name) => setWiz({ step: WIZ_PIN, person: name, pinEntry: "", pinError: false, stage: "", cabinetItem: "" });
+
+  const pinDigit = (d) => {
+    if (wiz.pinEntry.length >= 4) return;
+    const entry = wiz.pinEntry + d;
+    if (entry.length < 4) { setWiz({ ...wiz, pinEntry: entry }); return; }
+    const person = SAMPLE_WORKSHOP_PEOPLE.find(p => p.name === wiz.person);
+    if (person.pin === entry) {
+      setWiz({ ...wiz, pinEntry: entry, step: activeClocks[wiz.person] ? WIZ_ALREADY : WIZ_STAGE });
+    } else {
+      setWiz({ ...wiz, pinEntry: entry, pinError: true });
+      setTimeout(() => setWiz(w => ({ ...w, pinEntry: "", pinError: false })), 650);
+    }
+  };
+
+  const stop = (person) => {
+    setActive(prev => { const next = { ...prev }; delete next[person]; return next; });
+    resetWiz();
+  };
+
+  const goRunning = () => {
+    setActive(prev => ({ ...prev, [wiz.person]: { stage: wiz.stage, cabinetItem: needsCabinet ? wiz.cabinetItem : null, startedAt: Date.now() } }));
+    setWiz({ ...wiz, step: WIZ_RUNNING });
   };
 
   const toggle = (item, part) => {
@@ -360,96 +366,231 @@ function ClockInTab({
     const next = { ...completions, [item]: { ...cur, [part]: !cur[part] } };
     setCompletions(next); save("completions", next);
   };
-  const fractionFor = (item) => {
-    const c = completions[item] || { frame: false, door: false };
-    return (c.frame ? 0.5 : 0) + (c.door ? 0.5 : 0);
-  };
 
-  if (!signedInPerson) {
-    return <SignInScreen onSignedIn={(name) => { setSignedInPerson(name); save("signedInPerson", name); }} />;
+  // ---- who ----
+  if (wiz.step === WIZ_WHO) {
+    return (
+      <div>
+        <div style={{ ...styles.stepTitle, ...styles.serif }}>Who's clocking on?</div>
+        <div style={styles.tapGrid}>
+          {SAMPLE_WORKSHOP_PEOPLE.map(p => (
+            <button key={p.name} style={styles.tap} onClick={() => pickPerson(p.name)}>
+              {activeClocks[p.name] && <span style={styles.liveDot} />}
+              <div style={styles.tapName}>{p.name}</div>
+              {activeClocks[p.name] && <div style={styles.tapSub}>Already clocked on</div>}
+            </button>
+          ))}
+        </div>
+      </div>
+    );
   }
 
-  const cabinetForActive = activeClock?.cabinetItem
-    ? cabinetOptions.find(c => c.item === activeClock.cabinetItem)
-    : null;
-  const totalDone = cabinetOptions.reduce((a, c) => a + fractionFor(c.item), 0);
-
-  return (
-    <div>
-      <div style={styles.signedInBar}>
-        <div style={styles.signedInName}>Signed in as {signedInPerson}</div>
-        <button style={styles.signOutBtn} onClick={signOut}>Sign out</button>
+  // ---- pin ----
+  if (wiz.step === WIZ_PIN) {
+    const person = SAMPLE_WORKSHOP_PEOPLE.find(p => p.name === wiz.person);
+    return (
+      <div style={styles.pinWrap}>
+        <div style={{ ...styles.pinTarget, ...styles.serif }}>{person.name}'s PIN</div>
+        <div style={styles.pinDots}>{[0, 1, 2, 3].map(i => <div key={i} style={styles.pinDot(i < wiz.pinEntry.length)} />)}</div>
+        {wiz.pinError
+          ? <div style={styles.pinError}>Wrong PIN — try again</div>
+          : <div style={styles.pinHint}>Demo PIN: {person.pin}</div>}
+        <div style={styles.pinPad}>
+          {["1", "2", "3", "4", "5", "6", "7", "8", "9"].map(d => (
+            <button key={d} style={styles.pinKey} onClick={() => pinDigit(d)}>{d}</button>
+          ))}
+          <button style={{ ...styles.pinKey, ...styles.pinKeyGhost }} onClick={resetWiz}>Not {person.name}</button>
+          <button style={styles.pinKey} onClick={() => pinDigit("0")}>0</button>
+          <button style={{ ...styles.pinKey, ...styles.pinKeyGhost }} onClick={() => setWiz({ ...wiz, pinEntry: wiz.pinEntry.slice(0, -1) })}>⌫</button>
+        </div>
       </div>
-      <div style={styles.jobLine}>Job: {SAMPLE_JOB.da_number} {SAMPLE_JOB.client_name} — {SAMPLE_ROOM} (only job in this preview)</div>
+    );
+  }
 
-      {!activeClock ? (
-        <div>
-          <div style={{ fontSize: 13, color: "#555", marginBottom: 6 }}>Stage</div>
-          <div style={styles.stageGrid}>
-            {SAMPLE_STAGES.map(s => (
-              <button key={s.name} style={styles.stageBtn(draftStage === s.name)}
-                onClick={() => { setDraftStage(s.name); setDraftCabinet(""); }}>
-                {s.name}
-              </button>
-            ))}
+  // ---- already running ----
+  if (wiz.step === WIZ_ALREADY) {
+    const running = activeClocks[wiz.person];
+    const cab = running.cabinetItem ? cabinetOptions.find(c => c.item === running.cabinetItem) : null;
+    return (
+      <div>
+        <div style={{ ...styles.stepTitle, ...styles.serif }}>{wiz.person} is already clocked on</div>
+        <div style={styles.confirmCard}>
+          <div style={styles.confirmSummary}>
+            <div style={styles.confirmRow}><span style={styles.confirmK}>Stage</span><span style={styles.confirmV}>{running.stage}</span></div>
+            {cab && <div style={styles.confirmRow}><span style={styles.confirmK}>Cabinet</span><span style={styles.confirmV}>#{cab.item} {cab.description}</span></div>}
+            <div style={styles.confirmRow}><span style={styles.confirmK}>Running</span><span style={styles.confirmV}>{fmtElapsed(Date.now() - running.startedAt)}</span></div>
           </div>
+          <button style={styles.stopBtn} onClick={() => stop(wiz.person)}>Stop</button>
+        </div>
+        <div style={{ textAlign: "center", marginTop: 10 }}>
+          <button style={styles.backBtn} onClick={resetWiz}>← Not {wiz.person}</button>
+        </div>
+      </div>
+    );
+  }
 
-          {draftStageDef.isCabinetStage && (
-            <div style={{ marginBottom: 16 }}>
-              <div style={{ fontSize: 13, color: "#555", marginBottom: 6 }}>Cabinet</div>
-              <select style={styles.select} value={draftCabinet} onChange={(e) => setDraftCabinet(e.target.value)}>
-                <option value="">Pick a cabinet…</option>
-                {cabinetOptions.map(c => <option key={c.item} value={c.item}>#{c.item} — {c.description}</option>)}
-              </select>
-            </div>
-          )}
+  const trail = trailSteps(needsCabinet);
+  const activeIdx = trail.findIndex(t => t.k === wiz.step);
 
+  const Trail = () => (
+    <div style={styles.trail}>
+      {trail.map((t, i) => (
+        <React.Fragment key={t.k}>
+          <span style={styles.crumb(i === activeIdx ? "active" : i < activeIdx ? "done" : "todo")}>{t.label}</span>
+          {i < trail.length - 1 && <span style={styles.crumbSep}>›</span>}
+        </React.Fragment>
+      ))}
+    </div>
+  );
+
+  // ---- stage ----
+  if (wiz.step === WIZ_STAGE) {
+    return (
+      <div>
+        <Trail />
+        <button style={styles.backBtn} onClick={resetWiz}>← Back</button>
+        <div style={{ ...styles.stepTitle, ...styles.serif }}>What are you doing, {wiz.person}?</div>
+        <div style={{ fontSize: 13, color: C.ink2, marginBottom: 16 }}>Job: {SAMPLE_JOB.da_number} {SAMPLE_JOB.client_name} — {SAMPLE_ROOM} (only job in this preview)</div>
+        <select
+          style={{ ...styles.select, maxWidth: 420, padding: "14px 16px", fontSize: 15, borderRadius: 10 }}
+          value={wiz.stage}
+          onChange={(e) => setWiz({ ...wiz, stage: e.target.value, cabinetItem: "" })}
+        >
+          <option value="">Choose a stage…</option>
+          {SAMPLE_STAGES.map(s => <option key={s.name} value={s.name}>{s.name}{s.isCabinetStage ? " (picks a cabinet next)" : ""}</option>)}
+        </select>
+        <div style={{ marginTop: 16 }}>
           <button
-            style={{ ...styles.clockOnBtn, ...((draftStageDef.isCabinetStage && !draftCabinet) ? styles.clockOnBtnDisabled : {}) }}
-            disabled={draftStageDef.isCabinetStage && !draftCabinet}
-            onClick={clockOn}
+            style={{ ...styles.startBtn, maxWidth: 420, opacity: wiz.stage ? 1 : 0.4, cursor: wiz.stage ? "pointer" : "not-allowed" }}
+            disabled={!wiz.stage}
+            onClick={() => setWiz({ ...wiz, step: needsCabinet ? WIZ_CABINET : WIZ_CONFIRM })}
           >
-            Clock on
+            Continue
           </button>
         </div>
-      ) : (
-        <div style={styles.runningCard}>
-          <div style={styles.runningStage}>
-            {activeClock.stage}{cabinetForActive ? ` — #${cabinetForActive.item} ${cabinetForActive.description}` : ""}
+      </div>
+    );
+  }
+
+  // ---- cabinet ----
+  if (wiz.step === WIZ_CABINET) {
+    const inProgress = cabinetOptions.filter(c =>
+      Object.entries(activeClocks).some(([p, r]) => p !== wiz.person && r.stage === wiz.stage && r.cabinetItem === c.item)
+    );
+    const rest = cabinetOptions.filter(c => !inProgress.includes(c));
+    const cabTap = (c) => {
+      const whoElse = Object.entries(activeClocks).filter(([p, r]) => p !== wiz.person && r.stage === wiz.stage && r.cabinetItem === c.item).map(([p]) => p);
+      return (
+        <button key={c.item} style={styles.tap} onClick={() => setWiz({ ...wiz, cabinetItem: c.item, step: WIZ_CONFIRM })}>
+          <div style={styles.cabNum}>#{c.item}</div>
+          <div style={styles.cabType}>{c.description}</div>
+          {whoElse.length > 0 && <div style={styles.cabTapLive}><span style={{ width: 6, height: 6, borderRadius: "50%", background: C.clay }} />{whoElse.join(" & ")} on it</div>}
+        </button>
+      );
+    };
+    return (
+      <div>
+        <Trail />
+        <button style={styles.backBtn} onClick={() => setWiz({ ...wiz, step: WIZ_STAGE })}>← Back</button>
+        <div style={{ ...styles.stepTitle, ...styles.serif }}>Which cabinet?</div>
+        {inProgress.length > 0 && <>
+          <div style={styles.groupLabel}>In progress</div>
+          <div style={styles.tapGrid}>{inProgress.map(cabTap)}</div>
+        </>}
+        <div style={styles.groupLabel}>{SAMPLE_ROOM}</div>
+        <div style={styles.tapGrid}>{rest.map(cabTap)}</div>
+      </div>
+    );
+  }
+
+  // ---- confirm ----
+  if (wiz.step === WIZ_CONFIRM) {
+    const cab = wiz.cabinetItem ? cabinetOptions.find(c => c.item === wiz.cabinetItem) : null;
+    return (
+      <div>
+        <Trail />
+        <button style={styles.backBtn} onClick={() => setWiz({ ...wiz, step: needsCabinet ? WIZ_CABINET : WIZ_STAGE })}>← Back</button>
+        <div style={{ ...styles.stepTitle, ...styles.serif }}>Ready to start</div>
+        <div style={styles.confirmCard}>
+          <div style={styles.confirmSummary}>
+            <div style={styles.confirmRow}><span style={styles.confirmK}>Who</span><span style={styles.confirmV}>{wiz.person}</span></div>
+            <div style={styles.confirmRow}><span style={styles.confirmK}>Job</span><span style={styles.confirmV}>{SAMPLE_JOB.da_number} — {SAMPLE_JOB.client_name}</span></div>
+            <div style={styles.confirmRow}><span style={styles.confirmK}>Stage</span><span style={styles.confirmV}>{wiz.stage}</span></div>
+            {cab && <div style={styles.confirmRow}><span style={styles.confirmK}>Cabinet</span><span style={styles.confirmV}>#{cab.item} {cab.description}</span></div>}
           </div>
-          <div style={styles.runningTime}>{fmtElapsed(Date.now() - activeClock.startedAt)}</div>
+          <button style={styles.startBtn} onClick={goRunning}>Start</button>
+        </div>
+      </div>
+    );
+  }
 
-          {activeClock.stage === "Bench prep" && cabinetForActive && (
-            <div style={{ margin: "14px 0" }}>
-              <div style={{ fontSize: 12, color: "#7a6a55", marginBottom: 8 }}>
-                Mark done as you go — frame and door each count half:
-              </div>
-              <button style={styles.partBtn((completions[cabinetForActive.item] || {}).frame)} onClick={() => toggle(cabinetForActive.item, "frame")}>Frame</button>
-              {" "}
-              <button style={styles.partBtn((completions[cabinetForActive.item] || {}).door)} onClick={() => toggle(cabinetForActive.item, "door")}>Door</button>
-            </div>
-          )}
+  // ---- running ----
+  const running = activeClocks[wiz.person];
+  if (!running) { resetWiz(); return null; }
+  const cab = running.cabinetItem ? cabinetOptions.find(c => c.item === running.cabinetItem) : null;
+  return (
+    <div style={styles.runningWrap}>
+      <span style={styles.runningBadge}><span style={styles.pulse} />Running</span>
+      <div style={styles.runningClock}>{fmtElapsed(Date.now() - running.startedAt)}</div>
+      <div style={styles.runningWhat}>{wiz.person} · {SAMPLE_JOB.da_number} · {running.stage}{cab ? ` · #${cab.item}` : ""}</div>
 
-          <button style={styles.clockOffBtn} onClick={clockOff}>Clock off</button>
+      {running.stage === "Bench prep" && cab && (
+        <div style={styles.partsBox}>
+          <div style={{ fontSize: 12, color: C.ink2, marginBottom: 8 }}>Mark done as you go — frame and door each count half:</div>
+          <button style={styles.partBtn((completions[cab.item] || {}).frame)} onClick={() => toggle(cab.item, "frame")}>Frame</button>
+          {" "}
+          <button style={styles.partBtn((completions[cab.item] || {}).door)} onClick={() => toggle(cab.item, "door")}>Door</button>
         </div>
       )}
 
-      <div style={styles.note}>
-        Bench prep running total (across everyone, not just you): <strong>{totalDone.toFixed(1)}</strong> of{" "}
-        {cabinetOptions.length} cabinets — this is exactly what the floor board's Bench prep target would read
-        from <code>cabinet_stage_progress</code> once this is wired up for real.
-      </div>
+      <button style={styles.stopBtn} onClick={() => stop(wiz.person)}>Stop</button>
+    </div>
+  );
+}
 
-      <div style={styles.sectionTitle}>Today's clock log</div>
-      {timeLog.length === 0 ? (
-        <div style={styles.logEmpty}>Nothing clocked off yet.</div>
+function LiveBoardTab({ activeClocks, cabinets }) {
+  const entries = Object.entries(activeClocks);
+  const cabinetOptions = cabinets.filter(c => c.typeName !== "Panel");
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+    if (entries.length === 0) return;
+    const t = setInterval(() => forceTick(x => x + 1), 1000);
+    return () => clearInterval(t);
+  }, [entries.length]);
+
+  // Flag any stage+cabinet combo two or more people are on at once.
+  const shared = entries.filter(([p, r]) => r.cabinetItem && entries.some(([p2, r2]) => p2 !== p && r2.stage === r.stage && r2.cabinetItem === r.cabinetItem));
+
+  return (
+    <div>
+      <div style={styles.sectionTitle}>Running now</div>
+      {entries.length === 0 ? (
+        <div style={styles.emptyLive}>Nobody's clocked on right now — try the Clock on/off tab.</div>
       ) : (
-        timeLog.map((e, i) => (
-          <div key={i} style={styles.logRow}>
-            <span>{e.person} — {e.stage}{e.cabinetItem ? ` — #${e.cabinetItem}` : ""}</span>
-            <span>{e.minutes}m</span>
-          </div>
-        ))
+        <table style={styles.liveTable}>
+          <thead><tr><th style={styles.th}>Who</th><th style={styles.th}>Job</th><th style={styles.th}>Stage</th><th style={styles.th}>Cabinet</th><th style={styles.th}>Elapsed</th></tr></thead>
+          <tbody>
+            {entries.map(([person, r]) => {
+              const cab = r.cabinetItem ? cabinetOptions.find(c => c.item === r.cabinetItem) : null;
+              return (
+                <tr key={person}>
+                  <td style={styles.td}><div style={styles.who}><span style={styles.avatar}>{initials(person)}</span>{person}</div></td>
+                  <td style={styles.td}>{SAMPLE_JOB.da_number}</td>
+                  <td style={styles.td}><span style={styles.liveStageTag}>{r.stage}</span></td>
+                  <td style={{ ...styles.td, color: C.ink3, fontSize: 12.5 }}>{cab ? `#${cab.item} ${cab.description}` : "—"}</td>
+                  <td style={{ ...styles.td, ...styles.liveElapsed }}>{fmtElapsed(Date.now() - r.startedAt)}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+      {shared.length > 0 && (
+        <div style={styles.sameCabNote}>
+          {shared.map(([p]) => p).join(" and ")} {shared.length === 2 ? "are" : "are"} both running against the same
+          cabinet right now — two people on one cabinet is normal and expected. Total time logged against a cabinet is
+          labour minutes (everyone's time added up), not wall-clock time.
+        </div>
       )}
     </div>
   );
@@ -461,20 +602,16 @@ export default function TimeTrackerPreview() {
   const [extras, setExtras] = useState(() => load("extras", null) || initialExtras());
   const [accessories, setAccessories] = useState(() => load("accessories", null) || initialAccessories());
   const [completions, setCompletions] = useState(() => load("completions", null) || {});
-  const [signedInPerson, setSignedInPerson] = useState(() => load("signedInPerson", null));
-  const [activeClock, setActiveClock] = useState(() => load("activeClock", null));
-  const [timeLog, setTimeLog] = useState(() => load("timeLog", null) || []);
+  const [activeClocks, setActiveClocks] = useState(() => load("activeClocks", null) || {});
 
   const resetDemo = () => {
-    if (!window.confirm("Reset this preview back to the original Anna Reid sample data? This also signs you out and clears the clock log.")) return;
+    if (!window.confirm("Reset this preview back to the original Anna Reid sample data? This also clears who's clocked on.")) return;
     const c = initialCabinets(), e = initialExtras(), a = initialAccessories();
     setCabinets(c); save("cabinets", c);
     setExtras(e); save("extras", e);
     setAccessories(a); save("accessories", a);
     setCompletions({}); save("completions", {});
-    setSignedInPerson(null); save("signedInPerson", null);
-    setActiveClock(null); save("activeClock", null);
-    setTimeLog([]); save("timeLog", []);
+    setActiveClocks({}); save("activeClocks", {});
   };
 
   return (
@@ -486,22 +623,26 @@ export default function TimeTrackerPreview() {
         up for this preview (see the code comment). Nothing you do on this page touches the main schedule or
         floor board. <a href="#" onClick={(e) => { e.preventDefault(); resetDemo(); }}>Reset to sample data</a>
       </div>
-      <div style={styles.title}>Time tracker — try it out</div>
-      <div style={styles.subtitle}>One combined tool: import review and the real clock on/off flow, both against real sample data.</div>
+      <div style={{ ...styles.title, ...styles.serif }}>Time tracker — try it out</div>
+      <div style={styles.subtitle}>One combined tool: import review, the clock on/off wizard, and who's on now.</div>
 
       <div style={styles.tabs}>
         <button style={styles.tab(tab === "import")} onClick={() => setTab("import")}>Import review</button>
-        <button style={styles.tab(tab === "clock")} onClick={() => setTab("clock")}>Clock in/out</button>
+        <button style={styles.tab(tab === "clock")} onClick={() => setTab("clock")}>Clock on/off</button>
+        <button style={styles.tab(tab === "live")} onClick={() => setTab("live")}>Who's on now</button>
       </div>
 
-      {tab === "import"
-        ? <ImportReviewTab cabinets={cabinets} setCabinets={setCabinets} extras={extras} setExtras={setExtras} accessories={accessories} setAccessories={setAccessories} />
-        : <ClockInTab
-            signedInPerson={signedInPerson} setSignedInPerson={setSignedInPerson}
-            activeClock={activeClock} setActiveClock={setActiveClock}
-            timeLog={timeLog} setTimeLog={setTimeLog}
-            cabinets={cabinets} completions={completions} setCompletions={setCompletions}
-          />}
+      <div style={styles.card}>
+        {tab === "import" && (
+          <ImportReviewTab cabinets={cabinets} setCabinets={setCabinets} extras={extras} setExtras={setExtras} accessories={accessories} setAccessories={setAccessories} />
+        )}
+        {tab === "clock" && (
+          <ClockWizard activeClocks={activeClocks} setActiveClocks={setActiveClocks} cabinets={cabinets} completions={completions} setCompletions={setCompletions} />
+        )}
+        {tab === "live" && (
+          <LiveBoardTab activeClocks={activeClocks} cabinets={cabinets} />
+        )}
+      </div>
     </div>
   );
 }
