@@ -10,9 +10,12 @@
 -- Naming convention (display and enforce this in the admin screen): PD
 -- means Pair of Doors, SD means Single Door, a trailing number is width
 -- in cm. So "Tall PD 120" is a tall cabinet with a pair of doors, 120cm
--- wide. Confirmed against a real Cabinet Vision export (DA1234 Walker
--- Church) — several of the seeded names below matched real cabinets on
--- that job exactly (e.g. "Base Intg DW Door 67").
+-- wide. Confirmed against two real Cabinet Vision exports — DA1234
+-- Walker Church (several of the seeded names below matched real cabinets
+-- on that job exactly, e.g. "Base Intg DW Door 67") and DA1277 Anna Reid
+-- (added Highline and "Base Intg Fridge 67" below after confirming they
+-- were genuinely missing common types, not one-offs — Highline in
+-- particular is an everyday unit, not something specific to that job).
 
 create table if not exists cabinet_types (
   id uuid primary key default gen_random_uuid(),
@@ -42,8 +45,11 @@ insert into cabinet_types (name, category, carries_reassembly) values
   ('Base Dwr Line 1D-PD 110', 'base', true),
   ('Base Sink PD 80', 'base', true),
   ('Base Intg DW Door 67', 'base', true),
+  ('Base Intg Fridge 67', 'base', true),
   ('Base Double Bin 48', 'base', true),
   ('Base 2 Oak Chopping Boards', 'base', true),
+  ('Base Highline SD', 'base', true),
+  ('Base Highline PD', 'base', true),
   ('Tall PD 80', 'tall', true),
   ('Tall SD 67', 'tall', true),
   ('Tall FFR Housing', 'tall', true),
