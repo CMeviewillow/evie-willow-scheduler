@@ -84,8 +84,39 @@ export const SAMPLE_ACCESSORIES = [
   { label: "Spice/Jars Racks", cabinetItem: null, rawSpecText: "Spice/Jars Racks — TBC", productCode: null },
 ];
 
-// The real seeded team (0001_people.sql) — workshop names only, for the
-// bench prep tap demo's "who's doing this" picker.
+// The real seeded team (0001_people.sql), workshop names only. PINs here
+// are made up for this preview only — real people aren't seeded with a
+// PIN in 0001_people.sql on purpose (a placeholder number in a migration
+// would read as real data); real PINs get set per person via the
+// ?admin=aliases screen before Phase 3 goes live for real.
 export const SAMPLE_WORKSHOP_PEOPLE = [
-  "Harry", "Jon", "Tom", "Mike", "Jan", "Jaxon", "Josh", "Wayne", "Glenn", "Mark",
+  { name: "Harry", pin: "1111" },
+  { name: "Jon", pin: "2222" },
+  { name: "Tom", pin: "3333" },
+  { name: "Mike", pin: "4444" },
+  { name: "Jan", pin: "5555" },
+  { name: "Jaxon", pin: "6666" },
+  { name: "Josh", pin: "7777" },
+  { name: "Wayne", pin: "8888" },
+  { name: "Glenn", pin: "9999" },
+  { name: "Mark", pin: "0000" },
+];
+
+// The 12 production stages (0006_stages.sql). isCabinetStage drives
+// whether a cabinet must be picked before clocking on; hasParts (Bench
+// prep only) drives whether it's a frame/door tap instead of a plain
+// timer.
+export const SAMPLE_STAGES = [
+  { name: "CNC", isCabinetStage: false, hasParts: false },
+  { name: "Bench prep", isCabinetStage: true, hasParts: true },
+  { name: "Cabinet bench", isCabinetStage: true, hasParts: false },
+  { name: "Drawer making", isCabinetStage: false, hasParts: false },
+  { name: "Spraying and finishing", isCabinetStage: false, hasParts: false },
+  { name: "Cabinet reassembly", isCabinetStage: true, hasParts: false },
+  { name: "Edgebanding", isCabinetStage: false, hasParts: false },
+  { name: "Timber machining", isCabinetStage: false, hasParts: false },
+  { name: "Production prep", isCabinetStage: false, hasParts: false },
+  { name: "Remakes and fix-ups", isCabinetStage: true, hasParts: false },
+  { name: "Delivery and logistics", isCabinetStage: false, hasParts: false },
+  { name: "Design and admin", isCabinetStage: false, hasParts: false },
 ];
