@@ -13,9 +13,17 @@
 -- isn't complete at this stage until BOTH its frame and its door are
 -- done, so it needs the two-part completion model added in
 -- 0013_bench_prep_parts.sql (has_parts), not just a plain done/not-done
--- like Cabinet bench. Drawer making stays off this stage entirely — the
--- floor board already tracks drawer boxes on its own separate tab, not
--- as part of any cabinet's stage progress.
+-- like Cabinet bench.
+--
+-- Drawer making is its own separate overhead stage (like CNC or
+-- Edgebanding), not part of any cabinet's stage progress and not a third
+-- Bench prep part — a drawer box isn't numbered/typed against one
+-- specific cabinet the way a frame or door is. It exists so real clocked
+-- time can eventually be costed against it. The floor board's existing
+-- Drawers tab (Harry's daily batch counts) is a separate, real-time
+-- production-visibility tool and stays exactly as it is — there's no
+-- person or precise time on a batch count to derive labour minutes from,
+-- so it doesn't feed this stage's time_entries, it just runs alongside it.
 
 create table if not exists stages (
   id uuid primary key default gen_random_uuid(),
@@ -31,11 +39,12 @@ insert into stages (name, sort_order, is_cabinet_stage, is_overhead) values
   ('CNC', 1, false, true),
   ('Bench prep', 2, true, false),
   ('Cabinet bench', 3, true, false),
-  ('Spraying and finishing', 4, false, true),
-  ('Cabinet reassembly', 5, true, false),
-  ('Edgebanding', 6, false, true),
-  ('Timber machining', 7, false, true),
-  ('Production prep', 8, false, true),
-  ('Remakes and fix-ups', 9, true, false),
-  ('Delivery and logistics', 10, false, false),
-  ('Design and admin', 11, false, false);
+  ('Drawer making', 4, false, true),
+  ('Spraying and finishing', 5, false, true),
+  ('Cabinet reassembly', 6, true, false),
+  ('Edgebanding', 7, false, true),
+  ('Timber machining', 8, false, true),
+  ('Production prep', 9, false, true),
+  ('Remakes and fix-ups', 10, true, false),
+  ('Delivery and logistics', 11, false, false),
+  ('Design and admin', 12, false, false);

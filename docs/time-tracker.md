@@ -49,7 +49,7 @@ executed yet.
 | 0003 | `jobs` | `da_number`, client, and a status ladder: `quoted → setup → released → in_production → delivered → complete`. `setup` means a Production import is under way; `released` means every cabinet on the job has a type. |
 | 0004 | `rooms` | Cabinet numbering restarts per room (`Kitchen`, `Utility`, ...), so cabinet numbers are only unique within a room. |
 | 0005 | `cabinet_types` | The master list — the thing that makes cross-job pooling possible. Only ever created via the phase 2 import review screen or an admin screen, both office-side. Anything created during an import is flagged `needs_office_review`. |
-| 0006 | `stages` | The 11 production stages. `is_cabinet_stage` (`Bench prep`, `Cabinet bench`, `Cabinet reassembly`, `Remakes and fix-ups`) drives whether the floor board asks which cabinet a timer is against; `has_parts` (added in 0013) narrows that further for Bench prep. |
+| 0006 | `stages` | The 12 production stages (including `Drawer making`, its own overhead stage — see "Bench prep: frame and door" below for why it's not a cabinet stage). `is_cabinet_stage` (`Bench prep`, `Cabinet bench`, `Cabinet reassembly`, `Remakes and fix-ups`) drives whether the floor board asks which cabinet a timer is against; `has_parts` (added in 0013) narrows that further for Bench prep. |
 | 0007 | `production_imports` | One row per Production-schedule import attempt (phase 2 writes here). Keeps the raw extracted text so a parse can be re-run without asking for the file again. Named source-agnostically, not `a4_imports` — see "The core idea" above. |
 | 0008 | `cabinets` | One row per physical cabinet. `cabinet_type_id` is nullable at import, required before the job can release. Decimal numbers (`#14`, `#14.1`) are real, distinct components — confirmed against a real Cabinet Vision export — not a typo or a duplicate. Rows with "Skirting" in the description are never created here — see "Skirting and cornice" below. |
 | 0009 | `time_entries` | The actual clock on/off records. See concurrency rules below. `part` (added in 0013) is required exactly when the stage `has_parts`. |
@@ -99,9 +99,15 @@ that cabinet type. Two things make that work:
 A cabinet isn't complete at Bench prep until **both its frame and its door**
 are done — so unlike Cabinet bench or Cabinet reassembly (where one done
 event means the whole cabinet), Bench prep needs two, each worth half.
-Drawer making is deliberately **not** a third part here: the floor board
-already tracks drawer boxes on its own separate "Drawers" tab, entirely
-outside this per-cabinet model.
+Drawer making is deliberately **not** a third part here — it's its own
+stage (`Drawer making`, `is_overhead = true`), not tied to any cabinet at
+all: a drawer box isn't numbered/typed against one specific cabinet the way
+a frame or door is. It exists purely so real clocked time can eventually be
+costed against it, same as CNC or Edgebanding. The floor board's existing
+"Drawers" tab (Harry's daily batch counts by label + quantity) is a
+separate, real-time production-visibility tool and stays exactly as it is
+— there's no person or precise time on a batch count to derive labour
+minutes from, so it runs alongside this stage rather than feeding it.
 
 This also exposed a real gap: `time_entries` only ever recorded continuous
 clock-on/clock-off **time**, with no discrete "this is actually done" event
