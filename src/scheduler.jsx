@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo, useRef } from "react";
 import { Plus, Trash2, AlertTriangle, Calendar, Settings, Download, Upload, X, Truck, Undo2, Redo2, TrendingUp } from "lucide-react";
 import "./storage.js"; // installs window.storage backed by Supabase
 import PersonAliasAdmin from "./timetracker/PersonAliasAdmin.jsx";
+import TimeTrackerPreview from "./timetracker/TimeTrackerPreview.jsx";
 
 // Read-only mode: append ?readonly=1 to the URL to disable all edits.
 const IS_READONLY = typeof window !== "undefined"
@@ -14,7 +15,9 @@ const IS_BOARD = typeof window !== "undefined"
   && new URLSearchParams(window.location.search).get("board") === "1";
 
 // Time tracker admin screens, reached with ?admin=<name> on the same
-// URL, same pattern as ?board=1. Only "aliases" exists so far.
+// URL, same pattern as ?board=1. "aliases" is the team/PIN admin screen;
+// "preview" is the local-only try-it-out for Phase 2 import review and
+// Phase 3 bench prep tapping (see src/timetracker/TimeTrackerPreview.jsx).
 const ADMIN_SCREEN = typeof window !== "undefined"
   && new URLSearchParams(window.location.search).get("admin");
 
@@ -3289,6 +3292,10 @@ function App() {
 
   if (ADMIN_SCREEN === "aliases") {
     return <PersonAliasAdmin />;
+  }
+
+  if (ADMIN_SCREEN === "preview") {
+    return <TimeTrackerPreview />;
   }
 
   if (loading) {
