@@ -6,6 +6,11 @@
 // OneDrive and any other device syncing this same folder — no separate
 // upload step needed. Read-only: never writes anything back to Supabase.
 //
+// Also writes a matching .csv with just the job list (name, cabinets,
+// colour, installer, install date, notes) — the JSON is the complete,
+// exact-fidelity backup for restoring from; the CSV is there so a human
+// can just open it in Excel and read it, no JSON-wrangling needed.
+//
 // Run manually:   node --env-file=.env scripts/backup-schedule.mjs
 // Run on schedule: see the Windows Task Scheduler task "EvieWillowScheduleBackup".
 
@@ -53,7 +58,38 @@ async function main() {
   await writeFile(outFile, JSON.stringify(payload, null, 2), "utf8");
   console.log(`Backed up ${data.length} key(s) to ${outFile}`);
 
+  const jobsRow = data.find(r => r.key === "ew-jobs");
+  if (jobsRow?.value) {
+    const csvFile = path.join(backupsDir, `schedule-backup-${stamp}.csv`);
+    await writeFile(csvFile, jobsToCsv(jobsRow.value), "utf8");
+    console.log(`Wrote readable job list to ${csvFile}`);
+  }
+
   await pruneOldBackups();
+}
+
+function csvCell(value) {
+  const s = value == null ? "" : String(value);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function jobsToCsv(jobs) {
+  const header = ["Job name", "Total cabinets", "Colour", "Installer", "Install date", "Locked", "Notes"];
+  const lines = [header.map(csvCell).join(",")];
+  for (const j of jobs) {
+    const totalCabinets = Object.values(j.cabinets || {}).reduce((sum, n) => sum + (Number(n) || 0), 0);
+    const installDate = j.installOverride || j.targetInstallWeek || "";
+    lines.push([
+      j.name,
+      totalCabinets,
+      j.colour?.name || "",
+      j.installer || "auto",
+      installDate,
+      j.locked ? "yes" : "",
+      j.notes || "",
+    ].map(csvCell).join(","));
+  }
+  return lines.join("\r\n") + "\r\n";
 }
 
 async function pruneOldBackups() {
