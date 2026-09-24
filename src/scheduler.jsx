@@ -2891,6 +2891,14 @@ function App() {
   // by mergeJobs but `settings` was missed.
   const settingsRef = useRef(settings);
   useEffect(() => { settingsRef.current = settings; }, [settings]);
+  // Same guard, same reason, for dismissedReminders/dismissedWarnings — they
+  // had the identical unconditional-setState bug and kept the echo loop
+  // alive live in production even after the settings fix above shipped
+  // (confirmed 2026-09-24: two tabs, zero edits, still climbing post-fix).
+  const dismissedRemindersRef = useRef(dismissedReminders);
+  useEffect(() => { dismissedRemindersRef.current = dismissedReminders; }, [dismissedReminders]);
+  const dismissedWarningsRef = useRef(dismissedWarnings);
+  useEffect(() => { dismissedWarningsRef.current = dismissedWarnings; }, [dismissedWarnings]);
 
   // Load from storage (reusable function for realtime sync)
   const reloadFromStorage = async () => {
@@ -2911,8 +2919,20 @@ function App() {
         if (JSON.stringify(incoming) !== JSON.stringify(settingsRef.current)) setSettings(incoming);
       }
     } catch {}
-    try { const r = await window.storage.get("ew-dismissed-reminders"); if (r?.value) setDismissedReminders(JSON.parse(r.value)); } catch {}
-    try { const w = await window.storage.get("ew-dismissed-warnings"); if (w?.value) setDismissedWarnings(JSON.parse(w.value)); } catch {}
+    try {
+      const r = await window.storage.get("ew-dismissed-reminders");
+      if (r?.value) {
+        const incoming = JSON.parse(r.value);
+        if (JSON.stringify(incoming) !== JSON.stringify(dismissedRemindersRef.current)) setDismissedReminders(incoming);
+      }
+    } catch {}
+    try {
+      const w = await window.storage.get("ew-dismissed-warnings");
+      if (w?.value) {
+        const incoming = JSON.parse(w.value);
+        if (JSON.stringify(incoming) !== JSON.stringify(dismissedWarningsRef.current)) setDismissedWarnings(incoming);
+      }
+    } catch {}
     await loadFloorActuals();
   };
 
