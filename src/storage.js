@@ -11,6 +11,18 @@
 //   updated_at (timestamptz, default now())
 //
 // Realtime: we subscribe to changes so multiple tablets stay in sync.
+//
+// Uses Realtime Broadcast (a plain pub/sub signal), not postgres_changes
+// (database change capture). postgres_changes sends the ENTIRE changed row
+// over the websocket to every connected client on every write — but every
+// subscriber here only uses the notification as a "go re-fetch yourself"
+// signal and never reads the row payload it was given, so that full-row
+// data was being transmitted and immediately discarded, unused, on every
+// single change, to every open tab. Confirmed as the likely driver of a
+// real Supabase egress-quota breach (12+ GB in one billing period against
+// a 5GB cap) — see project_realtime_broadcast_egress_fix memory. Broadcast
+// carries only the tiny message envelope we choose to send (empty here),
+// regardless of how large kv_store's rows are.
 
 import { createClient } from "@supabase/supabase-js";
 
@@ -25,18 +37,42 @@ if (SUPABASE_URL && SUPABASE_ANON_KEY) {
 // Subscribers for realtime change notifications
 const subscribers = new Set();
 let realtimeChannel = null;
+let realtimeReady = null; // Promise resolving once the channel is actually subscribed
 
+// Lazily creates the shared broadcast channel (once per tab) and returns a
+// promise that resolves when it's ready to send on. Safe to call from both
+// subscribe() (to start listening) and set()/delete() (to notify) — whoever
+// calls first creates it, everyone else reuses the same channel/promise.
 function ensureRealtime() {
-  if (!supabase || realtimeChannel) return;
-  realtimeChannel = supabase
-    .channel("kv_store_changes")
-    .on("postgres_changes", { event: "*", schema: "public", table: "kv_store" }, () => {
-      // Notify all subscribers that something changed
+  if (!supabase) return null;
+  if (!realtimeChannel) {
+    realtimeChannel = supabase.channel("kv_store_changes");
+    realtimeChannel.on("broadcast", { event: "changed" }, () => {
+      // Notify all subscribers that something changed — no payload to read,
+      // callers already re-fetch whatever they need themselves.
       subscribers.forEach(fn => {
         try { fn(); } catch (e) { console.error(e); }
       });
-    })
-    .subscribe();
+    });
+    realtimeReady = new Promise((resolve) => {
+      realtimeChannel.subscribe((status) => {
+        if (status === "SUBSCRIBED") resolve();
+      });
+    });
+  }
+  return realtimeReady;
+}
+
+// Best-effort notify other tabs after our own write — never blocks or
+// fails the write itself if the channel isn't ready yet (e.g. a save that
+// races ahead of the subscription finishing on a fresh page load); other
+// tabs will still pick the change up on their own next load/poll.
+function notifyChanged() {
+  const ready = ensureRealtime();
+  if (!ready) return;
+  ready.then(() => {
+    realtimeChannel.send({ type: "broadcast", event: "changed", payload: {} });
+  }).catch(() => {});
 }
 
 // Public API matching window.storage
@@ -61,6 +97,7 @@ export const storage = {
       .from("kv_store")
       .upsert({ key, value: parsed, updated_at: new Date().toISOString() });
     if (error) throw error;
+    notifyChanged();
     return { key, value, shared: true };
   },
 
@@ -71,6 +108,7 @@ export const storage = {
       .delete()
       .eq("key", key);
     if (error) throw error;
+    notifyChanged();
     return { key, deleted: true, shared: true };
   },
 
