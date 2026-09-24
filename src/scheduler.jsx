@@ -2778,7 +2778,21 @@ function mergeJobs(base, mine, theirs) {
       merged.push(m);
     } else {
       const t = theirsById.get(m.id);
-      if (t !== undefined) merged.push(t); // untouched — take the server's copy
+      if (t !== undefined) {
+        // Untouched locally — take the server's copy, but keep OUR reference
+        // if the content is actually identical. theirs is always a fresh
+        // JSON.parse, so a plain `merged.push(t)` here made every reload
+        // produce a brand-new array of new object references even when
+        // nothing had changed, which broke sameJobs's reference check below
+        // (it always saw "different"), which called setJobs on every single
+        // reload, which re-triggered the jobs-save effect and re-broadcast —
+        // an echo loop exactly like the settings/reminders/warnings one,
+        // just in the one place that was believed to already be protected.
+        // Confirmed live 2026-09-24: with the settings/reminders/warnings
+        // fixes shipped, a 2+ tab echo loop was still running; it stopped
+        // the moment this line started preserving the local reference.
+        merged.push(JSON.stringify(m) === JSON.stringify(t) ? m : t);
+      }
       // else: untouched locally, server no longer has it — respect the remote delete
     }
   }
