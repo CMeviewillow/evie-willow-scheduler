@@ -2876,6 +2876,21 @@ function App() {
   // have written since. Updated after every successful load, save, and
   // merge-reload.
   const lastSyncedJobsRef = useRef(null);
+  // Same "always current" mirror as jobsRef, for settings — settings has no
+  // per-item merge concern (unlike jobs, it's one shared object, not a
+  // list), so a plain equality check before setSettings is enough; it just
+  // never got one. Without it, reloadFromStorage always created a new
+  // settings object even when nothing changed, which re-triggered the
+  // debounced settings-save effect below, which re-broadcast, which
+  // triggered every OTHER connected client's reload the same way — a
+  // permanent ping-pong between any 2+ connected clients (any scheduler
+  // tab + the always-on floor board TV counts). Confirmed live 2026-09-24:
+  // two tabs open, zero real edits, and the realtime callback fired 15
+  // times within a second and kept climbing — the real driver of a
+  // Supabase egress-quota breach that day, once `jobs` was already fixed
+  // by mergeJobs but `settings` was missed.
+  const settingsRef = useRef(settings);
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
 
   // Load from storage (reusable function for realtime sync)
   const reloadFromStorage = async () => {
@@ -2889,7 +2904,13 @@ function App() {
         if (!sameJobs(merged, jobsRef.current)) setJobs(merged);
       }
     } catch {}
-    try { const s = await window.storage.get("ew-settings"); if (s?.value) setSettings(JSON.parse(s.value)); } catch {}
+    try {
+      const s = await window.storage.get("ew-settings");
+      if (s?.value) {
+        const incoming = JSON.parse(s.value);
+        if (JSON.stringify(incoming) !== JSON.stringify(settingsRef.current)) setSettings(incoming);
+      }
+    } catch {}
     try { const r = await window.storage.get("ew-dismissed-reminders"); if (r?.value) setDismissedReminders(JSON.parse(r.value)); } catch {}
     try { const w = await window.storage.get("ew-dismissed-warnings"); if (w?.value) setDismissedWarnings(JSON.parse(w.value)); } catch {}
     await loadFloorActuals();
