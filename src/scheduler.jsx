@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useMemo, useRef } from "react";
-import { Plus, Trash2, AlertTriangle, Calendar, Settings, Download, Upload, X, Truck, Undo2, Redo2, TrendingUp } from "lucide-react";
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import { Plus, Trash2, AlertTriangle, Calendar, Settings, Download, Upload, X, Truck, Undo2, Redo2, TrendingUp, GripVertical } from "lucide-react";
 import "./storage.js"; // installs window.storage backed by Supabase
 import PersonAliasAdmin from "./timetracker/PersonAliasAdmin.jsx";
 import TimeTrackerPreview from "./timetracker/TimeTrackerPreview.jsx";
@@ -76,6 +76,25 @@ const DRAGGABLE_STAGES = {
   finishing:  { dateField: "finishingOverride",  daysField: "finishingDaysOverride", usedField: "finishingOverrideUsed" },
   reassembly: { dateField: "reassemblyOverride", daysField: "reassemblyDaysOverride", usedField: "reassemblyOverrideUsed" },
   install:    { dateField: "installOverride",    daysField: "installDaysOverride" },
+};
+
+// When a bar drag moves one production stage, which OTHER stages should
+// follow it (their own date pin cleared so they re-chain naturally off the
+// new position, via the same conveyor-belt relationships auto jobs already
+// use)? Only lists directions the auto logic actually supports — bench is
+// the anchor everything else derives from (machining ends right before it
+// starts, finishing starts 1 day after it starts), and reassembly derives
+// from finishing the same way. The reverse isn't true (bench doesn't derive
+// from machining, nothing derives from reassembly), so those cascade to
+// nothing — clearing an unrelated stage's pin there would just reset it to
+// some other independent position, not make it "follow" the drag. Install
+// is never included: it's the customer commitment, set manually, separately.
+const STAGE_CASCADE = {
+  machining: [],
+  bench: ["machining", "finishing", "reassembly"],
+  finishing: ["reassembly"],
+  reassembly: [],
+  install: [],
 };
 
 const FITTERS = ["Steve", "Thompson"];
@@ -225,7 +244,8 @@ function dayCapacity(date) {
 
 // Friday's REAL capacity (07:00-11:00 minus a break = 3.75 of an 8.5-hour
 // day) — used only for the floor board's own day-by-day cabinet breakdown
-// (dayLayoutForRatedInterval), never for the core scheduler's date math.
+// (cncQueueDayLayout/stageQueueDayLayout), never for the core scheduler's
+// date math.
 function fridayAwareCapacity(date) {
   return date.getDay() === 5 ? FRIDAY_DAY_FRACTION : 1;
 }
@@ -400,6 +420,7 @@ function newJob() {
     manualStart: "",         // optional manual start date (ISO)
     colour: { name: "", hex: "" }, // paint/finish colour — floor board groups booth runs by this
     boothRunId: "",          // jobs sprayed together to save a colour changeover (see booth-run warnings)
+    priorityRank: null,      // manual production-priority order, set by dragging the job's name in the Gantt. null = not yet manually ordered, falls back to deadline-driven order.
   };
 }
 
@@ -429,9 +450,10 @@ function featureImpact(features) {
 // Core scheduling rounds each job's total bench/finishing/reassembly time up
 // to the nearest half day (with a 0.5-day floor), same as before the
 // fractional rewrite. The floor board's own day-by-day cabinet breakdown
-// (dayLayoutForRatedInterval/cabinetEntriesFor) still works from each style's
-// EXACT count and rate, independent of this rounding — so partial-day
-// sharing between jobs still displays precisely. Rounding here is about
+// (cncQueueDayLayout/stageQueueDayLayout/cabinetEntriesFor) still works
+// from each style's EXACT count and rate, independent of this rounding —
+// so partial-day sharing between jobs still displays precisely. Rounding
+// here is about
 // keeping the overall schedule's month-spanning positions stable: an exact,
 // unrounded total compounds small savings across months of backlog into
 // large, disruptive drift versus what the workshop is used to seeing.
@@ -531,47 +553,28 @@ function computeRateReview(floorActuals, jobs) {
   });
 }
 
-// Walk a job's cabinet mix, style by style at that style's own rate, across a
-// fractional-day interval starting at `startSlot`. Returns
-// Map<dateKey, [{style, cabinets}]> — used for bench, finishing and
-// reassembly, which all run at real per-style rates and can share a day
-// across two different jobs.
-function dayLayoutForRatedInterval(startSlot, cabinetEntries, holidays) {
-  const byDate = new Map();
-  let cursor = normalizeToWorkingDay(startSlot, holidays);
-  for (const { style, count, rate } of cabinetEntries) {
-    let remaining = count;
-    while (remaining > DAY_EPSILON) {
-      const availableToday = fridayAwareCapacity(cursor.date) - cursor.used;
-      if (availableToday <= DAY_EPSILON) {
-        cursor = normalizeToWorkingDay({ date: nextWorkingDay(addDays(cursor.date, 1), holidays), used: 0 }, holidays);
-        continue;
-      }
-      const daysForRemaining = remaining / rate;
-      const daysConsumedToday = Math.min(daysForRemaining, availableToday);
-      const cabinetsToday = roundDay(daysConsumedToday * rate);
-      const k = dayKey(cursor.date);
-      if (!byDate.has(k)) byDate.set(k, []);
-      byDate.get(k).push({ style, cabinets: cabinetsToday });
-      remaining = roundDay(remaining - cabinetsToday);
-      cursor = advanceFractionalDay(cursor, daysConsumedToday, holidays);
-    }
-  }
-  return byDate;
+// Rounds a day's raw cabinet total for display, but never rounds a genuinely
+// nonzero remainder down to 0 — the tail end of a job's stage (e.g. its last
+// working day, where a fraction of a cabinet's worth of rated time is left)
+// would otherwise vanish from the floor board entirely, even though the
+// main Gantt still shows the job occupying that stage that day. See
+// project_floor_board_reasm_rounding.
+function roundedCabinetsForDisplay(raw) {
+  if (raw <= DAY_EPSILON) return 0;
+  return Math.max(1, Math.round(raw));
 }
 
-// CNC cutting is the one truly continuous resource in the workshop — unlike
-// bench (which needs a distinct block per job for assembly to make sense),
-// raw cutting flows seamlessly from one job's panels straight into the
-// next's. So the floor board's CNC target isn't positioned as a per-job
-// block at all: this walks EVERY job's cabinets, in the same queue order
-// used everywhere else, through the CNC line at each style's standard rate
-// — the same rate-and-fill model bench already uses via
-// dayLayoutForRatedInterval, just spanning the whole backlog in one
-// continuous pass from settings.startDate instead of restarting at each
-// job's own start date. That's what keeps a target on the CNC card every
-// working day there's still backlog to cut, instead of it going idle
-// between one job's own machining block and the next's.
+// CNC cutting is the one truly continuous resource in the workshop — raw
+// cutting flows seamlessly from one job's panels straight into the next's.
+// So the floor board's CNC target isn't positioned as a per-job block at
+// all: this walks EVERY job's cabinets, in the same queue order used
+// everywhere else, through the CNC line at each style's standard rate,
+// spanning the whole backlog in one continuous pass from settings.startDate
+// instead of restarting at each job's own start date. That's what keeps a
+// target on the CNC card every working day there's still backlog to cut,
+// instead of it going idle between one job's own machining block and the
+// next's. Bench/finishing/reassembly use the same continuous-queue model —
+// see stageQueueDayLayout below — for the same reason.
 function cncQueueDayLayout(scheduledJobs, holidays, startDate) {
   const byDate = new Map();
   let cursor = normalizeToWorkingDay({ date: startDate, used: 0 }, holidays);
@@ -601,6 +604,65 @@ function cncQueueDayLayout(scheduledJobs, holidays, startDate) {
   return byDate;
 }
 
+// Same continuous-queue model as CNC (above), for bench, finishing, and
+// reassembly — display-only, never touches the real scheduled task dates
+// (the Gantt bars, which stay exactly as computed: each job's own
+// dedicated block, unchanged). Without this, a job whose real cabinet
+// work finishes early within its own block (e.g. most of its cabinets
+// went through on the first few days, leaving only a sliver on the last)
+// makes the floor board's target for that day crater to near-zero, even
+// though there's a next job in the queue that's genuinely ready to fill
+// the rest of the day — see project_floor_board_queue_fill.
+//
+// Each job's own task.startSlot for the stage is still respected as a
+// floor — this never pulls a job's cabinets in before that job's own
+// prerequisites (previous stage, pins, capacity conflicts — all already
+// resolved by scheduleJobs) say it can genuinely begin. But if the queue
+// still has capacity left on a day after an earlier job's cabinets run
+// out, the next job whose own start has already arrived slots straight
+// into that gap instead of waiting for its own block to start.
+//
+// Jobs are walked in order of their own startSlot for THIS stage, not
+// scheduledJobs' install-priority order — a job with a later install date
+// can easily have an earlier bench/finishing/reassembly slot (slack,
+// pinned dates, etc.), and the shared cursor only ever moves forward, so
+// processing in priority order could skip a job's real start entirely and
+// misattribute its cabinets to whatever later day the cursor had already
+// reached.
+function stageQueueDayLayout(scheduledJobs, stageKey, rateScaleFor, holidays) {
+  const byDate = new Map();
+  const withTask = scheduledJobs
+    .map(job => ({ job, task: (job.tasks || []).find(t => t.stage === stageKey) }))
+    .filter(({ job, task }) => task?.startSlot && totalCabinets(job) > 0)
+    .sort((a, b) => compareFractionalSlot(a.task.startSlot, b.task.startSlot));
+  let cursor = null;
+  withTask.forEach(({ job, task }) => {
+    const jobStart = normalizeToWorkingDay(task.startSlot, holidays);
+    if (!cursor || compareFractionalSlot(jobStart, cursor) > 0) cursor = jobStart;
+    const colour = job.colour || { name: "", hex: "" };
+    const entries = cabinetEntriesFor(job, rateScaleFor(job, task));
+    entries.forEach(({ style, count, rate }) => {
+      let remaining = count;
+      while (remaining > DAY_EPSILON) {
+        const availableToday = fridayAwareCapacity(cursor.date) - cursor.used;
+        if (availableToday <= DAY_EPSILON) {
+          cursor = normalizeToWorkingDay({ date: nextWorkingDay(addDays(cursor.date, 1), holidays), used: 0 }, holidays);
+          continue;
+        }
+        const daysForRemaining = remaining / rate;
+        const daysConsumedToday = Math.min(daysForRemaining, availableToday);
+        const cabinetsToday = roundDay(daysConsumedToday * rate);
+        const k = dayKey(cursor.date);
+        if (!byDate.has(k)) byDate.set(k, []);
+        byDate.get(k).push({ jobId: job.id, jobName: job.name, colour, style, cabinets: cabinetsToday });
+        remaining = roundDay(remaining - cabinetsToday);
+        cursor = advanceFractionalDay(cursor, daysConsumedToday, holidays);
+      }
+    });
+  });
+  return byDate;
+}
+
 
 function mixFromEntries(entries) {
   const mix = {};
@@ -608,15 +670,37 @@ function mixFromEntries(entries) {
   return mix;
 }
 
+// Groups a stage's queue-day-layout entries by job for one day and emits
+// one rounded entry per job via addEntry — shared by cnc/bench/finishing/
+// reassembly below so they batch and round identically.
+function emitQueueDay(addEntry, stage, dateKey, dayEntries, extra) {
+  const byJob = new Map();
+  dayEntries.forEach(e => {
+    if (!byJob.has(e.jobId)) byJob.set(e.jobId, { jobName: e.jobName, colour: e.colour, entries: [] });
+    byJob.get(e.jobId).entries.push(e);
+  });
+  let batch = 0;
+  byJob.forEach(({ jobName, colour, entries }, jobId) => {
+    batch++;
+    const cabinets = roundedCabinetsForDisplay(entries.reduce((a, e) => a + e.cabinets, 0));
+    if (cabinets > 0) addEntry(dateKey, stage, { jobId, jobName, batch, cabinets, colour, mix: mixFromEntries(entries), ...(extra ? extra(entries) : {}) });
+  });
+}
+
 // Build the full day layout: { dateKey: { stage: [{jobId,jobName,batch,cabinets,colour,mix}] } }.
-// CNC is computed once up front as one continuous queue across the whole
-// backlog (see cncQueueDayLayout) rather than per job. "Bench prep" — frame,
-// door and drawer making — is the cabinets going to bench the next working
-// day, so it's derived straight from bench's own day-by-day numbers, shifted
-// back one working day, rather than paced separately. Finishing splits into
-// "spray" and "pad" (pad is whichever painted-family cabinets land on a
-// given finishing day) — display-only, the scheduler itself still has one
-// finishing stage.
+// CNC, bench, finishing and reassembly are each computed once up front as
+// one continuous queue across the whole backlog (see cncQueueDayLayout /
+// stageQueueDayLayout) rather than per job, so a target never craters to
+// near-zero just because one job's own cabinets happen to run out partway
+// through a day — the next job in the queue fills the rest, same as a real
+// bench/spray booth/reassembly area would in practice. This is entirely
+// display-only: the Gantt's own per-job blocks (job.tasks) are untouched.
+// "Bench prep" — frame, door and drawer making — is the cabinets going to
+// bench the next working day, so it's derived straight from bench's own
+// day-by-day numbers, shifted back one working day, rather than paced
+// separately. Finishing splits into "spray" and "pad" (pad is whichever
+// painted-family cabinets land on a given finishing day) — display-only,
+// the scheduler itself still has one finishing stage.
 function computeDayLayout(scheduled, holidays, settings) {
   const layout = {};
   const addEntry = (dateKey, stage, entry) => {
@@ -626,81 +710,43 @@ function computeDayLayout(scheduled, holidays, settings) {
   };
 
   const cncByDate = cncQueueDayLayout(scheduled, holidays, nextWorkingDay(parseISO(settings.startDate), holidays));
-  [...cncByDate.keys()].sort().forEach(k => {
-    const byJob = new Map();
-    cncByDate.get(k).forEach(e => {
-      if (!byJob.has(e.jobId)) byJob.set(e.jobId, { jobName: e.jobName, colour: e.colour, entries: [] });
-      byJob.get(e.jobId).entries.push(e);
-    });
-    let batch = 0;
-    byJob.forEach(({ jobName, colour, entries }, jobId) => {
-      batch++;
-      const cabinets = Math.round(entries.reduce((a, e) => a + e.cabinets, 0));
-      if (cabinets > 0) addEntry(k, "cnc", { jobId, jobName, batch, cabinets, colour, mix: mixFromEntries(entries) });
-    });
-  });
+  [...cncByDate.keys()].sort().forEach(k => emitQueueDay(addEntry, "cnc", k, cncByDate.get(k)));
 
-  scheduled.forEach(job => {
-    if (!job.tasks?.length) return;
-    if (totalCabinets(job) === 0) return;
-    const colour = job.colour || { name: "", hex: "" };
-    // A stage whose actual days (task.days, which reflects any
-    // benchDaysOverride/finishingDaysOverride/reassemblyDaysOverride) is
-    // smaller than its nominal cabinet-math days has been overbooked — extra
-    // hours/hands thrown at it to clear faster than the standard rate. Scale
-    // that stage's own day-layout rate up to match, so the floor board's
-    // cabinets/day reflects the actual pace rather than the standard one.
-    // Unoverridden stages have task.days === nominal, so scale is exactly 1.
+  // A stage whose actual days (task.days, which reflects any
+  // benchDaysOverride/finishingDaysOverride/reassemblyDaysOverride) is
+  // smaller than its nominal cabinet-math days has been overbooked — extra
+  // hours/hands thrown at it to clear faster than the standard rate. Scale
+  // that stage's own day-layout rate up to match, so the floor board's
+  // cabinets/day reflects the actual pace rather than the standard one.
+  // Unoverridden stages have task.days === nominal, so scale is exactly 1.
+  const benchByDate = stageQueueDayLayout(scheduled, "bench", (job, task) => {
     const nominalBenchDays = benchDaysForJob(job);
-    const nominalFinishDays = nominalBenchDays + featureImpact(job.features).flatExtra;
-
-    const benchTask = job.tasks.find(t => t.stage === "bench");
-    if (benchTask?.startSlot) {
-      const benchScale = benchTask.days > 0 ? nominalBenchDays / benchTask.days : 1;
-      const dl = dayLayoutForRatedInterval(benchTask.startSlot, cabinetEntriesFor(job, benchScale), holidays);
-      let batch = 0;
-      [...dl.keys()].sort().forEach(k => {
-        batch++;
-        const dayEntries = dl.get(k);
-        const cabinets = Math.round(dayEntries.reduce((a, e) => a + e.cabinets, 0));
-        if (cabinets > 0) {
-          addEntry(k, "bench", { jobId: job.id, jobName: job.name, batch, cabinets, colour, mix: mixFromEntries(dayEntries) });
-          let prepDate = addDays(parseISO(k), -1);
-          while (isWeekend(prepDate) || holidays.has(dayKey(prepDate))) prepDate = addDays(prepDate, -1);
-          addEntry(dayKey(prepDate), "prep", { jobId: job.id, jobName: job.name, batch, cabinets, colour, mix: mixFromEntries(dayEntries) });
-        }
-      });
-    }
-
-    const finishTask = job.tasks.find(t => t.stage === "finishing");
-    if (finishTask?.startSlot) {
-      const finishScale = finishTask.days > 0 ? nominalFinishDays / finishTask.days : 1;
-      const fdl = dayLayoutForRatedInterval(finishTask.startSlot, cabinetEntriesFor(job, finishScale), holidays);
-      let batch = 0;
-      [...fdl.keys()].sort().forEach(k => {
-        batch++;
-        const dayEntries = fdl.get(k);
-        const padEntries = dayEntries.filter(e => PADDED_STYLES.includes(e.style));
-        const sprayCabinets = Math.round(dayEntries.reduce((a, e) => a + e.cabinets, 0));
-        const padCabinets = Math.round(padEntries.reduce((a, e) => a + e.cabinets, 0));
-        if (sprayCabinets > 0) addEntry(k, "spray", { jobId: job.id, jobName: job.name, batch, cabinets: sprayCabinets, colour, mix: mixFromEntries(dayEntries) });
-        if (padCabinets > 0) addEntry(k, "pad", { jobId: job.id, jobName: job.name, batch, cabinets: padCabinets, colour, mix: mixFromEntries(padEntries) });
-      });
-    }
-
-    const reasmTask = job.tasks.find(t => t.stage === "reassembly");
-    if (reasmTask?.startSlot) {
-      const reasmScale = reasmTask.days > 0 ? nominalBenchDays / reasmTask.days : 1;
-      const rdl = dayLayoutForRatedInterval(reasmTask.startSlot, cabinetEntriesFor(job, reasmScale), holidays);
-      let batch = 0;
-      [...rdl.keys()].sort().forEach(k => {
-        batch++;
-        const dayEntries = rdl.get(k);
-        const cabinets = Math.round(dayEntries.reduce((a, e) => a + e.cabinets, 0));
-        if (cabinets > 0) addEntry(k, "reasm", { jobId: job.id, jobName: job.name, batch, cabinets, colour, mix: mixFromEntries(dayEntries) });
-      });
-    }
+    return task.days > 0 ? nominalBenchDays / task.days : 1;
+  }, holidays);
+  [...benchByDate.keys()].sort().forEach(k => {
+    emitQueueDay(addEntry, "bench", k, benchByDate.get(k));
+    (layout[k]?.bench || []).forEach(({ jobId, jobName, batch, cabinets, colour, mix }) => {
+      let prepDate = addDays(parseISO(k), -1);
+      while (isWeekend(prepDate) || holidays.has(dayKey(prepDate))) prepDate = addDays(prepDate, -1);
+      addEntry(dayKey(prepDate), "prep", { jobId, jobName, batch, cabinets, colour, mix });
+    });
   });
+
+  const finishByDate = stageQueueDayLayout(scheduled, "finishing", (job, task) => {
+    const nominalFinishDays = benchDaysForJob(job) + featureImpact(job.features).flatExtra;
+    return task.days > 0 ? nominalFinishDays / task.days : 1;
+  }, holidays);
+  [...finishByDate.keys()].sort().forEach(k => {
+    const dayEntries = finishByDate.get(k);
+    emitQueueDay(addEntry, "spray", k, dayEntries);
+    emitQueueDay(addEntry, "pad", k, dayEntries.filter(e => PADDED_STYLES.includes(e.style)));
+  });
+
+  const reasmByDate = stageQueueDayLayout(scheduled, "reassembly", (job, task) => {
+    const nominalBenchDays = benchDaysForJob(job);
+    return task.days > 0 ? nominalBenchDays / task.days : 1;
+  }, holidays);
+  [...reasmByDate.keys()].sort().forEach(k => emitQueueDay(addEntry, "reasm", k, reasmByDate.get(k)));
 
   return layout;
 }
@@ -914,17 +960,38 @@ function findLatestFreeBenchSlot(beforeSlot, daysNeeded, occupied, holidays) {
 //  - bank holidays and weekends
 // ============================================================
 
+// A job with no manual priorityRank falls back to its deadline — pinned
+// install/target week first, then manual-start, then whatever's left, the
+// exact same commitment-driven order as always (unchanged from before
+// priorityRank existed — verified as a no-op against real data). Expressed
+// as a millisecond timestamp so a manually-set priorityRank, which is
+// computed on this same deadline-ish scale (see GanttView's drag handler,
+// which interpolates using this same function, not bench timing), is
+// genuinely comparable to it — an ISO date string sorts identically either
+// way, so this is a no-op for the deadline-vs-deadline case.
+function deadlineSortKey(job) {
+  const pin = job.installOverride || job.targetInstallWeek;
+  const dateStr = pin || job.manualStart || "9999-12-31";
+  return new Date(dateStr).getTime();
+}
+
+// Decides which job claims shared bench/machining/finishing capacity first.
+// A manually-set priorityRank (dragged in the Gantt) sits on the exact same
+// number line as everyone else's deadline-driven fallback, rather than
+// unconditionally beating every unranked job — that's what lets dragging a
+// job DOWN actually push it behind unranked jobs too (a delayed job letting
+// others fall forward into the gap), not just move ranked jobs around each
+// other. When no job has ever been ranked, every comparison falls through
+// to the original pinned install / manualStart logic — a deliberate no-op
+// for that case.
+function compareJobPriority(a, b) {
+  const aKey = a.priorityRank != null ? a.priorityRank : deadlineSortKey(a);
+  const bKey = b.priorityRank != null ? b.priorityRank : deadlineSortKey(b);
+  return aKey - bKey;
+}
+
 function scheduleJobs(jobs, holidays, settings) {
-  const sorted = [...jobs].sort((a, b) => {
-    // Pinned jobs (installOverride or targetInstallWeek) come first as hard
-    // commitments. Then manual-start jobs, then flexible jobs.
-    const aPin = a.installOverride || a.targetInstallWeek;
-    const bPin = b.installOverride || b.targetInstallWeek;
-    if (!!aPin !== !!bPin) return aPin ? -1 : 1;
-    const aDate = aPin || a.manualStart || "9999-12-31";
-    const bDate = bPin || b.manualStart || "9999-12-31";
-    return aDate.localeCompare(bDate);
-  });
+  const sorted = [...jobs].sort(compareJobPriority);
 
   const state = {
     machiningOccupied: [], // [{start, end, jobName, jobId}] — pinned + placed CNC blocks (end exclusive)
@@ -933,6 +1000,13 @@ function scheduleJobs(jobs, holidays, settings) {
     installerSchedules: {},
     installBookings: [],   // [{customer, jobName, start, end, installer, cabCount, weekKey}]
     vanBookings: [],       // [{date, jobName, isSibling}] — 1 van can do 1 delivery per day
+    // Where the manually-ranked queue currently ends, updated as each
+    // ranked job's bench gets placed. A ranked job's ASAP search starts
+    // here instead of at settings.startDate, so it chains onto the back
+    // of the priority queue specifically — not onto the first gap
+    // anywhere in the whole year, which could easily be an early slot
+    // that has nothing to do with its actual rank.
+    rankedBenchFrontier: null,
   };
   FITTERS.forEach(f => state.installerSchedules[f] = []);
 
@@ -1305,8 +1379,18 @@ function findInstallDayInTargetWeek(targetISO, cabCount, state, holidays, prefer
 //   ← machining ends 1 working day before bench starts
 //   ← machining starts machiningDays before its end
 // This returns the required machining start date.
-function backwardFromInstall(installDate, benchDays, machiningDays, impact, holidays, settings) {
-  const weekBuffer = settings.workshopBufferIdealDays ?? 3;
+//
+// `bufferDaysOverride`, when given, replaces the ideal workshop buffer as
+// the retreat amount — used by the finishing safety valve below, which
+// needs the true "any later than this and install becomes infeasible"
+// boundary (the MINIMUM buffer/dispatch gap), not the ideal one. Retreating
+// from the ideal buffer would flag a job as "infeasible" the moment it eats
+// into that ideal cushion at all, even with days of real slack still left
+// before the actual deadline — bench's own existing forced-overlap fallback
+// below intentionally keeps using the ideal buffer (unchanged, long-relied-on
+// behavior), so this is opt-in per caller, not a change to the default.
+function backwardFromInstall(installDate, benchDays, machiningDays, impact, holidays, settings, bufferDaysOverride) {
+  const weekBuffer = bufferDaysOverride ?? (settings.workshopBufferIdealDays ?? 3);
   // Step back weekBuffer working days from install: that's the day reassembly ENDS
   let d = new Date(installDate.getTime());
   let stepped = 0;
@@ -1346,7 +1430,7 @@ function backwardFromInstall(installDate, benchDays, machiningDays, impact, holi
       if (!isWeekend(machiningStart) && !holidays.has(dayKey(machiningStart))) h--;
     }
   }
-  return { machiningStart, benchStart };
+  return { machiningStart, benchStart, finishStart };
 }
 
 // Schedule a single job into the current state. Returns the tasks and updated state.
@@ -1514,7 +1598,25 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     benchStartSlot = interval.startSlot;
     benchEndSlot = interval.endSlot;
   } else {
-    const asapSlot = findFreeBenchSlot(earliestBenchSlot, benchActualDays, state.benchOccupied, holidays);
+    // A manually-ranked job's ASAP search starts at the LATER of (a) where
+    // its own rank places it on the calendar and (b) the back of the
+    // priority queue so far (wherever the last ranked job's bench ended)
+    // — never at settings.startDate the way an unranked job's does.
+    // Searching from the very beginning would just find the first free
+    // gap anywhere in the whole year regardless of how "delayed" this
+    // job's rank actually is, which defeats "delay this job, let others
+    // fall forward" outright — a lone delayed job would still grab
+    // whatever early capacity happens to be free. Unranked jobs are
+    // completely unaffected by any of this.
+    let searchFrom = earliestBenchSlot;
+    if (job.priorityRank != null) {
+      const rankSlot = { date: new Date(job.priorityRank), used: 0 };
+      if (compareFractionalSlot(rankSlot, searchFrom) > 0) searchFrom = rankSlot;
+      if (state.rankedBenchFrontier && compareFractionalSlot(state.rankedBenchFrontier, searchFrom) > 0) {
+        searchFrom = state.rankedBenchFrontier;
+      }
+    }
+    const asapSlot = findFreeBenchSlot(searchFrom, benchActualDays, state.benchOccupied, holidays);
     benchStartSlot = asapSlot;
     if (pinnedInstallDate) {
       const { benchStart: latestBenchStartDate } = backwardFromInstall(
@@ -1551,7 +1653,15 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
             });
           }
         }
-      } else {
+      } else if (job.priorityRank == null) {
+        // Only jobs still on the deadline-driven auto-flow get deferred
+        // toward their own install date when there's slack — a manually
+        // ranked job (dragged in the Gantt) stays at its ASAP slot instead,
+        // chaining immediately behind whatever's ahead of it in the
+        // priority queue rather than floating off toward its own deadline.
+        // That's the whole point of dragging it: it moves up the schedule
+        // to run right after the last bench slot, not just "sometime before
+        // install."
         const slackWorkingDays = workingDaysBetween(asapSlot.date, desiredLatestBenchStart.date, holidays);
         if (slackWorkingDays >= SLACK_THRESHOLD_WORKING_DAYS) {
           const latestSlot = findLatestFreeBenchSlot(desiredLatestBenchStart, benchActualDays, state.benchOccupied, holidays);
@@ -1566,6 +1676,9 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     }
   }
   benchEndSlot = advanceFractionalDay(benchStartSlot, benchActualDays, holidays);
+  if (job.priorityRank != null && (!state.rankedBenchFrontier || compareFractionalSlot(benchEndSlot, state.rankedBenchFrontier) > 0)) {
+    state.rankedBenchFrontier = benchEndSlot;
+  }
   const benchInterval = { startSlot: benchStartSlot, endSlot: benchEndSlot };
   tasks.push({
     stage: "bench",
@@ -1738,16 +1851,64 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
       });
     }
   } else {
-    finishStartSlot = findFreeBenchSlot(desiredFinishStart, finishActualDays, state.finishingOccupied, holidays);
-    if (compareFractionalSlot(finishStartSlot, desiredFinishStart) > 0) {
+    const asapFinishSlot = findFreeBenchSlot(desiredFinishStart, finishActualDays, state.finishingOccupied, holidays);
+    finishStartSlot = asapFinishSlot;
+    // Same safety valve bench already has above: if every other job's
+    // pinned finishing time is booked wall-to-wall with no gap, the free-slot
+    // search can walk arbitrarily far into the future looking for one —
+    // silently blowing the install date out by months instead of just a few
+    // days. Never search further than the point that would make this job's
+    // OWN install date infeasible anyway; beyond that, force the fit at the
+    // latest position that still protects install, overlapping if it must,
+    // with a loud warning — exactly like bench's forced-overlap fallback.
+    if (pinnedInstallDate) {
+      // The true "any later and install can't be hit" boundary uses the
+      // MINIMUM buffer (same figures earliestFeasible uses below for the
+      // install-nudge check), not the ideal one — see backwardFromInstall's
+      // bufferDaysOverride comment.
+      const minFeasibleBuffer = Math.max(settings.dispatchGapDays ?? 1, settings.workshopBufferMinDays ?? 1);
+      const { finishStart: latestFinishStartDate } = backwardFromInstall(
+        pinnedInstallDate, benchDays, job.machiningDays || 1, impact, holidays, settings, minFeasibleBuffer
+      );
+      let desiredLatestFinishStart = { date: latestFinishStartDate, used: 0 };
+      // Clamp to the earliest finishing can start at all — right after
+      // bench begins. If the deadline implies starting before that, forcing
+      // a slot doesn't help; install-feasibility further down already nudges
+      // the install date forward with its own clear warning in that case.
+      const clampedToStart = compareFractionalSlot(desiredLatestFinishStart, desiredFinishStart) < 0;
+      if (clampedToStart) desiredLatestFinishStart = desiredFinishStart;
+      if (!clampedToStart && compareFractionalSlot(asapFinishSlot, desiredLatestFinishStart) > 0) {
+        finishStartSlot = desiredLatestFinishStart;
+        const forcedEnd = advanceFractionalDay(desiredLatestFinishStart, finishActualDays, holidays);
+        for (const existing of state.finishingOccupied) {
+          if (slotsOverlap(desiredLatestFinishStart, forcedEnd, existing.startSlot, existing.endSlot)) {
+            warnings.push({
+              jobId: job.id,
+              jobName: job.name,
+              type: "buffer_too_tight",
+              message: `Finishing doesn't fit before the ${fmtUK(pinnedInstallDate)} install target without overlapping ${existing.jobName}'s finishing — scheduled anyway to protect the install date, review capacity`,
+            });
+          }
+        }
+      } else if (compareFractionalSlot(asapFinishSlot, desiredFinishStart) > 0) {
+        finishingPushed = true;
+        if (dayKey(asapFinishSlot.date) !== dayKey(desiredFinishStart.date)) {
+          warnings.push({
+            jobId: job.id,
+            jobName: job.name,
+            type: "bunching",
+            message: `Finishing capacity overlap: pushed back from ${fmtUK(desiredFinishStart.date)} to ${fmtUK(asapFinishSlot.date)}`,
+          });
+        }
+      }
+    } else if (compareFractionalSlot(asapFinishSlot, desiredFinishStart) > 0) {
       finishingPushed = true;
-      // Only warn if the push actually moves to a different day
-      if (dayKey(finishStartSlot.date) !== dayKey(desiredFinishStart.date)) {
+      if (dayKey(asapFinishSlot.date) !== dayKey(desiredFinishStart.date)) {
         warnings.push({
           jobId: job.id,
           jobName: job.name,
           type: "bunching",
-          message: `Finishing capacity overlap: pushed back from ${fmtUK(desiredFinishStart.date)} to ${fmtUK(finishStartSlot.date)}`,
+          message: `Finishing capacity overlap: pushed back from ${fmtUK(desiredFinishStart.date)} to ${fmtUK(asapFinishSlot.date)}`,
         });
       }
     }
@@ -2593,6 +2754,78 @@ function deepCloneState(state) {
 }
 
 // ============================================================
+// MULTI-DEVICE SYNC MERGE
+// ============================================================
+
+// Reconciles this device's local job list against whatever the server
+// currently has before a save (or after a realtime notification) blindly
+// overwrites one with the other. Without this, two devices open at once —
+// e.g. a workshop tablet and someone's laptop — can silently clobber each
+// other: each periodically saves its ENTIRE job list, so device B saving
+// its own (older) copy a moment after device A drags a bar wipes out A's
+// change, which then "snaps back" once A's own sync notices B's write.
+//
+// `base` is the last job list this device knows was in sync with the
+// server (see lastSyncedJobsRef); `mine` is this device's current local
+// jobs; `theirs` is what was just read from the server. Every job update
+// in this codebase replaces the object (`{...j, ...patch}` / `.map(...)`),
+// never mutates in place, so an UNCHANGED job keeps the exact same object
+// reference across renders — comparing `mine`'s entries against `base` by
+// reference is enough to tell exactly which jobs this device actually
+// touched, with no deep-equality needed. Anything touched locally wins;
+// anything untouched takes whatever the server has (picking up remote
+// edits, or a remote delete).
+function mergeJobs(base, mine, theirs) {
+  const baseById = new Map((base || []).map(j => [j.id, j]));
+  const theirsById = new Map((theirs || []).map(j => [j.id, j]));
+  const merged = [];
+  const handled = new Set();
+  for (const m of (mine || [])) {
+    handled.add(m.id);
+    const touchedLocally = baseById.get(m.id) !== m; // new (no base entry) or edited (different ref)
+    if (touchedLocally) {
+      merged.push(m);
+    } else {
+      const t = theirsById.get(m.id);
+      if (t !== undefined) {
+        // Untouched locally — take the server's copy, but keep OUR reference
+        // if the content is actually identical. theirs is always a fresh
+        // JSON.parse, so a plain `merged.push(t)` here made every reload
+        // produce a brand-new array of new object references even when
+        // nothing had changed, which broke sameJobs's reference check below
+        // (it always saw "different"), which called setJobs on every single
+        // reload, which re-triggered the jobs-save effect and re-broadcast —
+        // an echo loop exactly like the settings/reminders/warnings one,
+        // just in the one place that was believed to already be protected.
+        // Confirmed live 2026-09-24: with the settings/reminders/warnings
+        // fixes shipped, a 2+ tab echo loop was still running; it stopped
+        // the moment this line started preserving the local reference.
+        merged.push(JSON.stringify(m) === JSON.stringify(t) ? m : t);
+      }
+      // else: untouched locally, server no longer has it — respect the remote delete
+    }
+  }
+  for (const t of (theirs || [])) {
+    if (handled.has(t.id) || baseById.has(t.id)) continue;
+    merged.push(t); // a job added on another device we've never seen
+  }
+  return merged;
+}
+
+// Cheap post-merge check: did merging in the server's copy actually change
+// anything this device is displaying? Reference-equal, order-preserving in
+// the common (no-conflict) case by construction of mergeJobs above, so this
+// avoids an unnecessary setJobs (and the save-effect re-run it would cause)
+// when the merge found nothing new to pick up.
+function sameJobs(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+// ============================================================
 // UI COMPONENTS
 // ============================================================
 
@@ -2656,12 +2889,73 @@ function App() {
   // would otherwise trigger a reload and overwrite local state).
   const lastWriteAtRef = useRef(0);
 
+  // Always-current mirror of `jobs`, for code (the debounced save effect,
+  // reloadFromStorage) that needs the latest local state but can't rely on
+  // its own closure being fresh — see mergeJobs above.
+  const jobsRef = useRef(jobs);
+  useEffect(() => { jobsRef.current = jobs; }, [jobs]);
+  // The last job list this device knows matched the server — the merge
+  // base for reconciling local edits against whatever another device may
+  // have written since. Updated after every successful load, save, and
+  // merge-reload.
+  const lastSyncedJobsRef = useRef(null);
+  // Same "always current" mirror as jobsRef, for settings — settings has no
+  // per-item merge concern (unlike jobs, it's one shared object, not a
+  // list), so a plain equality check before setSettings is enough; it just
+  // never got one. Without it, reloadFromStorage always created a new
+  // settings object even when nothing changed, which re-triggered the
+  // debounced settings-save effect below, which re-broadcast, which
+  // triggered every OTHER connected client's reload the same way — a
+  // permanent ping-pong between any 2+ connected clients (any scheduler
+  // tab + the always-on floor board TV counts). Confirmed live 2026-09-24:
+  // two tabs open, zero real edits, and the realtime callback fired 15
+  // times within a second and kept climbing — the real driver of a
+  // Supabase egress-quota breach that day, once `jobs` was already fixed
+  // by mergeJobs but `settings` was missed.
+  const settingsRef = useRef(settings);
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
+  // Same guard, same reason, for dismissedReminders/dismissedWarnings — they
+  // had the identical unconditional-setState bug and kept the echo loop
+  // alive live in production even after the settings fix above shipped
+  // (confirmed 2026-09-24: two tabs, zero edits, still climbing post-fix).
+  const dismissedRemindersRef = useRef(dismissedReminders);
+  useEffect(() => { dismissedRemindersRef.current = dismissedReminders; }, [dismissedReminders]);
+  const dismissedWarningsRef = useRef(dismissedWarnings);
+  useEffect(() => { dismissedWarningsRef.current = dismissedWarnings; }, [dismissedWarnings]);
+
   // Load from storage (reusable function for realtime sync)
   const reloadFromStorage = async () => {
-    try { const j = await window.storage.get("ew-jobs"); if (j?.value) { setDragFreeze(null); setJobs(JSON.parse(j.value)); } } catch {}
-    try { const s = await window.storage.get("ew-settings"); if (s?.value) setSettings(JSON.parse(s.value)); } catch {}
-    try { const r = await window.storage.get("ew-dismissed-reminders"); if (r?.value) setDismissedReminders(JSON.parse(r.value)); } catch {}
-    try { const w = await window.storage.get("ew-dismissed-warnings"); if (w?.value) setDismissedWarnings(JSON.parse(w.value)); } catch {}
+    try {
+      const j = await window.storage.get("ew-jobs");
+      if (j?.value) {
+        const serverJobs = JSON.parse(j.value);
+        const merged = mergeJobs(lastSyncedJobsRef.current, jobsRef.current, serverJobs);
+        lastSyncedJobsRef.current = merged;
+        setDragFreeze(null);
+        if (!sameJobs(merged, jobsRef.current)) setJobs(merged);
+      }
+    } catch {}
+    try {
+      const s = await window.storage.get("ew-settings");
+      if (s?.value) {
+        const incoming = JSON.parse(s.value);
+        if (JSON.stringify(incoming) !== JSON.stringify(settingsRef.current)) setSettings(incoming);
+      }
+    } catch {}
+    try {
+      const r = await window.storage.get("ew-dismissed-reminders");
+      if (r?.value) {
+        const incoming = JSON.parse(r.value);
+        if (JSON.stringify(incoming) !== JSON.stringify(dismissedRemindersRef.current)) setDismissedReminders(incoming);
+      }
+    } catch {}
+    try {
+      const w = await window.storage.get("ew-dismissed-warnings");
+      if (w?.value) {
+        const incoming = JSON.parse(w.value);
+        if (JSON.stringify(incoming) !== JSON.stringify(dismissedWarningsRef.current)) setDismissedWarnings(incoming);
+      }
+    } catch {}
     await loadFloorActuals();
   };
 
@@ -2784,10 +3078,15 @@ function App() {
   // empty-array safety guard so a transient empty state can't wipe data —
   // except when undo/redo deliberately restored an empty array, which is a
   // real historical state to persist, not a race to guard against.
+  //
+  // Before writing, merges against whatever's currently on the server (see
+  // mergeJobs) instead of blindly overwriting it — otherwise this device's
+  // periodic whole-list save can silently erase an edit another device made
+  // in the meantime (see project_multi_device_sync_merge).
   const wasUndoRedoForSave = isUndoRedoActionRef.current;
   useEffect(() => {
     if (loading || IS_READONLY) return;
-    const t = setTimeout(() => {
+    const t = setTimeout(async () => {
       if (jobs.length === 0 && !wasUndoRedoForSave) {
         // Safety check: don't overwrite non-empty Supabase data with an empty array
         window.storage.get("ew-jobs").then(r => {
@@ -2807,7 +3106,18 @@ function App() {
         }).catch(console.error);
         return;
       }
-      safeSet("ew-jobs", JSON.stringify(jobs));
+      let toSave = jobs;
+      try {
+        const server = await window.storage.get("ew-jobs");
+        if (server?.value) {
+          const serverJobs = JSON.parse(server.value);
+          const merged = mergeJobs(lastSyncedJobsRef.current, jobs, serverJobs);
+          toSave = merged;
+          if (!sameJobs(merged, jobs)) setJobs(merged);
+        }
+      } catch (e) { console.error(e); }
+      lastSyncedJobsRef.current = toSave;
+      safeSet("ew-jobs", JSON.stringify(toSave));
     }, 600);
     return () => clearTimeout(t);
   }, [jobs, loading]);
@@ -3473,6 +3783,17 @@ function App() {
             freezeOtherJobs(jobId);
             const patch = { [cfg.dateField]: isoDate };
             if (cfg.usedField) patch[cfg.usedField] = usedFraction || 0;
+            // Dragging one stage is a statement about the whole job's
+            // production chain, not just that one bar — clear the OTHER
+            // stages' own date pins (duration overrides stay untouched) so
+            // they re-chain naturally off this new position. The row's
+            // position in the Gantt follows for free: it's sorted by each
+            // job's own earliest computed stage date, which just updated.
+            (STAGE_CASCADE[stage] || []).forEach(s => {
+              const sCfg = DRAGGABLE_STAGES[s];
+              patch[sCfg.dateField] = "";
+              if (sCfg.usedField) patch[sCfg.usedField] = 0;
+            });
             dragUpdateJob(jobId, patch);
           }}
           onStageResize={(jobId, stage, days) => {
@@ -3514,6 +3835,31 @@ function App() {
           }}
           onDeliveryDrag={(jobId, isoDate) => {
             updateJob(jobId, { deliveryDate: isoDate });
+          }}
+          onReorderJobs={(draggedJobId, newRank) => {
+            // A real, committed change — not a bar-drag preview — so any
+            // drag-freeze in effect is no longer relevant. Only the dragged
+            // job's own data changes here — never any other job's — so one
+            // drag can never reshuffle jobs you didn't touch.
+            setDragFreeze(null);
+            setJobs(prev => prev.map(j => {
+              if (j.id !== draggedJobId) return j;
+              const patch = { priorityRank: newRank };
+              // The whole point of dragging a job's name is to let its
+              // production flow automatically at its new priority — a
+              // leftover manual pin on any of these stages (from an
+              // earlier bar-drag) would keep the job locked to its old
+              // date and silently make the reorder do nothing. Install is
+              // deliberately untouched: that's the customer commitment,
+              // set manually, separately.
+              ["machining", "bench", "finishing", "reassembly"].forEach(stage => {
+                const cfg = DRAGGABLE_STAGES[stage];
+                patch[cfg.dateField] = "";
+                patch[cfg.daysField] = 0;
+                if (cfg.usedField) patch[cfg.usedField] = 0;
+              });
+              return { ...j, ...patch };
+            }));
           }}
         />
       </div>
@@ -4749,7 +5095,7 @@ function ganttSegmentsFor(task, ganttStart, colWidth, holidays) {
   return segments;
 }
 
-function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onStageResize, onStageReset, onToggleLock, onDeliveryDrag }) {
+function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onStageResize, onStageReset, onToggleLock, onDeliveryDrag, onReorderJobs }) {
   const COL_WIDTH = 36;       // wider so day numbers are readable
   const ROW_HEIGHT = 64;
 
@@ -4764,6 +5110,12 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
   // Drag state for delivery icon
   const [deliveryDragState, setDeliveryDragState] = useState(null);
   // deliveryDragState: { jobId, currentLeft, currentDate }
+
+  // Drag state for reordering a job's manual production priority (dragging
+  // its name up/down). Local to this component — only committed to real job
+  // state (via onReorderJobs) on drop.
+  const [reorderDrag, setReorderDrag] = useState(null);
+  // reorderDrag: { jobId, dragIndex, offsetY, targetIndex }
 
   // Chart geometry (day columns, month/week groupings) depends only on the
   // jobs' dates and the workshop start date — memoized so a drag (which only
@@ -4820,17 +5172,104 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobs, startDate]);
 
-  // Rows flow top-to-bottom in the order each job's earliest stage actually
-  // starts, so dragging a job's bench (etc.) earlier than another job visibly
-  // moves it up the chart to match — an even flow down the page instead of a
-  // fixed, drag-independent order.
+  // Rows flow top-to-bottom in the order each job's earliest PRODUCTION
+  // stage actually starts, so dragging a job's bench (etc.) earlier than
+  // another job visibly moves it up the chart to match — an even flow down
+  // the page instead of a fixed, drag-independent order. Deliberately only
+  // machining/bench/finishing/reassembly count here, not every task type —
+  // final_survey in particular is always exactly 25 working days before
+  // install, nothing to do with when production actually starts, and
+  // mixing it in used to make a job's row (and what a drag-computed
+  // priorityRank number actually means) drift out of step with its own
+  // bench. A manually-set priorityRank (dragged by its name, see
+  // GanttRow's grip handle) sits on that same number line instead of
+  // unconditionally beating every unranked job, so dragging a job down
+  // among unranked ones actually delays it rather than just reordering it
+  // against other ranked jobs.
+  const PRODUCTION_STAGES = ["machining", "bench", "finishing", "reassembly"];
+  const earliestStart = (job) => {
+    const prod = (job.tasks || []).filter(t => PRODUCTION_STAGES.includes(t.stage));
+    if (!prod.length) return Infinity;
+    return Math.min(...prod.map(t => t.start.getTime()));
+  };
   const orderedJobs = useMemo(() => {
-    const earliestStart = (job) => {
-      if (!job.tasks || !job.tasks.length) return Infinity;
-      return Math.min(...job.tasks.map(t => t.start.getTime()));
-    };
-    return [...jobs].sort((a, b) => earliestStart(a) - earliestStart(b));
+    return [...jobs].sort((a, b) => {
+      const aKey = a.priorityRank != null ? a.priorityRank : earliestStart(a);
+      const bKey = b.priorityRank != null ? b.priorityRank : earliestStart(b);
+      return aKey - bKey;
+    });
   }, [jobs]);
+
+  // Dragging a job's name up/down sets its manual production priority —
+  // which job claims shared bench/machining/finishing capacity first — but
+  // never touches install dates. Same rAF-throttled mousedown/mousemove/
+  // mouseup-on-window pattern as the delivery-icon drag below.
+  //
+  // useCallback matters here, not just as tidiness: reorderDrag updates (via
+  // setReorderDrag below) re-render GanttView on every rAF tick while a drag
+  // is in progress, and every GanttRow is React.memo'd specifically so that
+  // re-rendering doesn't cascade to all of them. Without this, a plain inline
+  // function would get a new identity every tick, defeating that memo for
+  // every row — fine with a handful of jobs, visibly janky with dozens.
+  const startRowDrag = useCallback((e, job, index) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const startY = e.clientY;
+    let rafId = null;
+    let pending = null;
+    const flush = () => { rafId = null; if (pending) setReorderDrag(pending); };
+    const onMove = (ev) => {
+      const dy = ev.clientY - startY;
+      const rawTarget = index + Math.round(dy / ROW_HEIGHT);
+      const targetIndex = Math.max(0, Math.min(orderedJobs.length - 1, rawTarget));
+      pending = { jobId: job.id, dragIndex: index, offsetY: dy, targetIndex };
+      if (rafId === null) rafId = requestAnimationFrame(flush);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      const finalTarget = pending ? pending.targetIndex : index;
+      setReorderDrag(null);
+      if (finalTarget !== index && onReorderJobs) {
+        // Only the dragged job's own priorityRank is ever touched — never
+        // the whole list's. Its new rank nestles its bench dates exactly
+        // between whatever's now immediately above/below it, using each
+        // neighbor's own bench timing (priorityRank if it has one,
+        // earliestStart if not) — the same number line the rows are
+        // visually ordered by, so it lands where it looks like it should.
+        // scheduleSingleJob's auto-bench branch anchors a ranked job's
+        // search to this same rank value (not settings.startDate), which
+        // is what actually makes it settle next to these two neighbors
+        // instead of grabbing the first free gap anywhere in the year.
+        // Half a day's worth of milliseconds is the fallback nudge when
+        // there's only one neighbor to go on.
+        const HALF_DAY_MS = 12 * 60 * 60 * 1000;
+        const keyOf = (j) => j.priorityRank != null ? j.priorityRank : earliestStart(j);
+        const withoutDragged = orderedJobs.filter((_, idx) => idx !== index);
+        // finalTarget is an index into orderedJobs (which still includes the
+        // dragged row); withoutDragged has that row removed, so every index
+        // from the dragged row's old position onward is shifted back by one.
+        // Dragging DOWN (index < finalTarget) needs that correction or the
+        // neighbor picked as "below" is one row too far — visually landing
+        // one customer further than the drop-line indicator showed, i.e.
+        // skipping whichever job sat right at the boundary. Dragging UP
+        // needs no adjustment: removing a row from AFTER the target doesn't
+        // shift anything before it.
+        const adjustedTarget = index < finalTarget ? finalTarget - 1 : finalTarget;
+        const above = withoutDragged[adjustedTarget - 1];
+        const below = withoutDragged[adjustedTarget];
+        let newRank;
+        if (above && below) newRank = (keyOf(above) + keyOf(below)) / 2;
+        else if (above) newRank = keyOf(above) + HALF_DAY_MS;
+        else if (below) newRank = keyOf(below) - HALF_DAY_MS;
+        else newRank = Date.now();
+        onReorderJobs(job.id, newRank);
+      }
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, [orderedJobs, onReorderJobs, ROW_HEIGHT]);
 
   if (!chart) {
     return (
@@ -4989,8 +5428,20 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
                 onStageReset={onStageReset}
                 onToggleLock={onToggleLock}
                 onDeliveryDrag={onDeliveryDrag}
+                isReordering={!!(reorderDrag && reorderDrag.jobId === job.id)}
+                reorderOffsetY={reorderDrag && reorderDrag.jobId === job.id ? reorderDrag.offsetY : 0}
+                onRowDragStart={onReorderJobs ? startRowDrag : null}
               />
             ))}
+            {reorderDrag && (
+              <div
+                style={{
+                  position: "absolute", left: 0, right: 0,
+                  top: reorderDrag.targetIndex * ROW_HEIGHT - 1,
+                  height: 2, background: "#7a8b6f", zIndex: 5, pointerEvents: "none",
+                }}
+              />
+            )}
           </div>
         </div>
       </div>
@@ -5032,6 +5483,7 @@ const GanttRow = React.memo(function GanttRow({
   dragState, resizeState, deliveryDragState,
   setDragState, setResizeState, setDeliveryDragState,
   onStageDrag, onStageResize, onStageReset, onToggleLock, onDeliveryDrag,
+  isReordering, reorderOffsetY, onRowDragStart,
 }) {
   return (
     <div
@@ -5238,8 +5690,46 @@ const GanttRow = React.memo(function GanttRow({
                   rafId = null;
                   if (pendingState) setDragState(pendingState);
                 };
-                const onMove = (ev) => {
-                  const dx = ev.clientX - startX;
+                // Auto-scroll the Gantt horizontally when the drag nears either
+                // edge of the visible scroll container. Without this, a target
+                // date more than about one screenful away is unreachable — the
+                // mouse simply runs out of room to travel before the bar gets
+                // there, which reads as "it won't let me drop it where I want."
+                // `scrollAdjust` tracks total px auto-scrolled since drag start
+                // so the drag's own dx math (mouse-position-relative) still
+                // lines up with the bar's true position once the container
+                // itself has moved underneath the cursor.
+                let scrollEl = e.target;
+                while (scrollEl && !(
+                  scrollEl.scrollWidth > scrollEl.clientWidth + 1 &&
+                  /auto|scroll/.test(getComputedStyle(scrollEl).overflowX)
+                )) {
+                  scrollEl = scrollEl.parentElement;
+                }
+                let scrollAdjust = 0;
+                let scrollDir = 0;
+                let scrollTimer = null;
+                let lastClientX = e.clientX;
+                const EDGE_ZONE = 60;
+                const SCROLL_STEP = 24;
+                const stopAutoScroll = () => {
+                  if (scrollTimer !== null) { clearInterval(scrollTimer); scrollTimer = null; }
+                  scrollDir = 0;
+                };
+                const startAutoScroll = (dir) => {
+                  if (scrollDir === dir) return;
+                  stopAutoScroll();
+                  scrollDir = dir;
+                  if (dir === 0 || !scrollEl) return;
+                  scrollTimer = setInterval(() => {
+                    const before = scrollEl.scrollLeft;
+                    scrollEl.scrollLeft += dir * SCROLL_STEP;
+                    scrollAdjust += scrollEl.scrollLeft - before;
+                    processMove(lastClientX);
+                  }, 16);
+                };
+                const processMove = (clientX) => {
+                  const dx = (clientX - startX) + scrollAdjust;
                   const newLeft = barLeft + dx;
                   if (supportsHalfDay) {
                     const snappedHalfIdx = Math.round(newLeft / (COL_WIDTH / 2));
@@ -5284,10 +5774,21 @@ const GanttRow = React.memo(function GanttRow({
                   }
                   if (rafId === null) rafId = requestAnimationFrame(flush);
                 };
+                const onMove = (ev) => {
+                  lastClientX = ev.clientX;
+                  if (scrollEl) {
+                    const rect = scrollEl.getBoundingClientRect();
+                    if (ev.clientX < rect.left + EDGE_ZONE) startAutoScroll(-1);
+                    else if (ev.clientX > rect.right - EDGE_ZONE) startAutoScroll(1);
+                    else startAutoScroll(0);
+                  }
+                  processMove(ev.clientX);
+                };
                 const onUp = () => {
                   window.removeEventListener("mousemove", onMove);
                   window.removeEventListener("mouseup", onUp);
                   if (rafId !== null) cancelAnimationFrame(rafId);
+                  stopAutoScroll();
                   setDragState(null);
                   const startingUsed = t.startSlot?.used || 0;
                   const usedChanged = supportsHalfDay && Math.abs(lastUsed - startingUsed) > DAY_EPSILON;
@@ -5541,7 +6042,28 @@ const GanttRow = React.memo(function GanttRow({
         return out;
       })}
       {/* Job label overlay */}
-      <div style={styles.ganttJobLabel}>
+      <div
+        style={{
+          ...styles.ganttJobLabel,
+          display: "flex",
+          alignItems: "center",
+          gap: 3,
+          ...(isReordering ? {
+            transform: `translateY(${reorderOffsetY}px)`,
+            zIndex: 6,
+            boxShadow: "0 3px 8px rgba(58,52,44,0.25)",
+          } : {}),
+        }}
+      >
+        {!IS_READONLY && onRowDragStart && (
+          <span
+            style={{ pointerEvents: "auto", cursor: "grab", display: "flex", color: "#9b8f7e" }}
+            onMouseDown={(e) => onRowDragStart(e, job, i)}
+            title="Drag to reorder production priority"
+          >
+            <GripVertical size={12} strokeWidth={2} />
+          </span>
+        )}
         {job.name || "—"}
       </div>
     </div>
@@ -6947,6 +7469,17 @@ function buildMorningBrief(scheduled, dayLayout, todayKey) {
   return { stages, allJobs };
 }
 
+// Monday of the week containing `d` — a plain-Date version of mountFloorBoard's
+// own internal mondayOf, needed one level up (in the React FloorBoard
+// component) to build a whole week's worth of morning briefs rather than
+// just today's.
+function mondayOfDate(d) {
+  const m = new Date(d.getTime());
+  const dow = m.getDay();
+  m.setDate(m.getDate() + (dow === 0 ? -6 : 1 - dow));
+  return m;
+}
+
 const FLOOR_BOARD_CSS = `
   .floor-board-root{--linen:#f5f0e6; --panel:#faf6ec; --panel2:#fdfaf2;
     --ink:#3a342c; --ink2:#7a6a55; --ink3:#9b8f7e;
@@ -6997,6 +7530,7 @@ const FLOOR_BOARD_CSS = `
   .floor-board-root .chip[aria-pressed="true"]{border:2px solid var(--ink);background:#fff;color:var(--ink);padding:3px 7px;font-weight:500}
   .floor-board-root .chip.offplan{border-style:dashed;border-color:var(--honey)}
   .floor-board-root .chip-add{border-style:dashed;color:var(--ink3)}
+  .floor-board-root .chip-add:disabled{cursor:default;opacity:.5}
   .floor-board-root .chip-n{font-weight:500;color:var(--ink)}
   .floor-board-root .swatch{display:inline-block;width:11px;height:11px;border-radius:2px;
     border:1px solid rgba(58,52,44,.25);flex:none}
@@ -7063,6 +7597,29 @@ const FLOOR_BOARD_CSS = `
   .floor-board-root .batch-toggle button{padding:6px 14px;font-size:12px;border-radius:4px;border:1px solid var(--rule);
     background:#fff;color:var(--ink2);font-family:Inter,sans-serif;cursor:pointer}
   .floor-board-root .batch-toggle button.yes[aria-pressed="true"]{background:var(--sage-bg);color:#5a6e50;border-color:var(--sage);font-weight:600}
+  .floor-board-root .wp-notice{font-size:12px;color:var(--ink3);margin:-4px 0 14px;max-width:640px}
+  .floor-board-root .wp-grid{display:flex;flex-wrap:wrap;gap:12px}
+  .floor-board-root .wp-day{background:var(--panel);border:1px solid var(--rule);border-radius:6px;
+    padding:12px 13px 14px;flex:1 1 220px;min-width:0}
+  .floor-board-root .wp-day-name{font-size:17px;font-weight:500;margin-bottom:8px}
+  .floor-board-root .wp-stage{margin-bottom:10px}
+  .floor-board-root .wp-stage-name{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink3);
+    font-weight:600;margin-bottom:4px}
+  .floor-board-root .wp-row{display:flex;align-items:center;justify-content:space-between;gap:8px;
+    padding:4px 0}
+  .floor-board-root .wp-job{font-size:13px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;
+    white-space:nowrap;flex:1}
+  .floor-board-root .wp-input{width:56px;flex:none;border:1px solid var(--rule);border-radius:4px;
+    padding:5px 7px;font-size:13px;text-align:right;font-family:Inter,sans-serif;color:var(--ink);background:#fff}
+  .floor-board-root .wp-input:focus{outline:2px solid var(--sage);outline-offset:1px}
+  .floor-board-root .wp-remove{flex:none;width:22px;height:22px;border:1px solid var(--rule);border-radius:4px;
+    background:#fff;color:var(--ink3);font-size:14px;line-height:1;padding:0;font-family:Inter,sans-serif}
+  .floor-board-root .wp-remove:hover{border-color:var(--clay);color:var(--clay)}
+  .floor-board-root .wp-add{width:100%;margin-top:4px;padding:5px 4px;border:1px dashed var(--rule);border-radius:4px;
+    background:transparent;color:var(--ink3);font-size:11px;font-family:Inter,sans-serif;text-align:center;cursor:pointer}
+  .floor-board-root .wp-add:hover{border-color:var(--sage);color:#5a6e50}
+  .floor-board-root .wp-add:disabled{cursor:default;opacity:.5}
+  .floor-board-root .wp-empty{font-size:12px;color:var(--ink3);font-style:italic;margin-bottom:2px}
   .floor-board-root .batch-toggle button.no[aria-pressed="true"]{background:var(--clay-bg);color:var(--clay);border-color:var(--clay);font-weight:600}
   .floor-board-root .batch-empty{font-size:12px;color:var(--ink3);font-style:italic}
   @media (prefers-reduced-motion:reduce){.floor-board-root *{transition:none!important}}
@@ -7082,7 +7639,7 @@ const FLOOR_STAGES = [
 // skeleton once and never touches its insides again, so the board can own
 // its own imperative rendering (matching floor_board.html verbatim) without
 // fighting React's virtual DOM.
-function mountFloorBoard(root, planRef, holidaysSet) {
+function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
   const iso = fmtISO;
   const store = (typeof window !== "undefined" && window.storage) ? window.storage : null;
   const memory = {};
@@ -7109,6 +7666,11 @@ function mountFloorBoard(root, planRef, holidaysSet) {
 
   const dayKeyFor = (d) => "floor:" + iso(d);
   const weekKeyFor = (d) => "floor:wtd:" + iso(mondayOf(d));
+  // Harry/Jon's own weekly plan — a target cabinet count per job per stage
+  // per day, keyed by the Monday of that week. Read as an override on top
+  // of the auto-computed suggestion (see jobsAt below); never required —
+  // an un-set job/day just keeps showing the auto number.
+  const weekPlanKeyFor = (d) => "floor:plan:" + iso(mondayOf(d));
   const drawersKey = "floor:drawers";
   function mondayOf(d) {
     const m = new Date(d.getTime());
@@ -7134,9 +7696,55 @@ function mountFloorBoard(root, planRef, holidaysSet) {
 
   let today = {}, yesterday = {}, weekToDate = {}, offPlan = [], notes = [], extraJobs = {}, selected = {};
   let drawerBatches = [], activeTab = "today";
+  // Harry/Jon's own weekly plan, all keyed by date then stage:
+  //   weeklyTargets: { [dateISO]: { [stageKey]: { [jobId]: count } } } — a saved count override
+  //   weeklyRemoved: { [dateISO]: { [stageKey]: [jobId, ...] } } — auto-scheduled jobs they've hidden
+  //     for that day (e.g. a job the schedule still lists but is actually already finished)
+  //   weeklyExtra:   { [dateISO]: { [stageKey]: [{jobId,jobName,...}, ...] } } — jobs they've picked
+  //     that the auto schedule didn't put there that day
+  // This is the ONLY way to change which jobs appear — the schedule's own auto placement is just
+  // the starting suggestion, never the final word, since it can drift from what's really on the floor.
+  let weeklyTargets = {}, weeklyRemoved = {}, weeklyExtra = {};
 
+  async function loadWeeklyPlan() {
+    const raw = await load(weekPlanKeyFor(new Date()));
+    if (raw && (raw.targets || raw.removed || raw.extra)) {
+      weeklyTargets = raw.targets || {};
+      weeklyRemoved = raw.removed || {};
+      weeklyExtra = raw.extra || {};
+    } else {
+      // Old shape (pre-add/remove): the saved value WAS the targets map.
+      weeklyTargets = raw || {};
+      weeklyRemoved = {};
+      weeklyExtra = {};
+    }
+  }
+  function saveWeeklyPlan() {
+    queueSave(weekPlanKeyFor(new Date()), { targets: weeklyTargets, removed: weeklyRemoved, extra: weeklyExtra });
+  }
+
+  // The real job list for a given day/stage: the auto suggestion, minus anything
+  // Harry/Jon removed, plus anything they added — this is what every render
+  // function should treat as "the plan," not the raw auto-scheduled list.
+  function stagePlanFor(dateISO, stageKey, autoJobs) {
+    const removed = ((weeklyRemoved[dateISO] || {})[stageKey]) || [];
+    const extra = ((weeklyExtra[dateISO] || {})[stageKey]) || [];
+    const kept = (autoJobs || []).filter(j => removed.indexOf(j.jobId) === -1);
+    const extraFiltered = extra.filter(ej => kept.every(j => j.jobId !== ej.jobId));
+    return kept.concat(extraFiltered);
+  }
+
+  // Every job's `planned` count for TODAY, with Harry/Jon's own weekly-plan
+  // additions/removals/number (if they've set one for this job/stage/day) overriding the
+  // auto-computed suggestion — everything downstream (targetFor, the chips,
+  // yesterday's recap) reads `planned` off whatever this returns, so setting
+  // the override here is enough to make it take everywhere at once.
   function jobsAt(stageKey) {
-    return (planRef.current.stages[stageKey] || []).concat(extraJobs[stageKey] || []);
+    const dISO = iso(new Date());
+    const autoJobs = (planRef.current.stages[stageKey] || []).concat(extraJobs[stageKey] || []);
+    const base = stagePlanFor(dISO, stageKey, autoJobs);
+    const overrides = (weeklyTargets[dISO] || {})[stageKey] || {};
+    return base.map(j => (j.jobId in overrides) ? { ...j, planned: overrides[j.jobId] } : j);
   }
   function countAt(stageKey, jobId) {
     return (today[stageKey] && today[stageKey][jobId]) || 0;
@@ -7236,7 +7844,13 @@ function mountFloorBoard(root, planRef, holidaysSet) {
         </div>
         <div class="chips">
           ${chips}
-          <button class="chip chip-add" data-add="${s.key}" aria-label="Add another job to ${s.name}">+ another job</button>
+          ${(() => {
+            const addOptions = availableJobsForStage(s.key);
+            return `<select class="chip chip-add" data-add="${s.key}" aria-label="Add another job to ${s.name}" ${addOptions.length ? "" : "disabled"}>
+              <option value="">+ another job</option>
+              ${addOptions.map(j => `<option value="${j.jobId}">${escapeHtml(j.jobName)}</option>`).join("")}
+            </select>`;
+          })()}
         </div>
         ${late ? `<div class="behind-pill">${Math.round(due - done)} behind</div>` : ""}
         ${s.key === "prep" && drawersWaiting > 0 ? `<div class="behind-pill">${drawersWaiting} drawer box${drawersWaiting === 1 ? "" : "es"} waiting</div>` : ""}
@@ -7255,6 +7869,110 @@ function mountFloorBoard(root, planRef, holidaysSet) {
         </div>
       </div>`;
     }).join("");
+  }
+
+  // "This week" tab: Monday-Friday x department grid. Each cell starts from
+  // whichever job(s) the main schedule has queued there that day (pulled from
+  // weekPlanRef, the same auto-computed data "Today" uses, just for every day
+  // this week instead of only today) — but that's only ever the SUGGESTION.
+  // Harry/Jon can remove a job that's wrong (e.g. the schedule still lists it
+  // but it's actually already finished) and add any other active job instead,
+  // via stagePlanFor(); the number next to each is editable the same as before.
+  function renderWeekPlan() {
+    const monday = mondayOf(new Date());
+    const days = [0, 1, 2, 3, 4].map(i => addDays(monday, i));
+    $("weekplan").innerHTML = days.map(d => {
+      const dISO = iso(d);
+      const dayBrief = weekPlanRef.current[dISO] || { stages: {}, allJobs: [] };
+      const dayLabel = d.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "short" });
+      const stageBlocks = FLOOR_STAGES.map(s => {
+        const jobs = stagePlanFor(dISO, s.key, dayBrief.stages[s.key] || []);
+        const rows = jobs.map(j => {
+          const saved = ((weeklyTargets[dISO] || {})[s.key] || {})[j.jobId];
+          const value = saved != null ? saved : Math.round(j.planned);
+          return `
+          <div class="wp-row">
+            <span class="wp-job">${escapeHtml(j.jobName)}</span>
+            <input class="wp-input" type="number" min="0" inputmode="numeric"
+              data-wp-date="${dISO}" data-wp-stage="${s.key}" data-wp-job="${j.jobId}"
+              value="${value}" aria-label="${s.name} target for ${escapeHtml(j.jobName)} on ${dayLabel}" />
+            <button class="wp-remove" data-wp-remove-date="${dISO}" data-wp-remove-stage="${s.key}" data-wp-remove-job="${j.jobId}"
+              aria-label="Remove ${escapeHtml(j.jobName)} from ${s.name} on ${dayLabel}">&times;</button>
+          </div>`;
+        }).join("");
+        const addOptions = availableJobsForWeekPlan(dISO, s.key);
+        return `
+        <div class="wp-stage">
+          <div class="wp-stage-name">${s.name}</div>
+          ${rows || `<div class="wp-empty">Nothing booked</div>`}
+          <select class="wp-add" data-wp-add-date="${dISO}" data-wp-add-stage="${s.key}"
+            aria-label="Add a job to ${s.name} on ${dayLabel}" ${addOptions.length ? "" : "disabled"}>
+            <option value="">+ add job</option>
+            ${addOptions.map(j => `<option value="${j.jobId}">${escapeHtml(j.jobName)}</option>`).join("")}
+          </select>
+        </div>`;
+      }).join("");
+      return `
+      <div class="wp-day">
+        <div class="wp-day-name serif">${dayLabel}</div>
+        ${stageBlocks}
+      </div>`;
+    }).join("");
+  }
+
+  // Every active job from the main schedule not already sitting in this
+  // stage/day's list — the dropdown's options, and what a picked jobId is
+  // validated against.
+  function availableJobsForWeekPlan(dateISO, stageKey) {
+    const dayBrief = weekPlanRef.current[dateISO] || { stages: {}, allJobs: [] };
+    const already = stagePlanFor(dateISO, stageKey, dayBrief.stages[stageKey] || []).map(j => j.jobId);
+    return (dayBrief.allJobs || []).filter(j => already.indexOf(j.jobId) === -1);
+  }
+
+  function addJobToWeekPlan(dateISO, stageKey, jobId) {
+    const job = availableJobsForWeekPlan(dateISO, stageKey).find(j => j.jobId === jobId);
+    if (!job) return;
+    weeklyExtra = { ...weeklyExtra };
+    weeklyExtra[dateISO] = { ...(weeklyExtra[dateISO] || {}) };
+    weeklyExtra[dateISO][stageKey] = (weeklyExtra[dateISO][stageKey] || []).concat(job);
+    saveWeeklyPlan();
+    renderAll();
+  }
+
+  function removeJobFromWeekPlan(dateISO, stageKey, jobId) {
+    const isExtra = ((weeklyExtra[dateISO] || {})[stageKey] || []).some(j => j.jobId === jobId);
+    if (isExtra) {
+      weeklyExtra = { ...weeklyExtra };
+      weeklyExtra[dateISO] = { ...(weeklyExtra[dateISO] || {}) };
+      weeklyExtra[dateISO][stageKey] = weeklyExtra[dateISO][stageKey].filter(j => j.jobId !== jobId);
+    } else {
+      weeklyRemoved = { ...weeklyRemoved };
+      weeklyRemoved[dateISO] = { ...(weeklyRemoved[dateISO] || {}) };
+      const list = weeklyRemoved[dateISO][stageKey] || [];
+      weeklyRemoved[dateISO][stageKey] = list.indexOf(jobId) === -1 ? list.concat(jobId) : list;
+    }
+    // Drop any saved number override too — nothing left to override.
+    if ((weeklyTargets[dateISO] || {})[stageKey] && jobId in weeklyTargets[dateISO][stageKey]) {
+      weeklyTargets = { ...weeklyTargets };
+      weeklyTargets[dateISO] = { ...weeklyTargets[dateISO] };
+      weeklyTargets[dateISO][stageKey] = { ...weeklyTargets[dateISO][stageKey] };
+      delete weeklyTargets[dateISO][stageKey][jobId];
+    }
+    saveWeeklyPlan();
+    renderAll();
+  }
+
+  function setWeeklyTarget(dateISO, stageKey, jobId, rawValue) {
+    const n = parseInt(rawValue, 10);
+    const clamped = isNaN(n) || n < 0 ? 0 : n;
+    weeklyTargets = { ...weeklyTargets };
+    weeklyTargets[dateISO] = { ...(weeklyTargets[dateISO] || {}) };
+    weeklyTargets[dateISO][stageKey] = { ...(weeklyTargets[dateISO][stageKey] || {}), [jobId]: clamped };
+    saveWeeklyPlan();
+    // Today's live targets (Today tab) read jobsAt(), which applies this
+    // same weeklyTargets map — re-render everything so a same-day edit
+    // shows up immediately, not just next reload.
+    renderAll();
   }
 
   function renderYesterday() {
@@ -7342,11 +8060,13 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     activeTab = tab;
     $("panel-today").style.display = tab === "today" ? "" : "none";
     $("panel-drawers").style.display = tab === "drawers" ? "" : "none";
+    $("panel-weekplan").style.display = tab === "weekplan" ? "" : "none";
     $("tab-today").setAttribute("aria-selected", tab === "today" ? "true" : "false");
     $("tab-drawers").setAttribute("aria-selected", tab === "drawers" ? "true" : "false");
+    $("tab-weekplan").setAttribute("aria-selected", tab === "weekplan" ? "true" : "false");
   }
 
-  function renderAll() { renderPipe(); renderWeek(); renderStages(); renderYesterday(); renderNotes(); renderDrawers(); }
+  function renderAll() { renderPipe(); renderWeek(); renderStages(); renderYesterday(); renderNotes(); renderDrawers(); renderWeekPlan(); }
 
   function bump(stageKey, delta) {
     const jobId = selected[stageKey];
@@ -7361,20 +8081,17 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     queueSave(weekKeyFor(new Date()), wtd);
   }
 
-  function addJobToStage(stageKey) {
+  function availableJobsForStage(stageKey) {
     const taken = jobsAt(stageKey).map(j => j.jobId);
-    const options = (planRef.current.allJobs || []).filter(j => taken.indexOf(j.jobId) === -1);
-    if (!options.length) return;
-    const pick = window.prompt(
-      "Add a job to " + stageKey + ":\n\n" +
-      options.map((j, i) => (i + 1) + ". " + j.jobName).join("\n") +
-      "\n\nType a number:"
-    );
-    const idx = parseInt(pick, 10) - 1;
-    if (isNaN(idx) || !options[idx]) return;
-    extraJobs[stageKey] = (extraJobs[stageKey] || []).concat(options[idx]);
-    offPlan.push({ stage: stageKey, jobId: options[idx].jobId });
-    selected[stageKey] = options[idx].jobId;
+    return (planRef.current.allJobs || []).filter(j => taken.indexOf(j.jobId) === -1);
+  }
+
+  function addJobToStage(stageKey, jobId) {
+    const job = availableJobsForStage(stageKey).find(j => j.jobId === jobId);
+    if (!job) return;
+    extraJobs[stageKey] = (extraJobs[stageKey] || []).concat(job);
+    offPlan.push({ stage: stageKey, jobId: job.jobId });
+    selected[stageKey] = job.jobId;
     renderAll();
     queueSave(dayKeyFor(new Date()), { ...today, offPlan, notes });
   }
@@ -7384,7 +8101,7 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     if (!b) return;
     if (b.dataset.tab) { setTab(b.dataset.tab); return; }
     if (b.dataset.job) { selected[b.dataset.stage] = b.dataset.job; renderAll(); return; }
-    if (b.dataset.add) { addJobToStage(b.dataset.add); return; }
+    if (b.dataset.wpRemoveDate) { removeJobFromWeekPlan(b.dataset.wpRemoveDate, b.dataset.wpRemoveStage, b.dataset.wpRemoveJob); return; }
     if (b.dataset.addnote) { addNote(); return; }
     if (b.dataset.addbatch) { addDrawerBatch(); return; }
     if (b.dataset.batch) { setDrawerBatchDone(b.dataset.batch, b.dataset.done === "1"); return; }
@@ -7396,10 +8113,42 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     if (e.key === "Enter" && e.target && (e.target.id === "batch-label" || e.target.id === "batch-count")) addDrawerBatch();
   };
   root.addEventListener("keydown", onKeydown);
+  // "change" (fires on blur/Enter), not "input" — a weekly target shouldn't
+  // save on every keystroke while someone's still typing a number.
+  const onChange = (e) => {
+    const t = e.target;
+    if (t && t.classList && t.classList.contains("wp-input")) {
+      setWeeklyTarget(t.dataset.wpDate, t.dataset.wpStage, t.dataset.wpJob, t.value);
+    }
+    if (t && t.classList && t.classList.contains("wp-add") && t.value) {
+      addJobToWeekPlan(t.dataset.wpAddDate, t.dataset.wpAddStage, t.value);
+    }
+    if (t && t.classList && t.classList.contains("chip-add") && t.value) {
+      addJobToStage(t.dataset.add, t.value);
+    }
+  };
+  root.addEventListener("change", onChange);
 
   let currentDay = iso(new Date());
   let unsubscribe = null;
   let interval = null;
+
+  // This is a wall-mounted, always-on display, so it needs to hold the
+  // screen awake itself — a plain webpage doesn't get the "don't sleep,
+  // something's actively happening" treatment a video app gets from the
+  // TV's OS, even though its content keeps updating. The lock is released
+  // automatically whenever the tab is hidden, so it has to be re-acquired
+  // on visibilitychange too, not just once at load.
+  let wakeLock = null;
+  async function requestWakeLock() {
+    if (!("wakeLock" in navigator)) return;
+    try { wakeLock = await navigator.wakeLock.request("screen"); }
+    catch (e) { /* not available right now (e.g. backgrounded) — visibilitychange will retry */ }
+  }
+  const onVisibilityChange = () => {
+    if (document.visibilityState === "visible") requestWakeLock();
+  };
+  document.addEventListener("visibilitychange", onVisibilityChange);
 
   async function rollOverIfNewDay() {
     const nowDay = iso(new Date());
@@ -7410,16 +8159,19 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     if (prev) { delete prev.offPlan; delete prev.notes; yesterday = prev; } else { yesterday = {}; }
     today = {}; offPlan = []; notes = []; extraJobs = {}; selected = {};
     weekToDate = (await load(weekKeyFor(new Date()))) || {};
+    await loadWeeklyPlan();
     renderDate(); renderAll();
   }
 
   (async function init() {
+    requestWakeLock();
     renderDate(); renderNotice();
     const t = await load(dayKeyFor(new Date()));
     if (t) { offPlan = t.offPlan || []; notes = t.notes || []; delete t.offPlan; delete t.notes; today = t; }
     const y = await load(dayKeyFor(prevWorkingDay(new Date())));
     if (y) { delete y.offPlan; delete y.notes; yesterday = y; }
     weekToDate = (await load(weekKeyFor(new Date()))) || {};
+    await loadWeeklyPlan();
     drawerBatches = (await load(drawersKey)) || [];
     renderAll();
 
@@ -7443,6 +8195,9 @@ function mountFloorBoard(root, planRef, holidaysSet) {
     teardown() {
       root.removeEventListener("click", onClick);
       root.removeEventListener("keydown", onKeydown);
+      root.removeEventListener("change", onChange);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      if (wakeLock) wakeLock.release().catch(() => {});
       if (unsubscribe) unsubscribe();
       if (interval) clearInterval(interval);
       clearTimeout(flushTimer);
@@ -7454,6 +8209,7 @@ function FloorBoard({ scheduled, dayLayout }) {
   const rootRef = useRef(null);
   const apiRef = useRef(null);
   const planRef = useRef({ stages: {}, allJobs: [] });
+  const weekPlanRef = useRef({});
   const todayKey = dayKey(new Date());
   const plan = useMemo(
     () => buildMorningBrief(scheduled, dayLayout, todayKey),
@@ -7461,10 +8217,26 @@ function FloorBoard({ scheduled, dayLayout }) {
   );
   planRef.current = plan;
 
+  // Same morning-brief data "Today" uses (which jobs/cabinets the main
+  // schedule has queued at each stage), computed for every weekday this
+  // week instead of just today — feeds the "This week" tab's auto
+  // suggestions.
+  const weekPlan = useMemo(() => {
+    const monday = mondayOfDate(new Date());
+    const out = {};
+    for (let i = 0; i < 5; i++) {
+      const d = addDays(monday, i);
+      out[dayKey(d)] = buildMorningBrief(scheduled, dayLayout, dayKey(d));
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scheduled, dayLayout]);
+  weekPlanRef.current = weekPlan;
+
   useEffect(() => {
     if (!rootRef.current) return;
     const holidaysSet = new Set(UK_BANK_HOLIDAYS);
-    apiRef.current = mountFloorBoard(rootRef.current, planRef, holidaysSet);
+    apiRef.current = mountFloorBoard(rootRef.current, planRef, weekPlanRef, holidaysSet);
     return () => {
       apiRef.current?.teardown?.();
       apiRef.current = null;
@@ -7474,7 +8246,7 @@ function FloorBoard({ scheduled, dayLayout }) {
 
   useEffect(() => {
     apiRef.current?.onPlanChanged?.();
-  }, [plan]);
+  }, [plan, weekPlan]);
 
   return (
     <div className="floor-board-root" ref={rootRef}>
@@ -7492,6 +8264,7 @@ function FloorBoard({ scheduled, dayLayout }) {
         </div>
         <div className="tabbar" role="tablist">
           <button id="tab-today" className="tabbtn" data-tab="today" role="tab" aria-selected="true">Today</button>
+          <button id="tab-weekplan" className="tabbtn" data-tab="weekplan" role="tab" aria-selected="false">This week</button>
           <button id="tab-drawers" className="tabbtn" data-tab="drawers" role="tab" aria-selected="false">Drawers</button>
         </div>
         <div id="panel-today">
@@ -7514,6 +8287,11 @@ function FloorBoard({ scheduled, dayLayout }) {
               <div id="yesterday" />
             </div>
           </div>
+        </div>
+        <div id="panel-weekplan" style={{ display: "none" }}>
+          <h2 className="sec">This week's plan · Harry &amp; Jon set each day's real target</h2>
+          <div className="wp-notice">Job names and the suggested number come straight from the main schedule — but that's only a starting point. Type over a number to set your own target, tap × to remove a job that shouldn't be there (already finished, wrong day, etc.), or "+ add job" to bring in a different one.</div>
+          <div className="wp-grid" id="weekplan" />
         </div>
         <div id="panel-drawers" style={{ display: "none" }}>
           <h2 className="sec">Drawer batches · mark complete once boxed off</h2>
