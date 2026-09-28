@@ -7513,6 +7513,7 @@ const FLOOR_BOARD_CSS = `
   .floor-board-root .chip[aria-pressed="true"]{border:2px solid var(--ink);background:#fff;color:var(--ink);padding:3px 7px;font-weight:500}
   .floor-board-root .chip.offplan{border-style:dashed;border-color:var(--honey)}
   .floor-board-root .chip-add{border-style:dashed;color:var(--ink3)}
+  .floor-board-root .chip-add:disabled{cursor:default;opacity:.5}
   .floor-board-root .chip-n{font-weight:500;color:var(--ink)}
   .floor-board-root .swatch{display:inline-block;width:11px;height:11px;border-radius:2px;
     border:1px solid rgba(58,52,44,.25);flex:none}
@@ -7597,9 +7598,10 @@ const FLOOR_BOARD_CSS = `
   .floor-board-root .wp-remove{flex:none;width:22px;height:22px;border:1px solid var(--rule);border-radius:4px;
     background:#fff;color:var(--ink3);font-size:14px;line-height:1;padding:0;font-family:Inter,sans-serif}
   .floor-board-root .wp-remove:hover{border-color:var(--clay);color:var(--clay)}
-  .floor-board-root .wp-add{width:100%;margin-top:4px;padding:5px 0;border:1px dashed var(--rule);border-radius:4px;
-    background:transparent;color:var(--ink3);font-size:11px;font-family:Inter,sans-serif}
+  .floor-board-root .wp-add{width:100%;margin-top:4px;padding:5px 4px;border:1px dashed var(--rule);border-radius:4px;
+    background:transparent;color:var(--ink3);font-size:11px;font-family:Inter,sans-serif;text-align:center;cursor:pointer}
   .floor-board-root .wp-add:hover{border-color:var(--sage);color:#5a6e50}
+  .floor-board-root .wp-add:disabled{cursor:default;opacity:.5}
   .floor-board-root .wp-empty{font-size:12px;color:var(--ink3);font-style:italic;margin-bottom:2px}
   .floor-board-root .batch-toggle button.no[aria-pressed="true"]{background:var(--clay-bg);color:var(--clay);border-color:var(--clay);font-weight:600}
   .floor-board-root .batch-empty{font-size:12px;color:var(--ink3);font-style:italic}
@@ -7825,7 +7827,13 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
         </div>
         <div class="chips">
           ${chips}
-          <button class="chip chip-add" data-add="${s.key}" aria-label="Add another job to ${s.name}">+ another job</button>
+          ${(() => {
+            const addOptions = availableJobsForStage(s.key);
+            return `<select class="chip chip-add" data-add="${s.key}" aria-label="Add another job to ${s.name}" ${addOptions.length ? "" : "disabled"}>
+              <option value="">+ another job</option>
+              ${addOptions.map(j => `<option value="${j.jobId}">${escapeHtml(j.jobName)}</option>`).join("")}
+            </select>`;
+          })()}
         </div>
         ${late ? `<div class="behind-pill">${Math.round(due - done)} behind</div>` : ""}
         ${s.key === "prep" && drawersWaiting > 0 ? `<div class="behind-pill">${drawersWaiting} drawer box${drawersWaiting === 1 ? "" : "es"} waiting</div>` : ""}
@@ -7875,12 +7883,16 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
               aria-label="Remove ${escapeHtml(j.jobName)} from ${s.name} on ${dayLabel}">&times;</button>
           </div>`;
         }).join("");
+        const addOptions = availableJobsForWeekPlan(dISO, s.key);
         return `
         <div class="wp-stage">
           <div class="wp-stage-name">${s.name}</div>
           ${rows || `<div class="wp-empty">Nothing booked</div>`}
-          <button class="wp-add" data-wp-add-date="${dISO}" data-wp-add-stage="${s.key}"
-            aria-label="Add a job to ${s.name} on ${dayLabel}">+ add job</button>
+          <select class="wp-add" data-wp-add-date="${dISO}" data-wp-add-stage="${s.key}"
+            aria-label="Add a job to ${s.name} on ${dayLabel}" ${addOptions.length ? "" : "disabled"}>
+            <option value="">+ add job</option>
+            ${addOptions.map(j => `<option value="${j.jobId}">${escapeHtml(j.jobName)}</option>`).join("")}
+          </select>
         </div>`;
       }).join("");
       return `
@@ -7891,21 +7903,21 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     }).join("");
   }
 
-  function addJobToWeekPlan(dateISO, stageKey) {
+  // Every active job from the main schedule not already sitting in this
+  // stage/day's list — the dropdown's options, and what a picked jobId is
+  // validated against.
+  function availableJobsForWeekPlan(dateISO, stageKey) {
     const dayBrief = weekPlanRef.current[dateISO] || { stages: {}, allJobs: [] };
     const already = stagePlanFor(dateISO, stageKey, dayBrief.stages[stageKey] || []).map(j => j.jobId);
-    const options = (dayBrief.allJobs || []).filter(j => already.indexOf(j.jobId) === -1);
-    if (!options.length) return;
-    const pick = window.prompt(
-      "Add a job to " + stageKey + ":\n\n" +
-      options.map((j, i) => (i + 1) + ". " + j.jobName).join("\n") +
-      "\n\nType a number:"
-    );
-    const idx = parseInt(pick, 10) - 1;
-    if (isNaN(idx) || !options[idx]) return;
+    return (dayBrief.allJobs || []).filter(j => already.indexOf(j.jobId) === -1);
+  }
+
+  function addJobToWeekPlan(dateISO, stageKey, jobId) {
+    const job = availableJobsForWeekPlan(dateISO, stageKey).find(j => j.jobId === jobId);
+    if (!job) return;
     weeklyExtra = { ...weeklyExtra };
     weeklyExtra[dateISO] = { ...(weeklyExtra[dateISO] || {}) };
-    weeklyExtra[dateISO][stageKey] = (weeklyExtra[dateISO][stageKey] || []).concat(options[idx]);
+    weeklyExtra[dateISO][stageKey] = (weeklyExtra[dateISO][stageKey] || []).concat(job);
     saveWeeklyPlan();
     renderAll();
   }
@@ -8052,20 +8064,17 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     queueSave(weekKeyFor(new Date()), wtd);
   }
 
-  function addJobToStage(stageKey) {
+  function availableJobsForStage(stageKey) {
     const taken = jobsAt(stageKey).map(j => j.jobId);
-    const options = (planRef.current.allJobs || []).filter(j => taken.indexOf(j.jobId) === -1);
-    if (!options.length) return;
-    const pick = window.prompt(
-      "Add a job to " + stageKey + ":\n\n" +
-      options.map((j, i) => (i + 1) + ". " + j.jobName).join("\n") +
-      "\n\nType a number:"
-    );
-    const idx = parseInt(pick, 10) - 1;
-    if (isNaN(idx) || !options[idx]) return;
-    extraJobs[stageKey] = (extraJobs[stageKey] || []).concat(options[idx]);
-    offPlan.push({ stage: stageKey, jobId: options[idx].jobId });
-    selected[stageKey] = options[idx].jobId;
+    return (planRef.current.allJobs || []).filter(j => taken.indexOf(j.jobId) === -1);
+  }
+
+  function addJobToStage(stageKey, jobId) {
+    const job = availableJobsForStage(stageKey).find(j => j.jobId === jobId);
+    if (!job) return;
+    extraJobs[stageKey] = (extraJobs[stageKey] || []).concat(job);
+    offPlan.push({ stage: stageKey, jobId: job.jobId });
+    selected[stageKey] = job.jobId;
     renderAll();
     queueSave(dayKeyFor(new Date()), { ...today, offPlan, notes });
   }
@@ -8075,8 +8084,6 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     if (!b) return;
     if (b.dataset.tab) { setTab(b.dataset.tab); return; }
     if (b.dataset.job) { selected[b.dataset.stage] = b.dataset.job; renderAll(); return; }
-    if (b.dataset.add) { addJobToStage(b.dataset.add); return; }
-    if (b.dataset.wpAddDate) { addJobToWeekPlan(b.dataset.wpAddDate, b.dataset.wpAddStage); return; }
     if (b.dataset.wpRemoveDate) { removeJobFromWeekPlan(b.dataset.wpRemoveDate, b.dataset.wpRemoveStage, b.dataset.wpRemoveJob); return; }
     if (b.dataset.addnote) { addNote(); return; }
     if (b.dataset.addbatch) { addDrawerBatch(); return; }
@@ -8095,6 +8102,12 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     const t = e.target;
     if (t && t.classList && t.classList.contains("wp-input")) {
       setWeeklyTarget(t.dataset.wpDate, t.dataset.wpStage, t.dataset.wpJob, t.value);
+    }
+    if (t && t.classList && t.classList.contains("wp-add") && t.value) {
+      addJobToWeekPlan(t.dataset.wpAddDate, t.dataset.wpAddStage, t.value);
+    }
+    if (t && t.classList && t.classList.contains("chip-add") && t.value) {
+      addJobToStage(t.dataset.add, t.value);
     }
   };
   root.addEventListener("change", onChange);
