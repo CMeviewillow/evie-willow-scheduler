@@ -7654,7 +7654,18 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
   }
   const pending = {};
   let flushTimer = null;
+  // Stamped on every local change (a tap, not just the eventual save) so the
+  // realtime subscribe callback below can ignore notifications that arrive
+  // while we still have an unflushed change of our own in flight — without
+  // this, tapping +1 updates `today` locally, queues a save 600ms out, and
+  // if a realtime broadcast (an echo of that same save, or someone else's
+  // unrelated change) lands before the flush completes, the subscribe
+  // callback overwrites `today` with the still-stale pre-tap server copy —
+  // the tap visibly reverts to 0. Mirrors the App() component's own
+  // lastWriteAtRef/3-second suppression window for the same reason.
+  let lastWriteAt = 0;
   function queueSave(key, val) {
+    lastWriteAt = Date.now();
     pending[key] = val;
     clearTimeout(flushTimer);
     flushTimer = setTimeout(flush, 600);
@@ -8177,6 +8188,9 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
 
     if (store && store.subscribe) {
       unsubscribe = store.subscribe(async () => {
+        // Ignore notifications that arrive shortly after our own tap — see
+        // lastWriteAt above.
+        if (Date.now() - lastWriteAt < 3000) return;
         const t2 = await load(dayKeyFor(new Date()));
         if (t2) { offPlan = t2.offPlan || []; notes = t2.notes || []; delete t2.offPlan; delete t2.notes; today = t2; }
         drawerBatches = (await load(drawersKey)) || [];
