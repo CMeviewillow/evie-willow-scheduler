@@ -7653,9 +7653,51 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     clearTimeout(flushTimer);
     flushTimer = setTimeout(flush, 600);
   }
+  // For each stage/jobId counter: if OUR value differs from the baseline we
+  // last synced against, we changed it locally — keep ours. Otherwise we
+  // never touched it, so take whatever the server has now (which may have
+  // moved if another device saved since). Same idea as mergeJobs/sameJobs
+  // for `jobs` in the App() component, just applied to nested counters
+  // instead of a flat list — see dayBaseline above for why this exists.
+  function mergeDayCounts(baseline, mine, fresh) {
+    const stages = new Set([...Object.keys(baseline || {}), ...Object.keys(mine || {}), ...Object.keys(fresh || {})]);
+    const merged = {};
+    for (const stage of stages) {
+      const b = (baseline && baseline[stage]) || {};
+      const m = (mine && mine[stage]) || {};
+      const f = (fresh && fresh[stage]) || {};
+      const jobIds = new Set([...Object.keys(b), ...Object.keys(m), ...Object.keys(f)]);
+      const stageOut = {};
+      for (const jobId of jobIds) {
+        stageOut[jobId] = (m[jobId] || 0) !== (b[jobId] || 0) ? (m[jobId] || 0) : (f[jobId] || 0);
+      }
+      merged[stage] = stageOut;
+    }
+    return merged;
+  }
+
   async function flush() {
     const keys = Object.keys(pending);
-    for (const k of keys) { const v = pending[k]; delete pending[k]; await saveNow(k, v); }
+    for (const k of keys) {
+      const v = pending[k];
+      delete pending[k];
+      if (k === dayKeyFor(new Date())) {
+        // Never blindly overwrite the whole day record with our own
+        // possibly-stale snapshot of `today` — a device that missed a
+        // realtime update for some OTHER stage (a dropped connection, a
+        // tab that's been open a while) would otherwise silently erase
+        // that stage's count the next time it saved anything at all.
+        // Fetch the current server copy and merge our own changes into
+        // THAT, rather than saving over it.
+        const fresh = await load(k);
+        today = mergeDayCounts(dayBaseline, today, fresh);
+        dayBaseline = cloneCounts(today);
+        renderAll();
+        await saveNow(k, { ...today, offPlan, notes });
+      } else {
+        await saveNow(k, v);
+      }
+    }
   }
 
   const dayKeyFor = (d) => "floor:" + iso(d);
@@ -7690,6 +7732,14 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
 
   let today = {}, yesterday = {}, weekToDate = {}, offPlan = [], notes = [], extraJobs = {}, selected = {};
   let drawerBatches = [], activeTab = "today";
+  // The last copy of `today`'s stage counts we know matched the server —
+  // the merge base for reconciling our own local taps against whatever
+  // another device may have saved since. Updated after every load and
+  // every successful flush of the day record. See mergeDayCounts below for
+  // why this exists — it's the same 3-way-merge idea as mergeJobs/sameJobs
+  // (App() component), applied to floor board tap counts.
+  let dayBaseline = {};
+  const cloneCounts = (obj) => JSON.parse(JSON.stringify(obj || {}));
   // Harry/Jon's own weekly plan, all keyed by date then stage:
   //   weeklyTargets: { [dateISO]: { [stageKey]: { [jobId]: count } } } — a saved count override
   //   weeklyRemoved: { [dateISO]: { [stageKey]: [jobId, ...] } } — auto-scheduled jobs they've hidden
@@ -8152,6 +8202,7 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     const prev = await load(dayKeyFor(prevWorkingDay(new Date())));
     if (prev) { delete prev.offPlan; delete prev.notes; yesterday = prev; } else { yesterday = {}; }
     today = {}; offPlan = []; notes = []; extraJobs = {}; selected = {};
+    dayBaseline = {};
     weekToDate = (await load(weekKeyFor(new Date()))) || {};
     await loadWeeklyPlan();
     renderDate(); renderAll();
@@ -8162,6 +8213,7 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     renderDate(); renderNotice();
     const t = await load(dayKeyFor(new Date()));
     if (t) { offPlan = t.offPlan || []; notes = t.notes || []; delete t.offPlan; delete t.notes; today = t; }
+    dayBaseline = cloneCounts(today);
     const y = await load(dayKeyFor(prevWorkingDay(new Date())));
     if (y) { delete y.offPlan; delete y.notes; yesterday = y; }
     weekToDate = (await load(weekKeyFor(new Date()))) || {};
@@ -8176,6 +8228,7 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
         if (Date.now() - lastWriteAt < 3000) return;
         const t2 = await load(dayKeyFor(new Date()));
         if (t2) { offPlan = t2.offPlan || []; notes = t2.notes || []; delete t2.offPlan; delete t2.notes; today = t2; }
+        dayBaseline = cloneCounts(today);
         drawerBatches = (await load(drawersKey)) || [];
         renderAll();
       });
