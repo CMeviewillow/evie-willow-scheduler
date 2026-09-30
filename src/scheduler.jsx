@@ -7693,6 +7693,42 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     return merged;
   }
 
+  // Same 3-way merge, generalized one level deeper (weeklyTargets/
+  // weeklyRemoved/weeklyExtra are all keyed by date, then stage) and
+  // reused for both a per-job count map (targets, via mergeLeaf =
+  // mergeTargetCounts) and a whole-array leaf (removed/extra, via
+  // mergeLeaf = mergeArrayLeaf — those only ever change as a complete
+  // array per edit, see setWeeklyTarget/addJobToWeekPlan/
+  // removeJobFromWeekPlan, so there's no per-item baseline to diff).
+  function mergeByDateStage(baseline, mine, fresh, mergeLeaf) {
+    const dates = new Set([...Object.keys(baseline || {}), ...Object.keys(mine || {}), ...Object.keys(fresh || {})]);
+    const merged = {};
+    for (const dateISO of dates) {
+      const b = (baseline && baseline[dateISO]) || {};
+      const m = (mine && mine[dateISO]) || {};
+      const f = (fresh && fresh[dateISO]) || {};
+      const stages = new Set([...Object.keys(b), ...Object.keys(m), ...Object.keys(f)]);
+      const dateOut = {};
+      for (const stageKey of stages) {
+        dateOut[stageKey] = mergeLeaf(b[stageKey], m[stageKey], f[stageKey]);
+      }
+      merged[dateISO] = dateOut;
+    }
+    return merged;
+  }
+  function mergeTargetCounts(b, m, f) {
+    b = b || {}; m = m || {}; f = f || {};
+    const jobIds = new Set([...Object.keys(b), ...Object.keys(m), ...Object.keys(f)]);
+    const out = {};
+    for (const jobId of jobIds) {
+      out[jobId] = (m[jobId] || 0) !== (b[jobId] || 0) ? (m[jobId] || 0) : (f[jobId] || 0);
+    }
+    return out;
+  }
+  function mergeArrayLeaf(b, m, f) {
+    return JSON.stringify(m || []) !== JSON.stringify(b || []) ? (m || []) : (f || []);
+  }
+
   async function flush() {
     const keys = Object.keys(pending);
     for (const k of keys) {
@@ -7711,6 +7747,15 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
         dayBaseline = cloneCounts(today);
         renderAll();
         await saveNow(k, { ...today, offPlan, notes });
+      } else if (k === weekPlanKeyFor(new Date())) {
+        // Same problem, same fix, for the weekly plan.
+        const fresh = await load(k);
+        weeklyTargets = mergeByDateStage(weekPlanBaseline.targets, weeklyTargets, fresh?.targets, mergeTargetCounts);
+        weeklyRemoved = mergeByDateStage(weekPlanBaseline.removed, weeklyRemoved, fresh?.removed, mergeArrayLeaf);
+        weeklyExtra = mergeByDateStage(weekPlanBaseline.extra, weeklyExtra, fresh?.extra, mergeArrayLeaf);
+        weekPlanBaseline = { targets: cloneCounts(weeklyTargets), removed: cloneCounts(weeklyRemoved), extra: cloneCounts(weeklyExtra) };
+        renderAll();
+        await saveNow(k, { targets: weeklyTargets, removed: weeklyRemoved, extra: weeklyExtra });
       } else {
         await saveNow(k, v);
       }
@@ -7757,6 +7802,14 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
   // (App() component), applied to floor board tap counts.
   let dayBaseline = {};
   const cloneCounts = (obj) => JSON.parse(JSON.stringify(obj || {}));
+  // Same idea again, for the weekly plan (weeklyTargets/weeklyRemoved/
+  // weeklyExtra below) — a device whose local copy of ANY of these was
+  // stale (never loaded, or missed a realtime update for some OTHER day's
+  // edit) would otherwise silently erase that edit the next time it saved
+  // its own, via the identical whole-snapshot-overwrite bug that hit the
+  // day record (see mergeDayCounts's comment) — reported 2026-09-30 as
+  // "targets... reverting back to 0" across several devices.
+  let weekPlanBaseline = { targets: {}, removed: {}, extra: {} };
   // Harry/Jon's own weekly plan, all keyed by date then stage:
   //   weeklyTargets: { [dateISO]: { [stageKey]: { [jobId]: count } } } — a saved count override
   //   weeklyRemoved: { [dateISO]: { [stageKey]: [jobId, ...] } } — auto-scheduled jobs they've hidden
@@ -7779,6 +7832,7 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
       weeklyRemoved = {};
       weeklyExtra = {};
     }
+    weekPlanBaseline = { targets: cloneCounts(weeklyTargets), removed: cloneCounts(weeklyRemoved), extra: cloneCounts(weeklyExtra) };
   }
   function saveWeeklyPlan() {
     queueSave(weekPlanKeyFor(new Date()), { targets: weeklyTargets, removed: weeklyRemoved, extra: weeklyExtra });
@@ -8246,6 +8300,12 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
         const t2 = await load(dayKeyFor(new Date()));
         if (t2) { offPlan = t2.offPlan || []; notes = t2.notes || []; delete t2.offPlan; delete t2.notes; today = t2; }
         dayBaseline = cloneCounts(today);
+        // The weekly plan wasn't being re-synced here at all — another
+        // device's target/add/remove edits never showed up on this one
+        // until a full page reload, which is also what let a stale local
+        // copy of it survive long enough to clobber those edits on its
+        // own next save (see mergeByDateStage above).
+        await loadWeeklyPlan();
         drawerBatches = (await load(drawersKey)) || [];
         renderAll();
       });
