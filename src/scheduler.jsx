@@ -7711,6 +7711,41 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
   function mergeArrayLeaf(b, m, f) {
     return JSON.stringify(m || []) !== JSON.stringify(b || []) ? (m || []) : (f || []);
   }
+  // offPlan/notes have no delete — they only ever grow (push). For an
+  // append-only list, the safe merge needs no baseline at all: take the
+  // server's current full list (picks up every other device's additions),
+  // plus whatever of ours isn't in it yet (our own not-yet-synced ones).
+  function mergeAppendOnlyList(mine, fresh, keyFn) {
+    const freshKeys = new Set((fresh || []).map(keyFn));
+    const oursNew = (mine || []).filter(item => !freshKeys.has(keyFn(item)));
+    return [...(fresh || []), ...oursNew];
+  }
+  // Same by-id merge as mergeJobs/sameJobs for `jobs` in the App()
+  // component, applied to drawerBatches — addDrawerBatch/setDrawerBatchDone
+  // both reassign the array (new ref for a touched item, same ref for
+  // everything else), so reference equality against the baseline cheaply
+  // identifies what WE changed, same as there.
+  function mergeDrawerBatches(base, mine, theirs) {
+    const baseById = new Map((base || []).map(b => [b.id, b]));
+    const theirsById = new Map((theirs || []).map(b => [b.id, b]));
+    const merged = [];
+    const handled = new Set();
+    for (const m of (mine || [])) {
+      handled.add(m.id);
+      const touchedLocally = baseById.get(m.id) !== m;
+      if (touchedLocally) {
+        merged.push(m);
+      } else {
+        const t = theirsById.get(m.id);
+        if (t !== undefined) merged.push(JSON.stringify(m) === JSON.stringify(t) ? m : t);
+      }
+    }
+    for (const t of (theirs || [])) {
+      if (handled.has(t.id) || baseById.has(t.id)) continue;
+      merged.push(t);
+    }
+    return merged;
+  }
 
   async function flush() {
     const keys = Object.keys(pending);
@@ -7728,6 +7763,8 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
         const fresh = await load(k);
         today = mergeDayCounts(dayBaseline, today, fresh);
         dayBaseline = cloneCounts(today);
+        offPlan = mergeAppendOnlyList(offPlan, fresh?.offPlan, o => o.stage + ":" + o.jobId);
+        notes = mergeAppendOnlyList(notes, fresh?.notes, s => s);
         renderAll();
         await saveNow(k, { ...today, offPlan, notes });
       } else if (k === weekPlanKeyFor(new Date())) {
@@ -7739,6 +7776,22 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
         weekPlanBaseline = { targets: cloneCounts(weeklyTargets), removed: cloneCounts(weeklyRemoved), extra: cloneCounts(weeklyExtra) };
         renderAll();
         await saveNow(k, { targets: weeklyTargets, removed: weeklyRemoved, extra: weeklyExtra });
+      } else if (k === weekKeyFor(new Date())) {
+        // Same problem, same fix, for week-to-date — bumped on literally
+        // every tap of every stage, so the highest-frequency save of all
+        // of these, and the most exposed to two devices racing.
+        const fresh = await load(k);
+        weekToDate = mergeTargetCounts(weekToDateBaseline, weekToDate, fresh);
+        weekToDateBaseline = cloneCounts(weekToDate);
+        renderAll();
+        await saveNow(k, weekToDate);
+      } else if (k === drawersKey) {
+        // Same problem, same fix, for drawer batches.
+        const fresh = await load(k);
+        drawerBatches = mergeDrawerBatches(drawerBaseline, drawerBatches, fresh);
+        drawerBaseline = drawerBatches;
+        renderDrawers();
+        await saveNow(k, drawerBatches);
       } else {
         await saveNow(k, v);
       }
@@ -7785,6 +7838,16 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
   // (App() component), applied to floor board tap counts.
   let dayBaseline = {};
   const cloneCounts = (obj) => JSON.parse(JSON.stringify(obj || {}));
+  // Same idea, for weekToDate (a flat {stageKey: count} map — merged with
+  // mergeTargetCounts directly below, same shape as a targets leaf) and
+  // drawerBatches (a list of {id,...} objects — merged by id like
+  // mergeJobs/sameJobs merges `jobs` in the App() component). Both were
+  // missed by the day-record and weekly-plan fixes since they're saved
+  // under their own separate keys (floor:wtd:<mondayISO> and
+  // floor:drawers) — audited in full 2026-09-30 after the weekly-plan fix
+  // alone didn't stop reports of things still zeroing.
+  let weekToDateBaseline = {};
+  let drawerBaseline = [];
   // Same idea again, for the weekly plan (weeklyTargets/weeklyRemoved/
   // weeklyExtra below) — a device whose local copy of ANY of these was
   // stale (never loaded, or missed a realtime update for some OTHER day's
@@ -8258,6 +8321,7 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     today = {}; offPlan = []; notes = []; extraJobs = {}; selected = {};
     dayBaseline = {};
     weekToDate = (await load(weekKeyFor(new Date()))) || {};
+    weekToDateBaseline = cloneCounts(weekToDate);
     await loadWeeklyPlan();
     renderDate(); renderAll();
   }
@@ -8271,8 +8335,10 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     const y = await load(dayKeyFor(prevWorkingDay(new Date())));
     if (y) { delete y.offPlan; delete y.notes; yesterday = y; }
     weekToDate = (await load(weekKeyFor(new Date()))) || {};
+    weekToDateBaseline = cloneCounts(weekToDate);
     await loadWeeklyPlan();
     drawerBatches = (await load(drawersKey)) || [];
+    drawerBaseline = drawerBatches;
     renderAll();
 
     if (store && store.subscribe) {
@@ -8289,7 +8355,13 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
         // copy of it survive long enough to clobber those edits on its
         // own next save (see mergeByDateStage above).
         await loadWeeklyPlan();
+        // Same gap for week-to-date — it wasn't being re-synced here
+        // either, so a device's own copy could drift for hours and then
+        // wipe out other stages' progress on its very next tap.
+        weekToDate = (await load(weekKeyFor(new Date()))) || {};
+        weekToDateBaseline = cloneCounts(weekToDate);
         drawerBatches = (await load(drawersKey)) || [];
+        drawerBaseline = drawerBatches;
         renderAll();
       });
     }
