@@ -8311,6 +8311,29 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
   };
   document.addEventListener("visibilitychange", onVisibilityChange);
 
+  // This is a kiosk nobody manually reloads — a wall TV or a tablet left
+  // open for days. Every code fix shipped since the page was last opened
+  // is invisible to it until something forces a reload; a device that's
+  // been sitting on an old build keeps whatever bugs that build had,
+  // merge fixes and all, no matter how many times the live site gets
+  // fixed. Checked once a minute (piggybacking the existing interval):
+  // fetch the current deployed index.html, compare its script bundle
+  // against the one actually running, and reload if they differ. A brief
+  // visible reload once a minute's worth of staleness beats running
+  // stale code indefinitely.
+  const ownScriptSrc = (document.querySelector('script[type="module"]') || {}).src || "";
+  async function checkForNewVersion() {
+    if (!ownScriptSrc) return;
+    try {
+      const res = await fetch("/", { cache: "no-store" });
+      const html = await res.text();
+      const match = html.match(/<script[^>]+src="([^"]+)"/);
+      if (!match) return;
+      const latestSrc = new URL(match[1], window.location.origin).href;
+      if (latestSrc !== ownScriptSrc) window.location.reload();
+    } catch (e) { /* network hiccup — try again next minute */ }
+  }
+
   async function rollOverIfNewDay() {
     const nowDay = iso(new Date());
     if (nowDay === currentDay) return;
@@ -8369,6 +8392,7 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     interval = setInterval(async () => {
       await rollOverIfNewDay();
       renderDate(); renderWeek(); renderStages();
+      await checkForNewVersion();
     }, 60000);
   })();
 
