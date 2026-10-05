@@ -3,6 +3,10 @@ import { Plus, Trash2, AlertTriangle, Calendar, Settings, Download, Upload, X, T
 import "./storage.js"; // installs window.storage backed by Supabase
 import PersonAliasAdmin from "./timetracker/PersonAliasAdmin.jsx";
 import TimeTrackerPreview from "./timetracker/TimeTrackerPreview.jsx";
+import {
+  cloneJSON, mergeCounts, mergeStageCounts, mergeLWW, mergeSet3,
+  mergeByDateStage, mergeAppendOnlyList, mergeDrawerBatches,
+} from "./floorMerge.js";
 
 // Read-only mode: append ?readonly=1 to the URL to disable all edits.
 const IS_READONLY = typeof window !== "undefined"
@@ -2956,7 +2960,7 @@ function App() {
         if (JSON.stringify(incoming) !== JSON.stringify(dismissedWarningsRef.current)) setDismissedWarnings(incoming);
       }
     } catch {}
-    await loadFloorActuals();
+    if (!IS_BOARD) await loadFloorActuals();   // the board never reads these
   };
 
   // Pull every floor:YYYY-MM-DD record (the floor board's daily tap counts) —
@@ -2999,7 +3003,20 @@ function App() {
     if (loading) return;
     if (!window.storage.subscribe) return;
     let debounceTimer = null;
-    const unsubscribe = window.storage.subscribe(() => {
+    let floorTimer = null;
+    const unsubscribe = window.storage.subscribe((payload) => {
+      // A floor board tap (floor:* key) changes nothing in jobs/settings, so
+      // it must not trigger the full reload (ew-jobs plus every historic
+      // floor record) — that ran on every tap on every open screen. The
+      // floor board itself ignores it here; the main scheduler just
+      // refreshes its floor actuals now and then.
+      const key = payload && payload.key;
+      if (key && key.startsWith("floor:")) {
+        if (IS_BOARD) return;
+        clearTimeout(floorTimer);
+        floorTimer = setTimeout(() => { loadFloorActuals(); }, 10000);
+        return;
+      }
       // Ignore notifications that arrive shortly after our own save —
       // they're just realtime echoes of changes we ourselves made.
       const sinceLastWrite = Date.now() - lastWriteAtRef.current;
@@ -3007,7 +3024,7 @@ function App() {
       clearTimeout(debounceTimer);
       debounceTimer = setTimeout(() => { reloadFromStorage(); }, 800);
     });
-    return () => { clearTimeout(debounceTimer); unsubscribe(); };
+    return () => { clearTimeout(debounceTimer); clearTimeout(floorTimer); unsubscribe(); };
   }, [loading]);
 
   // Undo history capture — DEBOUNCED (1s of no further change) so a burst of
@@ -3017,7 +3034,7 @@ function App() {
   // from another device also produces an undo step — acceptable for a
   // single-workshop tool rather than building multi-device-aware history.
   useEffect(() => {
-    if (loading || IS_READONLY) return;
+    if (loading || IS_READONLY || IS_BOARD) return;
     if (!historyInitRef.current) {
       lastCommittedRef.current = { jobs, settings };
       historyInitRef.current = true;
@@ -3085,7 +3102,7 @@ function App() {
   // in the meantime (see project_multi_device_sync_merge).
   const wasUndoRedoForSave = isUndoRedoActionRef.current;
   useEffect(() => {
-    if (loading || IS_READONLY) return;
+    if (loading || IS_READONLY || IS_BOARD) return;
     const t = setTimeout(async () => {
       if (jobs.length === 0 && !wasUndoRedoForSave) {
         // Safety check: don't overwrite non-empty Supabase data with an empty array
@@ -3124,19 +3141,19 @@ function App() {
 
   // Save settings (debounced too — same reasoning)
   useEffect(() => {
-    if (loading || IS_READONLY) return;
+    if (loading || IS_READONLY || IS_BOARD) return;
     const t = setTimeout(() => safeSet("ew-settings", JSON.stringify(settings)), 600);
     return () => clearTimeout(t);
   }, [settings, loading]);
 
   useEffect(() => {
-    if (loading || IS_READONLY) return;
+    if (loading || IS_READONLY || IS_BOARD) return;
     const t = setTimeout(() => safeSet("ew-dismissed-reminders", JSON.stringify(dismissedReminders)), 600);
     return () => clearTimeout(t);
   }, [dismissedReminders, loading]);
 
   useEffect(() => {
-    if (loading || IS_READONLY) return;
+    if (loading || IS_READONLY || IS_BOARD) return;
     const t = setTimeout(() => safeSet("ew-dismissed-warnings", JSON.stringify(dismissedWarnings)), 600);
     return () => clearTimeout(t);
   }, [dismissedWarnings, loading]);
@@ -7551,6 +7568,7 @@ const FLOOR_BOARD_CSS = `
   .floor-board-root .plus{flex:1;background:var(--sage);color:var(--panel);border:none;
     font-size:22px;padding:10px 0;letter-spacing:.02em;min-height:46px}
   .floor-board-root .plus:active{background:#68785e}
+  .floor-board-root .plus:disabled,.floor-board-root .minus:disabled{opacity:.35;cursor:default}
   .floor-board-root .minus{width:56px;background:transparent;color:var(--ink2);border:1px solid var(--rule);font-size:20px;min-height:46px}
   .floor-board-root .plus:focus-visible,.floor-board-root .minus:focus-visible,.floor-board-root .chip:focus-visible{outline:3px solid var(--slate);outline-offset:2px}
   .floor-board-root .yrow{display:flex;justify-content:space-between;align-items:center;
@@ -7644,175 +7662,162 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
   const store = (typeof window !== "undefined" && window.storage) ? window.storage : null;
   const memory = {};
 
-  async function load(key) {
+  // ---------------------------------------------------------------------
+  // Storage + sync core.
+  //
+  // Several devices (wall TV, tablets) edit the same records at once, and
+  // each only knows the server as of its last sync. Everything below is
+  // built on one rule: every read-modify-write goes through `exclusive()`
+  // (one at a time per device) and is a 3-way merge of
+  //   baseline (server as of our last sync) / mine (local, incl. unsaved
+  //   edits) / fresh (server right now)
+  // using the pure functions in floorMerge.js. Counters are ADDITIVE
+  // (fresh + our delta), so two devices tapping the same counter both
+  // count. A failed read aborts the sync (never treated as "empty", which
+  // used to zero the board); a failed save re-queues instead of dropping
+  // the tap.
+  // ---------------------------------------------------------------------
+  async function load(key) {            // null = no such row; THROWS if the read failed
     if (!store) return memory[key] ?? null;
-    try { const r = await store.get(key); return r?.value ? JSON.parse(r.value) : null; } catch (e) { return null; }
+    const r = await store.get(key);
+    return r?.value ? JSON.parse(r.value) : null;
   }
-  async function saveNow(key, val) {
-    if (!store) { memory[key] = val; return; }
-    try { await store.set(key, JSON.stringify(val)); } catch (e) { memory[key] = val; }
+  // Read with the row's version so the matching write can be conditional.
+  async function loadV(key) {
+    if (!store) return { value: memory[key] ?? null, version: null, versioned: false };
+    if (store.getVersioned) {
+      const r = await store.getVersioned(key);
+      return { value: r.value ? JSON.parse(r.value) : null, version: r.version, versioned: true };
+    }
+    return { value: await load(key), version: null, versioned: false };
   }
-  const pending = {};
-  let flushTimer = null;
-  // Stamped on every local change (a tap, not just the eventual save) so the
-  // realtime subscribe callback below can ignore notifications that arrive
-  // while we still have an unflushed change of our own in flight — without
-  // this, tapping +1 updates `today` locally, queues a save 600ms out, and
-  // if a realtime broadcast (an echo of that same save, or someone else's
-  // unrelated change) lands before the flush completes, the subscribe
-  // callback overwrites `today` with the still-stale pre-tap server copy —
-  // the tap visibly reverts to 0. Mirrors the App() component's own
-  // lastWriteAtRef/3-second suppression window for the same reason.
-  let lastWriteAt = 0;
-  function queueSave(key, val) {
-    lastWriteAt = Date.now();
-    pending[key] = val;
+  // true = saved; false = another device wrote since we read (caller re-reads
+  // and re-merges). Throws if the write itself failed.
+  async function saveV(key, val, read) {
+    if (!store) { memory[key] = val; return true; }
+    if (read.versioned) return store.setIfVersion(key, JSON.stringify(val), read.version);
+    await store.set(key, JSON.stringify(val));
+    return true;
+  }
+
+  let chain = Promise.resolve();
+  function exclusive(fn) {
+    const run = chain.then(fn);
+    chain = run.catch(() => {});
+    return run;
+  }
+
+  const dirty = new Set();              // which of day/wtd/plan/drawers have unsaved local edits
+  let flushTimer = null, retryTimer = null, pullTimer = null;
+  function markDirty(name) {
+    dirty.add(name);
     clearTimeout(flushTimer);
-    flushTimer = setTimeout(flush, 600);
-  }
-  // For each stage/jobId counter: if OUR value differs from the baseline we
-  // last synced against, we changed it locally — keep ours. Otherwise we
-  // never touched it, so take whatever the server has now (which may have
-  // moved if another device saved since). Same idea as mergeJobs/sameJobs
-  // for `jobs` in the App() component, just applied to nested counters
-  // instead of a flat list — see dayBaseline above for why this exists.
-  function mergeDayCounts(baseline, mine, fresh) {
-    const stages = new Set([...Object.keys(baseline || {}), ...Object.keys(mine || {}), ...Object.keys(fresh || {})]);
-    const merged = {};
-    for (const stage of stages) {
-      const b = (baseline && baseline[stage]) || {};
-      const m = (mine && mine[stage]) || {};
-      const f = (fresh && fresh[stage]) || {};
-      const jobIds = new Set([...Object.keys(b), ...Object.keys(m), ...Object.keys(f)]);
-      const stageOut = {};
-      for (const jobId of jobIds) {
-        stageOut[jobId] = (m[jobId] || 0) !== (b[jobId] || 0) ? (m[jobId] || 0) : (f[jobId] || 0);
-      }
-      merged[stage] = stageOut;
-    }
-    return merged;
+    flushTimer = setTimeout(flushNow, 600);
   }
 
-  // Same 3-way merge, generalized one level deeper (weeklyTargets/
-  // weeklyRemoved/weeklyExtra are all keyed by date, then stage) and
-  // reused for both a per-job count map (targets, via mergeLeaf =
-  // mergeTargetCounts) and a whole-array leaf (removed/extra, via
-  // mergeLeaf = mergeArrayLeaf — those only ever change as a complete
-  // array per edit, see setWeeklyTarget/addJobToWeekPlan/
-  // removeJobFromWeekPlan, so there's no per-item baseline to diff).
-  function mergeByDateStage(baseline, mine, fresh, mergeLeaf) {
-    const dates = new Set([...Object.keys(baseline || {}), ...Object.keys(mine || {}), ...Object.keys(fresh || {})]);
-    const merged = {};
-    for (const dateISO of dates) {
-      const b = (baseline && baseline[dateISO]) || {};
-      const m = (mine && mine[dateISO]) || {};
-      const f = (fresh && fresh[dateISO]) || {};
-      const stages = new Set([...Object.keys(b), ...Object.keys(m), ...Object.keys(f)]);
-      const dateOut = {};
-      for (const stageKey of stages) {
-        dateOut[stageKey] = mergeLeaf(b[stageKey], m[stageKey], f[stageKey]);
-      }
-      merged[dateISO] = dateOut;
-    }
-    return merged;
-  }
-  function mergeTargetCounts(b, m, f) {
-    b = b || {}; m = m || {}; f = f || {};
-    const jobIds = new Set([...Object.keys(b), ...Object.keys(m), ...Object.keys(f)]);
+  const STAGE_KEYS = FLOOR_STAGES.map(s => s.key);
+  const pickStages = (rec) => {
     const out = {};
-    for (const jobId of jobIds) {
-      out[jobId] = (m[jobId] || 0) !== (b[jobId] || 0) ? (m[jobId] || 0) : (f[jobId] || 0);
-    }
+    for (const k of STAGE_KEYS) if (rec && rec[k]) out[k] = rec[k];
     return out;
-  }
-  function mergeArrayLeaf(b, m, f) {
-    return JSON.stringify(m || []) !== JSON.stringify(b || []) ? (m || []) : (f || []);
-  }
-  // offPlan/notes have no delete — they only ever grow (push). For an
-  // append-only list, the safe merge needs no baseline at all: take the
-  // server's current full list (picks up every other device's additions),
-  // plus whatever of ours isn't in it yet (our own not-yet-synced ones).
-  function mergeAppendOnlyList(mine, fresh, keyFn) {
-    const freshKeys = new Set((fresh || []).map(keyFn));
-    const oursNew = (mine || []).filter(item => !freshKeys.has(keyFn(item)));
-    return [...(fresh || []), ...oursNew];
-  }
-  // Same by-id merge as mergeJobs/sameJobs for `jobs` in the App()
-  // component, applied to drawerBatches — addDrawerBatch/setDrawerBatchDone
-  // both reassign the array (new ref for a touched item, same ref for
-  // everything else), so reference equality against the baseline cheaply
-  // identifies what WE changed, same as there.
-  function mergeDrawerBatches(base, mine, theirs) {
-    const baseById = new Map((base || []).map(b => [b.id, b]));
-    const theirsById = new Map((theirs || []).map(b => [b.id, b]));
-    const merged = [];
-    const handled = new Set();
-    for (const m of (mine || [])) {
-      handled.add(m.id);
-      const touchedLocally = baseById.get(m.id) !== m;
-      if (touchedLocally) {
-        merged.push(m);
-      } else {
-        const t = theirsById.get(m.id);
-        if (t !== undefined) merged.push(JSON.stringify(m) === JSON.stringify(t) ? m : t);
+  };
+  const parsePlan = (raw) => (raw && (raw.targets || raw.removed || raw.extra))
+    ? { targets: raw.targets || {}, removed: raw.removed || {}, extra: raw.extra || {} }
+    : { targets: raw || {}, removed: {}, extra: {} };   // old shape: the value WAS the targets map
+
+  // One entry per thing we save. merge() folds the server copy into local
+  // state and returns what to save plus the new baseline for either outcome.
+  const SYNC = {
+    day: {
+      key: () => dayKeyFor(curDate()),
+      setBase: (b) => { dayBaseline = b; },
+      merge(fresh) {
+        const f = fresh || {};
+        const fc = pickStages(f);
+        today = mergeStageCounts(dayBaseline, today, fc, STAGE_KEYS);
+        offPlan = mergeAppendOnlyList(offPlan, f.offPlan, o => o.stage + ":" + o.jobId);
+        notes = mergeAppendOnlyList(notes, f.notes, s => s);
+        return { payload: { ...today, offPlan, notes }, savedBase: cloneJSON(today, {}), serverBase: cloneJSON(fc, {}) };
+      },
+    },
+    wtd: {
+      key: () => weekKeyFor(curDate()),
+      setBase: (b) => { weekToDateBaseline = b; },
+      merge(fresh) {
+        weekToDate = mergeCounts(weekToDateBaseline, weekToDate, fresh || {});
+        return { payload: weekToDate, savedBase: cloneJSON(weekToDate, {}), serverBase: cloneJSON(fresh, {}) };
+      },
+    },
+    plan: {
+      key: () => weekPlanKeyFor(curDate()),
+      setBase: (b) => { weekPlanBaseline = b; },
+      merge(fresh) {
+        const p = parsePlan(fresh);
+        weeklyTargets = mergeByDateStage(weekPlanBaseline.targets, weeklyTargets, p.targets, mergeLWW);
+        weeklyRemoved = mergeByDateStage(weekPlanBaseline.removed, weeklyRemoved, p.removed, (b, m, f) => mergeSet3(b, m, f, x => x));
+        weeklyExtra = mergeByDateStage(weekPlanBaseline.extra, weeklyExtra, p.extra, (b, m, f) => mergeSet3(b, m, f, x => x.jobId));
+        const payload = { targets: weeklyTargets, removed: weeklyRemoved, extra: weeklyExtra };
+        return { payload, savedBase: cloneJSON(payload, {}), serverBase: cloneJSON(p, {}) };
+      },
+    },
+    drawers: {
+      key: () => drawersKey,
+      setBase: (b) => { drawerBaseline = b; },
+      merge(fresh) {
+        drawerBatches = mergeDrawerBatches(drawerBaseline, drawerBatches, fresh || []);
+        return { payload: drawerBatches, savedBase: cloneJSON(drawerBatches, []), serverBase: cloneJSON(fresh, []) };
+      },
+    },
+  };
+  const syncSig = () => JSON.stringify([today, weekToDate, offPlan, notes, weeklyTargets, weeklyRemoved, weeklyExtra, drawerBatches]);
+
+  // Runs inside exclusive(). Returns the names that failed (read or write).
+  async function syncKeys(names, save) {
+    const before = syncSig();
+    const failed = [];
+    for (const name of names) {
+      const h = SYNC[name];
+      const k = h.key();
+      // Saving: read, merge, write-if-unchanged; if another device got in
+      // between, read again and re-merge (bounded) rather than overwrite it.
+      for (let attempt = 0; attempt < 6; attempt++) {
+        let read;
+        try { read = await loadV(k); } catch (e) { failed.push(name); break; }
+        const { payload, savedBase, serverBase } = h.merge(read.value);
+        if (!save) { h.setBase(serverBase); break; }
+        try {
+          if (await saveV(k, payload, read)) { h.setBase(savedBase); break; }
+          h.setBase(serverBase);                    // lost the race — go round again
+          if (attempt === 5) failed.push(name);
+        } catch (e) { h.setBase(serverBase); failed.push(name); break; }
       }
     }
-    for (const t of (theirs || [])) {
-      if (handled.has(t.id) || baseById.has(t.id)) continue;
-      merged.push(t);
-    }
-    return merged;
+    if (syncSig() !== before) renderAll(true);
+    return failed;
   }
 
-  async function flush() {
-    const keys = Object.keys(pending);
-    for (const k of keys) {
-      const v = pending[k];
-      delete pending[k];
-      if (k === dayKeyFor(new Date())) {
-        // Never blindly overwrite the whole day record with our own
-        // possibly-stale snapshot of `today` — a device that missed a
-        // realtime update for some OTHER stage (a dropped connection, a
-        // tab that's been open a while) would otherwise silently erase
-        // that stage's count the next time it saved anything at all.
-        // Fetch the current server copy and merge our own changes into
-        // THAT, rather than saving over it.
-        const fresh = await load(k);
-        today = mergeDayCounts(dayBaseline, today, fresh);
-        dayBaseline = cloneCounts(today);
-        offPlan = mergeAppendOnlyList(offPlan, fresh?.offPlan, o => o.stage + ":" + o.jobId);
-        notes = mergeAppendOnlyList(notes, fresh?.notes, s => s);
-        renderAll();
-        await saveNow(k, { ...today, offPlan, notes });
-      } else if (k === weekPlanKeyFor(new Date())) {
-        // Same problem, same fix, for the weekly plan.
-        const fresh = await load(k);
-        weeklyTargets = mergeByDateStage(weekPlanBaseline.targets, weeklyTargets, fresh?.targets, mergeTargetCounts);
-        weeklyRemoved = mergeByDateStage(weekPlanBaseline.removed, weeklyRemoved, fresh?.removed, mergeArrayLeaf);
-        weeklyExtra = mergeByDateStage(weekPlanBaseline.extra, weeklyExtra, fresh?.extra, mergeArrayLeaf);
-        weekPlanBaseline = { targets: cloneCounts(weeklyTargets), removed: cloneCounts(weeklyRemoved), extra: cloneCounts(weeklyExtra) };
-        renderAll();
-        await saveNow(k, { targets: weeklyTargets, removed: weeklyRemoved, extra: weeklyExtra });
-      } else if (k === weekKeyFor(new Date())) {
-        // Same problem, same fix, for week-to-date — bumped on literally
-        // every tap of every stage, so the highest-frequency save of all
-        // of these, and the most exposed to two devices racing.
-        const fresh = await load(k);
-        weekToDate = mergeTargetCounts(weekToDateBaseline, weekToDate, fresh);
-        weekToDateBaseline = cloneCounts(weekToDate);
-        renderAll();
-        await saveNow(k, weekToDate);
-      } else if (k === drawersKey) {
-        // Same problem, same fix, for drawer batches.
-        const fresh = await load(k);
-        drawerBatches = mergeDrawerBatches(drawerBaseline, drawerBatches, fresh);
-        drawerBaseline = drawerBatches;
-        renderDrawers();
-        await saveNow(k, drawerBatches);
-      } else {
-        await saveNow(k, v);
+  function flushNow() {
+    clearTimeout(flushTimer);
+    return exclusive(async () => {
+      if (!dirty.size) return;
+      const names = [...dirty];
+      dirty.clear();
+      const failed = await syncKeys(names, true);
+      if (failed.length) {
+        failed.forEach(n => dirty.add(n));
+        clearTimeout(retryTimer);
+        retryTimer = setTimeout(flushNow, 3000);
       }
-    }
+    });
+  }
+  // Re-read everything from the server and fold it into local state
+  // (keeping any unsaved local edits on top). Safe to call at any time.
+  function pullNow() {
+    return exclusive(() => syncKeys(["day", "wtd", "plan", "drawers"], false));
+  }
+  function schedulePull(ms) {
+    clearTimeout(pullTimer);
+    pullTimer = setTimeout(pullNow, ms);
   }
 
   const dayKeyFor = (d) => "floor:" + iso(d);
@@ -7847,32 +7852,15 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
 
   let today = {}, yesterday = {}, weekToDate = {}, offPlan = [], notes = [], extraJobs = {}, selected = {};
   let drawerBatches = [], activeTab = "today";
-  // The last copy of `today`'s stage counts we know matched the server —
-  // the merge base for reconciling our own local taps against whatever
-  // another device may have saved since. Updated after every load and
-  // every successful flush of the day record. See mergeDayCounts below for
-  // why this exists — it's the same 3-way-merge idea as mergeJobs/sameJobs
-  // (App() component), applied to floor board tap counts.
-  let dayBaseline = {};
-  const cloneCounts = (obj) => JSON.parse(JSON.stringify(obj || {}));
-  // Same idea, for weekToDate (a flat {stageKey: count} map — merged with
-  // mergeTargetCounts directly below, same shape as a targets leaf) and
-  // drawerBatches (a list of {id,...} objects — merged by id like
-  // mergeJobs/sameJobs merges `jobs` in the App() component). Both were
-  // missed by the day-record and weekly-plan fixes since they're saved
-  // under their own separate keys (floor:wtd:<mondayISO> and
-  // floor:drawers) — audited in full 2026-09-30 after the weekly-plan fix
-  // alone didn't stop reports of things still zeroing.
-  let weekToDateBaseline = {};
-  let drawerBaseline = [];
-  // Same idea again, for the weekly plan (weeklyTargets/weeklyRemoved/
-  // weeklyExtra below) — a device whose local copy of ANY of these was
-  // stale (never loaded, or missed a realtime update for some OTHER day's
-  // edit) would otherwise silently erase that edit the next time it saved
-  // its own, via the identical whole-snapshot-overwrite bug that hit the
-  // day record (see mergeDayCounts's comment) — reported 2026-09-30 as
-  // "targets... reverting back to 0" across several devices.
+  // Baselines: the server's copy of each record as of our last sync — the
+  // "base" side of the 3-way merges in the sync core above.
+  let dayBaseline = {}, weekToDateBaseline = {}, drawerBaseline = [];
   let weekPlanBaseline = { targets: {}, removed: {}, extra: {} };
+  // The day this board's state belongs to. Saves are keyed off THIS, not
+  // the wall clock, so a tap just after midnight (before rollover has run)
+  // can't write the old day's counts into the new day's record.
+  let currentDay = iso(new Date());
+  const curDate = () => { const [y, m, d] = currentDay.split("-").map(Number); return new Date(y, m - 1, d, 12); };
   // Harry/Jon's own weekly plan, all keyed by date then stage:
   //   weeklyTargets: { [dateISO]: { [stageKey]: { [jobId]: count } } } — a saved count override
   //   weeklyRemoved: { [dateISO]: { [stageKey]: [jobId, ...] } } — auto-scheduled jobs they've hidden
@@ -7883,23 +7871,7 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
   // the starting suggestion, never the final word, since it can drift from what's really on the floor.
   let weeklyTargets = {}, weeklyRemoved = {}, weeklyExtra = {};
 
-  async function loadWeeklyPlan() {
-    const raw = await load(weekPlanKeyFor(new Date()));
-    if (raw && (raw.targets || raw.removed || raw.extra)) {
-      weeklyTargets = raw.targets || {};
-      weeklyRemoved = raw.removed || {};
-      weeklyExtra = raw.extra || {};
-    } else {
-      // Old shape (pre-add/remove): the saved value WAS the targets map.
-      weeklyTargets = raw || {};
-      weeklyRemoved = {};
-      weeklyExtra = {};
-    }
-    weekPlanBaseline = { targets: cloneCounts(weeklyTargets), removed: cloneCounts(weeklyRemoved), extra: cloneCounts(weeklyExtra) };
-  }
-  function saveWeeklyPlan() {
-    queueSave(weekPlanKeyFor(new Date()), { targets: weeklyTargets, removed: weeklyRemoved, extra: weeklyExtra });
-  }
+  function saveWeeklyPlan() { markDirty("plan"); }
 
   // The real job list for a given day/stage: the auto suggestion, minus anything
   // Harry/Jon removed, plus anything they added — this is what every render
@@ -7918,8 +7890,17 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
   // yesterday's recap) reads `planned` off whatever this returns, so setting
   // the override here is enough to make it take everywhere at once.
   function jobsAt(stageKey) {
-    const dISO = iso(new Date());
+    const dISO = currentDay;
     const autoJobs = (planRef.current.stages[stageKey] || []).concat(extraJobs[stageKey] || []);
+    // "+ another job" picks live in offPlan (saved, shared); extraJobs is
+    // only this device's session. Rebuild chips from offPlan so a job added
+    // on one device (or before a reload) shows its chip everywhere, not
+    // just a count in the stage total with no chip to explain it.
+    offPlan.filter(o => o.stage === stageKey).forEach(o => {
+      if (autoJobs.some(a => a.jobId === o.jobId)) return;
+      const j = (planRef.current.allJobs || []).find(x => x.jobId === o.jobId);
+      if (j) autoJobs.push(j);
+    });
     const base = stagePlanFor(dISO, stageKey, autoJobs);
     const overrides = (weeklyTargets[dISO] || {})[stageKey] || {};
     return base.map(j => (j.jobId in overrides) ? { ...j, planned: overrides[j.jobId] } : j);
@@ -7975,7 +7956,9 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     const daysSoFar = (dowIdx >= 5 ? 4 + (FRIDAY_DAY_HOURS / FULL_DAY_HOURS) * fractionOfDayElapsed(d)
                                    : (dowIdx - 1) + fractionOfDayElapsed(d));
     const paceNow = Math.round(reasmTarget * daysSoFar);
-    const actual = (weekToDate.reasm || 0) + totalAt("reasm");
+    // weekToDate already includes today's taps (bump() adds every tap to
+    // both), so adding totalAt("reasm") here counted today twice.
+    const actual = weekToDate.reasm || 0;
     const behind = actual < paceNow;
     $("weekstrip").innerHTML = `
       <div class="wk" style="flex:1">
@@ -8001,7 +7984,11 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
       const hit = t > 0 && done >= t;
       const late = !hit && done < due - 1;
       const pct = t > 0 ? Math.min(100, Math.round(done / t * 100)) : 0;
-      if (!selected[s.key] && jobs.length) selected[s.key] = jobs[0].jobId;
+      // Re-pick if the selected job is no longer in this stage's list (plan
+      // changed, or it was removed in the weekly plan) — otherwise taps
+      // went to a job with no chip.
+      if (jobs.length && !jobs.some(j => j.jobId === selected[s.key])) selected[s.key] = jobs[0].jobId;
+      if (!jobs.length) delete selected[s.key];
       const chips = jobs.map(j => {
         const n = countAt(s.key, j.jobId);
         const sel = selected[s.key] === j.jobId;
@@ -8041,9 +8028,10 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
           <div class="bar-fill ${late ? "late" : ""} ${done > t ? "over" : ""}" style="width:${pct}%"></div>
           <div class="pace" style="left:${(f * 100).toFixed(1)}%" title="where you should be by now"></div>
         </div>
+        ${selected[s.key] ? "" : `<div class="behind-pill">Nothing booked here — pick a job with “+ another job” to start counting</div>`}
         <div class="btns">
-          <button class="plus" data-k="${s.key}" data-d="1" aria-label="Add one cabinet at ${s.name}">+1</button>
-          <button class="minus" data-k="${s.key}" data-d="-1" aria-label="Remove one cabinet at ${s.name}">−</button>
+          <button class="plus" data-k="${s.key}" data-d="1" ${selected[s.key] ? "" : "disabled"} aria-label="Add one cabinet at ${s.name}">+1</button>
+          <button class="minus" data-k="${s.key}" data-d="-1" ${selected[s.key] ? "" : "disabled"} aria-label="Remove one cabinet at ${s.name}">−</button>
         </div>
       </div>`;
     }).join("");
@@ -8056,7 +8044,13 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
   // Harry/Jon can remove a job that's wrong (e.g. the schedule still lists it
   // but it's actually already finished) and add any other active job instead,
   // via stagePlanFor(); the number next to each is editable the same as before.
-  function renderWeekPlan() {
+  function renderWeekPlan(fromSync) {
+    // A background sync must not rebuild the grid while someone is typing a
+    // target or has a dropdown open — replacing the element throws away what
+    // they were entering before its change event ever fires. (Their own
+    // edits still re-render immediately; this only skips sync-driven ones.)
+    const ae = document.activeElement;
+    if (fromSync && ae && $("weekplan").contains(ae) && ae.matches("input,select")) return;
     const monday = mondayOf(new Date());
     const days = [0, 1, 2, 3, 4].map(i => addDays(monday, i));
     $("weekplan").innerHTML = days.map(d => {
@@ -8195,7 +8189,7 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     notes = [...notes, text];
     input.value = "";
     renderNotes();
-    queueSave(dayKeyFor(new Date()), { ...today, offPlan, notes });
+    markDirty("day");
   }
 
   function renderDrawers() {
@@ -8224,14 +8218,14 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     labelInput.value = ""; countInput.value = "";
     renderDrawers();
     renderStages();
-    queueSave(drawersKey, drawerBatches);
+    markDirty("drawers");
   }
 
   function setDrawerBatchDone(id, done) {
     drawerBatches = drawerBatches.map(b => (b.id === id ? { ...b, done } : b));
     renderDrawers();
     renderStages();
-    queueSave(drawersKey, drawerBatches);
+    markDirty("drawers");
   }
 
   function setTab(tab) {
@@ -8244,19 +8238,21 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     $("tab-weekplan").setAttribute("aria-selected", tab === "weekplan" ? "true" : "false");
   }
 
-  function renderAll() { renderPipe(); renderWeek(); renderStages(); renderYesterday(); renderNotes(); renderDrawers(); renderWeekPlan(); }
+  function renderAll(fromSync) { renderPipe(); renderWeek(); renderStages(); renderYesterday(); renderNotes(); renderDrawers(); renderWeekPlan(fromSync); }
 
   function bump(stageKey, delta) {
     const jobId = selected[stageKey];
     if (!jobId) return;
     today[stageKey] = today[stageKey] || {};
-    today[stageKey][jobId] = Math.max(0, (today[stageKey][jobId] || 0) + delta);
+    const before = today[stageKey][jobId] || 0;
+    const after = Math.max(0, before + delta);
+    const applied = after - before;       // a minus at 0 changes nothing, here or in the week total
+    if (!applied) return;
+    today[stageKey][jobId] = after;
+    weekToDate = { ...weekToDate, [stageKey]: Math.max(0, (weekToDate[stageKey] || 0) + applied) };
     renderAll();
-    queueSave(dayKeyFor(new Date()), { ...today, offPlan, notes });
-    const wtd = { ...weekToDate };
-    wtd[stageKey] = (wtd[stageKey] || 0) + delta;
-    weekToDate = wtd;
-    queueSave(weekKeyFor(new Date()), wtd);
+    markDirty("day");
+    markDirty("wtd");
   }
 
   function availableJobsForStage(stageKey) {
@@ -8271,7 +8267,7 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     offPlan.push({ stage: stageKey, jobId: job.jobId });
     selected[stageKey] = job.jobId;
     renderAll();
-    queueSave(dayKeyFor(new Date()), { ...today, offPlan, notes });
+    markDirty("day");
   }
 
   const onClick = (e) => {
@@ -8307,9 +8303,9 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
   };
   root.addEventListener("change", onChange);
 
-  let currentDay = iso(new Date());
   let unsubscribe = null;
   let interval = null;
+  let tick = 0;
 
   // This is a wall-mounted, always-on display, so it needs to hold the
   // screen awake itself — a plain webpage doesn't get the "don't sleep,
@@ -8324,20 +8320,21 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     catch (e) { /* not available right now (e.g. backgrounded) — visibilitychange will retry */ }
   }
   const onVisibilityChange = () => {
-    if (document.visibilityState === "visible") requestWakeLock();
+    if (document.visibilityState === "visible") { requestWakeLock(); pullNow(); }
+    else flushNow();                    // don't sit on unsaved taps while hidden/closing
   };
+  const onPageHide = () => { flushNow(); };
   document.addEventListener("visibilitychange", onVisibilityChange);
+  window.addEventListener("pagehide", onPageHide);
 
   // This is a kiosk nobody manually reloads — a wall TV or a tablet left
   // open for days. Every code fix shipped since the page was last opened
   // is invisible to it until something forces a reload; a device that's
-  // been sitting on an old build keeps whatever bugs that build had,
-  // merge fixes and all, no matter how many times the live site gets
-  // fixed. Checked once a minute (piggybacking the existing interval):
-  // fetch the current deployed index.html, compare its script bundle
-  // against the one actually running, and reload if they differ. A brief
-  // visible reload once a minute's worth of staleness beats running
-  // stale code indefinitely.
+  // been sitting on an old build keeps whatever bugs that build had, no
+  // matter how many times the live site gets fixed. Checked every other
+  // tick (once a minute): fetch the deployed index.html, compare its script
+  // bundle against the one actually running, and reload if they differ —
+  // but never on top of unsaved taps.
   const ownScriptSrc = (document.querySelector('script[type="module"]') || {}).src || "";
   async function checkForNewVersion() {
     if (!ownScriptSrc) return;
@@ -8347,70 +8344,62 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
       const match = html.match(/<script[^>]+src="([^"]+)"/);
       if (!match) return;
       const latestSrc = new URL(match[1], window.location.origin).href;
-      if (latestSrc !== ownScriptSrc) window.location.reload();
-    } catch (e) { /* network hiccup — try again next minute */ }
+      if (latestSrc === ownScriptSrc) return;
+      await flushNow();
+      if (!dirty.size) window.location.reload();
+    } catch (e) { /* network hiccup — try again next time */ }
   }
 
   async function rollOverIfNewDay() {
     const nowDay = iso(new Date());
     if (nowDay === currentDay) return;
-    await flush();
-    currentDay = nowDay;
-    const prev = await load(dayKeyFor(prevWorkingDay(new Date())));
-    if (prev) { delete prev.offPlan; delete prev.notes; yesterday = prev; } else { yesterday = {}; }
-    today = {}; offPlan = []; notes = []; extraJobs = {}; selected = {};
-    dayBaseline = {};
-    weekToDate = (await load(weekKeyFor(new Date()))) || {};
-    weekToDateBaseline = cloneCounts(weekToDate);
-    await loadWeeklyPlan();
+    await flushNow();                   // save anything still pending under the OLD day's keys
+    if (dirty.size) return;             // couldn't save yet (offline?) — don't discard it, retry next tick
+    await exclusive(async () => {
+      currentDay = nowDay;
+      today = {}; offPlan = []; notes = []; extraJobs = {}; selected = {};
+      weekToDate = {}; weeklyTargets = {}; weeklyRemoved = {}; weeklyExtra = {};
+      dayBaseline = {}; weekToDateBaseline = {};
+      weekPlanBaseline = { targets: {}, removed: {}, extra: {} };
+      yesterday = {};
+      try {
+        const prev = await load(dayKeyFor(prevWorkingDay(curDate())));
+        if (prev) { delete prev.offPlan; delete prev.notes; yesterday = prev; }
+      } catch (e) { /* recap just stays empty */ }
+    });
+    await pullNow();
     renderDate(); renderAll();
   }
 
   (async function init() {
     requestWakeLock();
     renderDate(); renderNotice();
-    const t = await load(dayKeyFor(new Date()));
-    if (t) { offPlan = t.offPlan || []; notes = t.notes || []; delete t.offPlan; delete t.notes; today = t; }
-    dayBaseline = cloneCounts(today);
-    const y = await load(dayKeyFor(prevWorkingDay(new Date())));
-    if (y) { delete y.offPlan; delete y.notes; yesterday = y; }
-    weekToDate = (await load(weekKeyFor(new Date()))) || {};
-    weekToDateBaseline = cloneCounts(weekToDate);
-    await loadWeeklyPlan();
-    drawerBatches = (await load(drawersKey)) || [];
-    drawerBaseline = drawerBatches;
+    try {
+      const y = await load(dayKeyFor(prevWorkingDay(curDate())));
+      if (y) { delete y.offPlan; delete y.notes; yesterday = y; }
+    } catch (e) { /* recap just stays empty */ }
+    await pullNow();
     renderAll();
 
     if (store && store.subscribe) {
-      unsubscribe = store.subscribe(async () => {
-        // Ignore notifications that arrive shortly after our own tap — see
-        // lastWriteAt above.
-        if (Date.now() - lastWriteAt < 3000) return;
-        const t2 = await load(dayKeyFor(new Date()));
-        if (t2) { offPlan = t2.offPlan || []; notes = t2.notes || []; delete t2.offPlan; delete t2.notes; today = t2; }
-        dayBaseline = cloneCounts(today);
-        // The weekly plan wasn't being re-synced here at all — another
-        // device's target/add/remove edits never showed up on this one
-        // until a full page reload, which is also what let a stale local
-        // copy of it survive long enough to clobber those edits on its
-        // own next save (see mergeByDateStage above).
-        await loadWeeklyPlan();
-        // Same gap for week-to-date — it wasn't being re-synced here
-        // either, so a device's own copy could drift for hours and then
-        // wipe out other stages' progress on its very next tap.
-        weekToDate = (await load(weekKeyFor(new Date()))) || {};
-        weekToDateBaseline = cloneCounts(weekToDate);
-        drawerBatches = (await load(drawersKey)) || [];
-        drawerBaseline = drawerBatches;
-        renderAll();
+      unsubscribe = store.subscribe((payload) => {
+        // Only floor:* writes matter here — jobs/settings saves from the main
+        // scheduler reach the plan through App(), not through this.
+        if (payload && payload.key && !payload.key.startsWith("floor:")) return;
+        schedulePull(300);
       });
     }
 
+    // Safety net: broadcasts are fire-and-forget, so one missed while the
+    // connection dropped (wifi, TV sleeping) would otherwise leave this
+    // device stale until the next write from somewhere. Re-read every 30s.
     interval = setInterval(async () => {
+      tick++;
       await rollOverIfNewDay();
+      if (!document.hidden) pullNow();
       renderDate(); renderWeek(); renderStages();
-      await checkForNewVersion();
-    }, 60000);
+      if (tick % 2 === 0) await checkForNewVersion();
+    }, 30000);
   })();
 
   return {
@@ -8420,10 +8409,12 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
       root.removeEventListener("keydown", onKeydown);
       root.removeEventListener("change", onChange);
       document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("pagehide", onPageHide);
       if (wakeLock) wakeLock.release().catch(() => {});
       if (unsubscribe) unsubscribe();
       if (interval) clearInterval(interval);
-      clearTimeout(flushTimer);
+      clearTimeout(pullTimer);
+      flushNow();                       // don't drop taps made in the last 600ms
     },
   };
 }
