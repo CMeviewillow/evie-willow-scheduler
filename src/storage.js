@@ -43,20 +43,33 @@ let realtimeReady = null; // Promise resolving once the channel is actually subs
 // promise that resolves when it's ready to send on. Safe to call from both
 // subscribe() (to start listening) and set()/delete() (to notify) — whoever
 // calls first creates it, everyone else reuses the same channel/promise.
+function notifySubscribers(payload) {
+  subscribers.forEach(fn => {
+    try { fn(payload); } catch (e) { console.error(e); }
+  });
+}
+
 function ensureRealtime() {
   if (!supabase) return null;
   if (!realtimeChannel) {
     realtimeChannel = supabase.channel("kv_store_changes");
-    realtimeChannel.on("broadcast", { event: "changed" }, () => {
-      // Notify all subscribers that something changed — no payload to read,
-      // callers already re-fetch whatever they need themselves.
-      subscribers.forEach(fn => {
-        try { fn(); } catch (e) { console.error(e); }
-      });
+    realtimeChannel.on("broadcast", { event: "changed" }, (msg) => {
+      // Tell subscribers which key changed (the payload is just { key }, a
+      // few bytes — still never row contents) so they can ignore writes that
+      // aren't theirs; callers re-fetch whatever they need themselves.
+      notifySubscribers(msg && msg.payload);
     });
+    let everSubscribed = false;
     realtimeReady = new Promise((resolve) => {
       realtimeChannel.subscribe((status) => {
-        if (status === "SUBSCRIBED") resolve();
+        if (status === "SUBSCRIBED") {
+          // A re-subscribe after a dropped connection: anything broadcast
+          // while we were away is gone for good, so tell subscribers to
+          // re-read rather than wait for the next write to wake them.
+          if (everSubscribed) notifySubscribers({ reconnected: true });
+          everSubscribed = true;
+          resolve();
+        }
       });
     });
   }
@@ -67,11 +80,11 @@ function ensureRealtime() {
 // fails the write itself if the channel isn't ready yet (e.g. a save that
 // races ahead of the subscription finishing on a fresh page load); other
 // tabs will still pick the change up on their own next load/poll.
-function notifyChanged() {
+function notifyChanged(key) {
   const ready = ensureRealtime();
   if (!ready) return;
   ready.then(() => {
-    realtimeChannel.send({ type: "broadcast", event: "changed", payload: {} });
+    realtimeChannel.send({ type: "broadcast", event: "changed", payload: { key } });
   }).catch(() => {});
 }
 
@@ -97,8 +110,55 @@ export const storage = {
       .from("kv_store")
       .upsert({ key, value: parsed, updated_at: new Date().toISOString() });
     if (error) throw error;
-    notifyChanged();
+    notifyChanged(key);
     return { key, value, shared: true };
+  },
+
+  // Versioned read/write for records several devices edit at once: read the
+  // value together with its updated_at, then write back only if updated_at
+  // is still the same (compare-and-swap). A plain get-then-set lets two
+  // devices read the same state and the second write silently erase the
+  // first — here the second one is refused and must re-read and re-merge.
+  async getVersioned(key) {
+    if (!supabase) throw new Error("Supabase not configured");
+    const { data, error } = await supabase
+      .from("kv_store")
+      .select("value, updated_at")
+      .eq("key", key)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return { value: null, version: null };
+    return {
+      value: typeof data.value === "string" ? data.value : JSON.stringify(data.value),
+      version: data.updated_at,
+    };
+  },
+
+  // Returns true if written, false if someone else wrote first (version
+  // changed, or the row appeared since we saw it missing). Throws on real errors.
+  async setIfVersion(key, value, version) {
+    if (!supabase) throw new Error("Supabase not configured");
+    let parsed = value;
+    try { parsed = JSON.parse(value); } catch (e) { /* keep as string */ }
+    const updated_at = new Date().toISOString();
+    if (version == null) {
+      const { error } = await supabase.from("kv_store").insert({ key, value: parsed, updated_at });
+      if (error) {
+        if (error.code === "23505") return false;
+        throw error;
+      }
+    } else {
+      const { data, error } = await supabase
+        .from("kv_store")
+        .update({ value: parsed, updated_at })
+        .eq("key", key)
+        .eq("updated_at", version)
+        .select("key");
+      if (error) throw error;
+      if (!data || !data.length) return false;
+    }
+    notifyChanged(key);
+    return true;
   },
 
   async delete(key) {
@@ -108,7 +168,7 @@ export const storage = {
       .delete()
       .eq("key", key);
     if (error) throw error;
-    notifyChanged();
+    notifyChanged(key);
     return { key, deleted: true, shared: true };
   },
 
