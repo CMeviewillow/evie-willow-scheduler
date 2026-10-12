@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
-import { Plus, Trash2, AlertTriangle, Calendar, Settings, Download, Upload, X, Truck, Undo2, Redo2, TrendingUp, GripVertical } from "lucide-react";
+import { Plus, Trash2, Calendar, Settings, Download, Upload, X, Truck, Undo2, Redo2, TrendingUp, GripVertical } from "lucide-react";
 import "./storage.js"; // installs window.storage backed by Supabase
 import PersonAliasAdmin from "./timetracker/PersonAliasAdmin.jsx";
 import TimeTrackerPreview from "./timetracker/TimeTrackerPreview.jsx";
@@ -2856,9 +2856,7 @@ function App() {
   const [editingJobId, setEditingJobId] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showWhatIf, setShowWhatIf] = useState(false);
-  const [showWarnings, setShowWarnings] = useState(false);
   const [showRateReview, setShowRateReview] = useState(false);
-  const [dismissedWarnings, setDismissedWarnings] = useState({}); // { fingerprint: true }
   const [showReminders, setShowReminders] = useState(false);
   const [dismissedReminders, setDismissedReminders] = useState({}); // { "jobId:surveyDate": true }
   const [showWeeklyUpdate, setShowWeeklyUpdate] = useState(false);
@@ -2921,14 +2919,12 @@ function App() {
   // by mergeJobs but `settings` was missed.
   const settingsRef = useRef(settings);
   useEffect(() => { settingsRef.current = settings; }, [settings]);
-  // Same guard, same reason, for dismissedReminders/dismissedWarnings — they
-  // had the identical unconditional-setState bug and kept the echo loop
-  // alive live in production even after the settings fix above shipped
-  // (confirmed 2026-09-24: two tabs, zero edits, still climbing post-fix).
+  // Same guard, same reason, for dismissedReminders — it had the identical
+  // unconditional-setState bug and kept the echo loop alive live in
+  // production even after the settings fix above shipped (confirmed
+  // 2026-09-24: two tabs, zero edits, still climbing post-fix).
   const dismissedRemindersRef = useRef(dismissedReminders);
   useEffect(() => { dismissedRemindersRef.current = dismissedReminders; }, [dismissedReminders]);
-  const dismissedWarningsRef = useRef(dismissedWarnings);
-  useEffect(() => { dismissedWarningsRef.current = dismissedWarnings; }, [dismissedWarnings]);
 
   // Load from storage (reusable function for realtime sync)
   const reloadFromStorage = async () => {
@@ -2954,13 +2950,6 @@ function App() {
       if (r?.value) {
         const incoming = JSON.parse(r.value);
         if (JSON.stringify(incoming) !== JSON.stringify(dismissedRemindersRef.current)) setDismissedReminders(incoming);
-      }
-    } catch {}
-    try {
-      const w = await window.storage.get("ew-dismissed-warnings");
-      if (w?.value) {
-        const incoming = JSON.parse(w.value);
-        if (JSON.stringify(incoming) !== JSON.stringify(dismissedWarningsRef.current)) setDismissedWarnings(incoming);
       }
     } catch {}
     if (!IS_BOARD) await loadFloorActuals();   // the board never reads these
@@ -3155,12 +3144,6 @@ function App() {
     return () => clearTimeout(t);
   }, [dismissedReminders, loading]);
 
-  useEffect(() => {
-    if (loading || IS_READONLY || IS_BOARD) return;
-    const t = setTimeout(() => safeSet("ew-dismissed-warnings", JSON.stringify(dismissedWarnings)), 600);
-    return () => clearTimeout(t);
-  }, [dismissedWarnings, loading]);
-
   const holidaySet = useMemo(() => {
     const set = new Set(UK_BANK_HOLIDAYS);
     (settings.holidays || []).forEach(h => set.add(h));
@@ -3181,39 +3164,14 @@ function App() {
   // job, the warning re-fires automatically (different fingerprint).
   const fingerprintFor = (w) => `${w.type}|${w.jobName || ""}|${w.message}`;
 
-  // Active warnings: those not in the dismissed map.
-  const activeWarnings = useMemo(() =>
-    warnings.filter(w => !dismissedWarnings[fingerprintFor(w)]),
-    [warnings, dismissedWarnings]
-  );
-
-  // Nothing auto-pops the warnings modal any more — every warning, including a
-  // genuinely unreachable customer-promised date, just sits quietly in the
-  // bell until you choose to open it. The schedule can move fast when a lot
-  // of jobs are being rearranged at once, and a popup firing mid-edit was
-  // pure interruption; the badge count is enough to know something's there.
-  // Still used to decide what counts as "worth surfacing" in the variance
-  // review's before/after preview.
+  // The schedule notes bell, its pop-out list and the dismissed-notes
+  // storage were removed (they got in the way of dragging bars around).
+  // The scheduler still computes warnings; the only place they surface now
+  // is the weekly check-in preview, which uses this to decide what counts
+  // as "worth surfacing" before you accept a whole-schedule shift.
   const SERIOUS_WARNING_TYPES = new Set([
     "target_unreachable",
   ]);
-
-  // Garbage-collect dismissed warnings whose fingerprint is no longer produced
-  // (e.g. job deleted, or warning resolved). Keeps the storage tidy.
-  useEffect(() => {
-    if (loading) return;
-    const liveFingerprints = new Set(warnings.map(fingerprintFor));
-    const cleaned = {};
-    let changed = false;
-    for (const fp of Object.keys(dismissedWarnings)) {
-      if (liveFingerprints.has(fp)) {
-        cleaned[fp] = true;
-      } else {
-        changed = true;
-      }
-    }
-    if (changed) setDismissedWarnings(cleaned);
-  }, [warnings, loading]);
 
   // Compute active survey reminders: those whose survey date has arrived
   // (today or earlier) AND haven't been dismissed yet AND install hasn't
@@ -3645,8 +3603,6 @@ function App() {
         onExport={exportData}
         onImport={importData}
         jobCount={jobs.length}
-        warningCount={activeWarnings.length}
-        onShowWarnings={() => setShowWarnings(true)}
         onShowRateReview={() => setShowRateReview(true)}
         reminderCount={activeReminders.length}
         onShowReminders={() => setShowReminders(true)}
@@ -3884,23 +3840,6 @@ function App() {
         />
       </div>
 
-      {showWarnings && activeWarnings.length > 0 && (
-        <WarningsModal
-          warnings={activeWarnings}
-          fingerprintFor={fingerprintFor}
-          onApproveOne={(fp) => {
-            setDismissedWarnings({ ...dismissedWarnings, [fp]: true });
-          }}
-          onApproveAll={() => {
-            const all = { ...dismissedWarnings };
-            activeWarnings.forEach(w => { all[fingerprintFor(w)] = true; });
-            setDismissedWarnings(all);
-            setShowWarnings(false);
-          }}
-          onClose={() => setShowWarnings(false)}
-        />
-      )}
-
       {showRateReview && (
         <RateReviewModal
           floorActuals={floorActuals}
@@ -3990,7 +3929,7 @@ function App() {
   );
 }
 
-function Header({ onAddJob, onSettings, onWhatIf, onExport, onImport, jobCount, warningCount, onShowWarnings, onShowRateReview, reminderCount, onShowReminders, onWeeklyUpdate, lastUpdateDate, varianceCount, onShowVarianceReview, canUndo, canRedo, onUndo, onRedo }) {
+function Header({ onAddJob, onSettings, onWhatIf, onExport, onImport, jobCount, onShowRateReview, reminderCount, onShowReminders, onWeeklyUpdate, lastUpdateDate, varianceCount, onShowVarianceReview, canUndo, canRedo, onUndo, onRedo }) {
   const fileRef = useRef(null);
   // Show "needs check-in" hint if the last update was more than 7 days ago, or never
   const needsCheckin = (() => {
@@ -4046,12 +3985,6 @@ function Header({ onAddJob, onSettings, onWhatIf, onExport, onImport, jobCount, 
           <button style={styles.btnReminder} onClick={onShowVarianceReview} title="Weekly floor board review">
             <span style={{ fontSize: 13 }}>📊</span>
             <span style={{ marginLeft: 4 }}>{varianceCount}</span>
-          </button>
-        )}
-        {warningCount > 0 && (
-          <button style={styles.btnWarning} onClick={onShowWarnings} title="Schedule notes">
-            <AlertTriangle size={14} />
-            <span style={{ marginLeft: 4 }}>{warningCount}</span>
           </button>
         )}
         <button style={styles.btnSecondary} onClick={onWhatIf}>
@@ -4495,86 +4428,6 @@ function RemindersModal({ reminders, onDismissOne, onDismissAll, onClose }) {
             </button>
             <button style={{ ...styles.btnGhost, flex: 1, justifyContent: "center", padding: "8px 14px" }} onClick={onClose}>
               Remind me later
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function WarningsModal({ warnings, fingerprintFor, onApproveOne, onApproveAll, onClose }) {
-  // Group warnings by job for clearer presentation
-  const byJob = {};
-  const global = [];
-  warnings.forEach(w => {
-    if (w.jobName) {
-      if (!byJob[w.jobName]) byJob[w.jobName] = [];
-      byJob[w.jobName].push(w);
-    } else {
-      global.push(w);
-    }
-  });
-
-  const renderRow = (w, i) => (
-    <div key={i} style={styles.warningItemRow}>
-      <span style={{
-        ...styles.warningTypeTag,
-        background: warningColorFor(w.type),
-      }}>
-        {warningLabelFor(w.type)}
-      </span>
-      <span style={{ flex: 1, fontSize: 12, color: "#3a342c", lineHeight: 1.5 }}>{w.message}</span>
-      <button
-        style={{
-          ...styles.btnGhostSm,
-          padding: "3px 9px",
-          fontSize: 10,
-          flexShrink: 0,
-        }}
-        onClick={() => onApproveOne(fingerprintFor(w))}
-        title="Approve this note — won't show again unless the situation changes"
-      >
-        ✓ OK
-      </button>
-    </div>
-  );
-
-  return (
-    <div style={styles.modalOverlay} onClick={onClose}>
-      <div style={{ ...styles.modal, width: 580, maxHeight: "80vh" }} onClick={e => e.stopPropagation()}>
-        <div style={styles.modalHeader}>
-          <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <AlertTriangle size={14} style={{ color: "#a07a3a" }} />
-            Schedule notes ({warnings.length})
-          </span>
-          <button style={styles.iconBtn} onClick={onClose}><X size={14} /></button>
-        </div>
-        <div style={{ ...styles.modalBody, paddingTop: 8 }}>
-          <div style={{ fontSize: 11, color: "#7a6a55", marginBottom: 14, lineHeight: 1.5 }}>
-            The scheduler made these decisions. Approve each one to dismiss it, or approve all. Once approved, a note won't reappear unless the underlying situation changes.
-          </div>
-
-          {Object.entries(byJob).map(([jobName, ws]) => (
-            <div key={jobName} style={styles.warningJobGroup}>
-              <div style={styles.warningJobHeader}>{jobName}</div>
-              {ws.map(renderRow)}
-            </div>
-          ))}
-
-          {global.length > 0 && (
-            <div style={styles.warningJobGroup}>
-              <div style={styles.warningJobHeader}>General</div>
-              {global.map(renderRow)}
-            </div>
-          )}
-
-          <div style={{ display: "flex", gap: 8, marginTop: 16, paddingTop: 14, borderTop: "1px solid #d9cfba" }}>
-            <button style={{ ...styles.btnPrimary, flex: 1, justifyContent: "center" }} onClick={onApproveAll}>
-              ✓ Approve all
-            </button>
-            <button style={{ ...styles.btnGhost, flex: 1, justifyContent: "center", padding: "9px 14px" }} onClick={onClose}>
-              Review later
             </button>
           </div>
         </div>
