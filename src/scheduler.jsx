@@ -2008,22 +2008,21 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
 
   let earliestInstallStart;
   if (job.installOverride) {
-    // Drag-overridden install: lands EXACTLY where the user put it, with one
-    // exception — production finishing AFTER install has started isn't a
-    // scheduling choice, it's physically impossible, so a too-tight date gets
-    // nudged forward to the earliest date production can actually hit.
-    // Everything else about the drag (the fitter, skipping auto-move/pairing)
-    // still behaves exactly as dropped.
+    // Drag-overridden install: lands EXACTLY where the user put it, always.
+    // It used to be nudged forward when production finished after it, which
+    // meant an install bar couldn't be dragged earlier than production, and
+    // dragging bench/finishing/re-assembly later silently pushed the install
+    // out with it. A manual placement is the user's call (and the install
+    // date is the customer commitment production answers to, never the
+    // other way round), so it stays put and the clash is flagged instead.
+    earliestInstallStart = pinnedInstallDate;
     if (pinnedInstallDate < earliestFeasible) {
-      earliestInstallStart = earliestFeasible;
       warnings.push({
         jobId: job.id,
         jobName: job.name,
-        type: "install_nudged",
-        message: `Install nudged from ${fmtUK(pinnedInstallDate)} to ${fmtUK(earliestFeasible)} — production doesn't finish until ${fmtUK(effectiveReassemblyEndDate)}`,
+        type: "install_early",
+        message: `Install ${fmtUK(pinnedInstallDate)} is before production finishes (${fmtUK(effectiveReassemblyEndDate)}) — left where you put it`,
       });
-    } else {
-      earliestInstallStart = pinnedInstallDate;
     }
   } else if (pinnedInstallDate) {
     // Form-typed target (softer commitment): honour unless production can't finish in time.
@@ -2204,7 +2203,11 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
         }
       }
       installer = best.fitter;
-      proposedStart = best.date;
+      // A manually placed install date is never pushed later to wait for a
+      // free fitter — that made a dragged install land somewhere other than
+      // where it was dropped whenever both fitters were busy. The overlap
+      // check below just warns about the clash instead.
+      if (!job.installOverride) proposedStart = best.date;
     }
   }
 
@@ -4639,6 +4642,7 @@ function warningColorFor(type) {
     case "target_stagger":     return "#c47a2a"; // orange — date moved
     case "target_unreachable": return "#c44a3a"; // red — hard miss
     case "install_nudged":     return "#c47a2a"; // orange — date auto-corrected
+    case "install_early":      return "#c47a2a"; // orange — manual install sits before production ends
     case "slip":               return "#c44a3a";
     case "buffer_tight":       return "#c47a2a"; // orange — buffer compressed
     case "buffer_too_tight":   return "#8a6b3a"; // amber — overlap allowed, routine notice
@@ -4659,6 +4663,7 @@ function warningLabelFor(type) {
     case "target_stagger":     return "DATE";
     case "target_unreachable": return "TARGET";
     case "install_nudged":     return "NUDGED";
+    case "install_early":      return "EARLY";
     case "slip":               return "SLIP";
     case "buffer_tight":       return "BUFFER";
     case "buffer_too_tight":   return "BUFFER";
