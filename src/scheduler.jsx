@@ -3502,6 +3502,13 @@ function App() {
   // already hold their position regardless).
   const freezeOtherJobs = (exceptJobId) => {
     const freeze = { ...(dragFreeze || {}) };
+    // The job being dragged must not stay frozen from an EARLIER drag. The
+    // freeze accumulates through a session, and an old synthetic bench/
+    // finishing position for this job would silently override the date it
+    // is being dropped on right now (spread over the job's real pins in the
+    // `scheduled` memo), snapping the bar straight back — the "won't stay
+    // where I put it" bug for any job whose bench/finishing wasn't pinned.
+    delete freeze[exceptJobId];
     scheduled.forEach(j => {
       if (j.id === exceptJobId) return;
       const entry = { ...(freeze[j.id] || {}) };
