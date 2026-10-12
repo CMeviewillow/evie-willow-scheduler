@@ -5585,8 +5585,14 @@ const GanttRow = React.memo(function GanttRow({
                 let scrollDir = 0;
                 let scrollTimer = null;
                 let lastClientX = e.clientX;
+                // Edge auto-scroll used to start instantly and run at a flat
+                // 24px per 16ms (~40 days a second), so merely pausing near the
+                // edge while aiming at a date carried the bar way past it. Now
+                // it waits for the cursor to dwell, then eases in: slow at the
+                // edge of the zone, faster only the deeper the cursor goes.
                 const EDGE_ZONE = 60;
-                const SCROLL_STEP = 24;
+                const DWELL_MS = 350;
+                const MIN_STEP = 2, MAX_STEP = 12;
                 const stopAutoScroll = () => {
                   if (scrollTimer !== null) { clearInterval(scrollTimer); scrollTimer = null; }
                   scrollDir = 0;
@@ -5596,12 +5602,32 @@ const GanttRow = React.memo(function GanttRow({
                   stopAutoScroll();
                   scrollDir = dir;
                   if (dir === 0 || !scrollEl) return;
+                  const enteredAt = Date.now();
                   scrollTimer = setInterval(() => {
+                    if (Date.now() - enteredAt < DWELL_MS) return;
+                    const rect = scrollEl.getBoundingClientRect();
+                    const dist = dir < 0 ? lastClientX - rect.left : rect.right - lastClientX;
+                    const depth = Math.max(0, Math.min(1, (EDGE_ZONE - dist) / EDGE_ZONE));
+                    const step = Math.max(MIN_STEP, Math.round(MAX_STEP * depth * depth));
                     const before = scrollEl.scrollLeft;
-                    scrollEl.scrollLeft += dir * SCROLL_STEP;
+                    scrollEl.scrollLeft += dir * step;
                     scrollAdjust += scrollEl.scrollLeft - before;
                     processMove(lastClientX);
                   }, 16);
+                };
+                // Weekends/bank holidays aren't valid start days. Snap to the
+                // NEAREST working day (ties go forward) instead of always
+                // forward — a Saturday drop used to jump two days to Monday
+                // when Friday was one day away.
+                const isOff = (d) => isWeekend(d) || holidays.has(dayKey(d));
+                const nearestWorkingDay = (d) => {
+                  for (let k = 0; k <= 14; k++) {
+                    const fwd = addDays(d, k);
+                    if (!isOff(fwd)) return fwd;
+                    const back = addDays(d, -k);
+                    if (!isOff(back)) return back;
+                  }
+                  return d;
                 };
                 const processMove = (clientX) => {
                   const dx = (clientX - startX) + scrollAdjust;
@@ -5612,12 +5638,14 @@ const GanttRow = React.memo(function GanttRow({
                     if (dayIdx < 0 || dayIdx >= days.length) return;
                     let snappedDate = days[dayIdx];
                     let usedFraction = (snappedHalfIdx - dayIdx * 2) * 0.5;
-                    while (isWeekend(snappedDate) || holidays.has(dayKey(snappedDate))) {
-                      snappedDate = addDays(snappedDate, 1);
+                    if (isOff(snappedDate)) {
+                      snappedDate = nearestWorkingDay(snappedDate);
                       usedFraction = 0;
-                      if (diffDays(snappedDate, ganttStart) >= days.length) break;
                     }
-                    usedFraction = Math.min(usedFraction, dayCapacity(snappedDate));
+                    // A start at or past the end of a short day (Friday's
+                    // afternoon) has no working time left in it and resolved
+                    // to Monday. Keep it on the day the cursor is over.
+                    if (usedFraction >= dayCapacity(snappedDate) - DAY_EPSILON) usedFraction = 0;
                     const snappedLeft = diffDays(snappedDate, ganttStart) * COL_WIDTH + usedFraction * COL_WIDTH;
                     lastDate = dayKey(snappedDate);
                     lastUsed = usedFraction;
@@ -5632,10 +5660,7 @@ const GanttRow = React.memo(function GanttRow({
                     const snappedDayIdx = Math.round(newLeft / COL_WIDTH);
                     if (snappedDayIdx < 0 || snappedDayIdx >= days.length) return;
                     let snappedDate = days[snappedDayIdx];
-                    while (isWeekend(snappedDate) || holidays.has(dayKey(snappedDate))) {
-                      snappedDate = addDays(snappedDate, 1);
-                      if (diffDays(snappedDate, ganttStart) >= days.length) break;
-                    }
+                    if (isOff(snappedDate)) snappedDate = nearestWorkingDay(snappedDate);
                     const snappedLeft = diffDays(snappedDate, ganttStart) * COL_WIDTH;
                     lastDate = dayKey(snappedDate);
                     lastUsed = 0;
