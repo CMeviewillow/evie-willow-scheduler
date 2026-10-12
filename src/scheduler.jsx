@@ -985,7 +985,73 @@ function compareJobPriority(a, b) {
   return aKey - bKey;
 }
 
+// Finished work must not move. The whole schedule hangs off one global
+// settings.startDate, and sliding it (the weekly check-in / variance review,
+// or editing it by hand) used to re-flow every auto-placed job from the very
+// first one — including jobs installed months ago. Measured on the live data:
+// a 3-5 day slide moved nothing among the 24 current/upcoming jobs (they're
+// pinned) and rewrote dates on 31 finished ones.
+//
+// So once the start date has been moved, settings.historyStartDate remembers
+// the one history was laid out with. Pass A schedules with THAT date to find
+// where finished jobs (install already past) really sit; pass B then pins
+// those jobs to exactly those positions and schedules everything with the
+// real start date. Until a slide happens there is no historyStartDate and
+// this is a straight call to the engine, so nothing changes.
 function scheduleJobs(jobs, holidays, settings) {
+  const hist = settings.historyStartDate;
+  if (!hist || hist === settings.startDate) return scheduleJobsCore(jobs, holidays, settings);
+
+  const passA = scheduleJobsCore(jobs, holidays, { ...settings, startDate: hist });
+  const today = dayKey(new Date());
+  const finishedA = new Map();
+  passA.scheduled.forEach(j => {
+    const inst = j.tasks?.find(t => t.stage === "install");
+    if (inst && dayKey(inst.start) < today) finishedA.set(j.id, j);
+  });
+  if (!finishedA.size) return scheduleJobsCore(jobs, holidays, settings);
+
+  const pinsFrom = (a, job) => {
+    const t = (stage) => a.tasks?.find(x => x.stage === stage);
+    const pins = {};
+    const mach = t("machining"), bench = t("bench"), fin = t("finishing"), reas = t("reassembly"), inst = t("install");
+    if (mach) { pins.machiningOverride = dayKey(mach.start); pins.machiningDaysOverride = mach.days; }
+    if (bench) { pins.benchOverride = dayKey(bench.start); pins.benchDaysOverride = bench.days; pins.benchOverrideUsed = bench.startSlot?.used || 0; }
+    if (fin) { pins.finishingOverride = dayKey(fin.start); pins.finishingDaysOverride = fin.days; pins.finishingOverrideUsed = fin.startSlot?.used || 0; }
+    if (reas) { pins.reassemblyOverride = dayKey(reas.start); pins.reassemblyDaysOverride = reas.days; pins.reassemblyOverrideUsed = reas.startSlot?.used || 0; }
+    if (inst) {
+      pins.installOverride = dayKey(inst.start);
+      pins.installDaysOverride = Math.ceil(inst.days);
+      if (inst.installer && inst.installer !== "Team" && !job.teamInstall) pins.installer = inst.installer;
+    }
+    return pins;
+  };
+  const OVERRIDE_FIELDS = ["machiningOverride", "machiningDaysOverride", "benchOverride", "benchDaysOverride", "benchOverrideUsed",
+    "finishingOverride", "finishingDaysOverride", "finishingOverrideUsed", "reassemblyOverride", "reassemblyDaysOverride",
+    "reassemblyOverrideUsed", "installOverride", "installDaysOverride", "installer"];
+  const jobsB = jobs.map(job => finishedA.has(job.id) ? { ...job, ...pinsFrom(finishedA.get(job.id), job) } : job);
+  const passB = scheduleJobsCore(jobsB, holidays, settings);
+
+  // The pins above are scaffolding, not user edits: put the job's real
+  // override fields back on the returned object and keep pass A's "is this
+  // bar overridden" flags, so finished jobs don't suddenly look hand-pinned.
+  const origById = new Map(jobs.map(j => [j.id, j]));
+  passB.scheduled = passB.scheduled.map(j => {
+    if (!finishedA.has(j.id)) return j;
+    const orig = origById.get(j.id);
+    const restored = { ...j };
+    OVERRIDE_FIELDS.forEach(f => { restored[f] = orig[f]; });
+    const a = finishedA.get(j.id);
+    restored.tasks = (j.tasks || []).map(t => {
+      const at = a.tasks?.find(x => x.stage === t.stage);
+      return at ? { ...t, isOverridden: at.isOverridden } : t;
+    });
+    return restored;
+  });
+  return passB;
+}
+
+function scheduleJobsCore(jobs, holidays, settings) {
   const sorted = [...jobs].sort(compareJobPriority);
 
   const state = {
@@ -3262,7 +3328,7 @@ function App() {
     if (!showVarianceReview) return null;
     if (!varianceReview.anchorJobId || varianceReview.offsetDays === 0) return null;
     const newStartDate = fmtISO(addDays(parseISO(settings.startDate), varianceReview.offsetDays));
-    const hypothetical = scheduleJobs(jobs, holidaySet, { ...settings, startDate: newStartDate });
+    const hypothetical = scheduleJobs(jobs, holidaySet, { ...settings, startDate: newStartDate, historyStartDate: settings.historyStartDate || settings.startDate });
 
     const moved = [];
     hypothetical.scheduled.forEach(job => {
@@ -3270,6 +3336,9 @@ function App() {
       const installBefore = before?.tasks?.find(t => t.stage === "install");
       const installAfter = job.tasks?.find(t => t.stage === "install");
       if (!installBefore || !installAfter) return;
+      // An install that's already happened is history — it isn't "moving",
+      // whatever the arithmetic says.
+      if (dayKey(installBefore.start) < dayKey(new Date())) return;
       const days = diffDays(installAfter.start, installBefore.start);
       if (days !== 0) {
         moved.push({ jobId: job.id, jobName: job.name, days, before: installBefore.start, after: installAfter.start });
@@ -3321,6 +3390,7 @@ function App() {
     setSettings({
       ...settings,
       startDate: fmtISO(newStartDate),
+      historyStartDate: settings.historyStartDate || settings.startDate,
       lastUpdateDate: fmtISO(today),
       ...extraSettings,
     });
@@ -3467,6 +3537,7 @@ function App() {
     setSettings({
       ...settings,
       startDate: fmtISO(newStartDate),
+      historyStartDate: settings.historyStartDate || settings.startDate,
       lastUpdateDate: fmtISO(today),
     });
     return { offset, anchor };
@@ -6336,7 +6407,7 @@ function SettingsModal({ settings, setSettings, onClose }) {
               type="date"
               style={styles.input}
               value={settings.startDate}
-              onChange={e => setSettings({ ...settings, startDate: e.target.value })}
+              onChange={e => setSettings({ ...settings, startDate: e.target.value, historyStartDate: settings.historyStartDate || settings.startDate })}
             />
           </div>
           <div style={{ ...styles.field, padding: 8, background: "#0f0f0f", border: "1px solid #2a2a2a", fontSize: 10, color: "#888" }}>
