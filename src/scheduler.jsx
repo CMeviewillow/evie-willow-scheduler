@@ -4715,11 +4715,16 @@ function JobEditor({ job, onUpdate, onDelete }) {
           </div>
           <div style={styles.field}>
             <label style={styles.labelSm}>Install date (exact day)</label>
+            {/* Shows the date the schedule is actually using (a dragged/pinned
+                install wins over the target), and editing it sets BOTH, so a
+                date typed here always lands on the schedule — before, it only
+                changed the soft target, which a pinned install silently
+                overrode, so for most jobs typing a date did nothing. */}
             <input
               type="date"
               style={styles.input}
-              value={job.targetInstallWeek}
-              onChange={e => onUpdate({ targetInstallWeek: e.target.value })}
+              value={job.installOverride || job.targetInstallWeek || ""}
+              onChange={e => onUpdate({ installOverride: e.target.value, targetInstallWeek: e.target.value })}
             />
           </div>
         </div>
@@ -4817,11 +4822,18 @@ function JobEditor({ job, onUpdate, onDelete }) {
           gap: 8,
         }}>
           <span style={{ flex: 1 }}>
-            Install pinned to <strong style={{ color: "#3a342c" }}>{fmtUK(job.installOverride)}</strong> by drag
+            Install fixed to <strong style={{ color: "#3a342c" }}>{fmtUK(job.installOverride)}</strong>
           </span>
           <button
             style={styles.btnGhostSm}
-            onClick={() => onUpdate({ installOverride: "" })}
+            // If a different target date sits underneath, fall back to it;
+            // if the target is just the same date (set from the box above),
+            // clear both so Clear actually hands the install back to auto.
+            onClick={() => onUpdate(
+              job.targetInstallWeek && job.targetInstallWeek !== job.installOverride
+                ? { installOverride: "" }
+                : { installOverride: "", targetInstallWeek: "" }
+            )}
           >
             Clear
           </button>
