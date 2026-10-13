@@ -3029,14 +3029,17 @@ function App() {
   // detection the moment any drawer batch existed.
   const loadFloorActuals = async () => {
     try {
-      const listing = await window.storage.list("floor:");
-      const dayKeyRe = /^floor:\d{4}-\d{2}-\d{2}$/;
+      const [oldListing, newListing] = await Promise.all([window.storage.list("floor:"), window.storage.list("floor2:")]);
+      const listing = { keys: [...(oldListing?.keys || []), ...(newListing?.keys || [])] };
+      const dayKeyRe = /^floor2?:\d{4}-\d{2}-\d{2}$/;
       const dayKeys = (listing?.keys || []).filter(k => dayKeyRe.test(k));
       const entries = {};
       for (const k of dayKeys) {
         try {
           const r = await window.storage.get(k);
-          if (r?.value) entries[k.slice("floor:".length)] = JSON.parse(r.value);
+          // Old-named keys come first in the list and floor2: keys last, so
+          // for any date both exist the newer record wins.
+          if (r?.value) entries[k.replace(/^floor2?:/, "")] = JSON.parse(r.value);
         } catch {}
       }
       setFloorActuals(entries);
@@ -3069,7 +3072,7 @@ function App() {
       // floor board itself ignores it here; the main scheduler just
       // refreshes its floor actuals now and then.
       const key = payload && payload.key;
-      if (key && key.startsWith("floor:")) {
+      if (key && /^floor2?:/.test(key)) {
         if (IS_BOARD) return;
         clearTimeout(floorTimer);
         floorTimer = setTimeout(() => { loadFloorActuals(); }, 10000);
@@ -7650,9 +7653,14 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
   // used to zero the board); a failed save re-queues instead of dropping
   // the tap.
   // ---------------------------------------------------------------------
+  // Until a floor2: record has been written, read the old floor: copy so
+  // nothing is lost in the changeover. Once the new record exists the old
+  // one is never looked at again.
+  const legacyKey = (k) => k.replace(/^floor2:/, "floor:");
   async function load(key) {            // null = no such row; THROWS if the read failed
     if (!store) return memory[key] ?? null;
-    const r = await store.get(key);
+    let r = await store.get(key);
+    if (!r?.value && key.startsWith("floor2:")) r = await store.get(legacyKey(key));
     return r?.value ? JSON.parse(r.value) : null;
   }
   // Read with the row's version so the matching write can be conditional.
@@ -7660,7 +7668,15 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     if (!store) return { value: memory[key] ?? null, version: null, versioned: false };
     if (store.getVersioned) {
       const r = await store.getVersioned(key);
-      return { value: r.value ? JSON.parse(r.value) : null, version: r.version, versioned: true };
+      let value = r.value ? JSON.parse(r.value) : null;
+      // Row missing: seed from the old copy but keep version null, so the save
+      // below is an insert of the NEW record (and loses cleanly if another
+      // device inserts it first).
+      if (!value && r.version == null && key.startsWith("floor2:")) {
+        const old = await store.getVersioned(legacyKey(key));
+        if (old.value) value = JSON.parse(old.value);
+      }
+      return { value, version: r.version, versioned: true };
     }
     return { value: await load(key), version: null, versioned: false };
   }
@@ -7793,14 +7809,22 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     pullTimer = setTimeout(pullNow, ms);
   }
 
-  const dayKeyFor = (d) => "floor:" + iso(d);
-  const weekKeyFor = (d) => "floor:wtd:" + iso(mondayOf(d));
+  // The floor board's records live under "floor2:" now. The old "floor:"
+  // names are left exactly as they were: any screen still running code from
+  // before the sync rebuild keeps overwriting whole records from a stale
+  // snapshot of the board (on 2026-10-13 a stale screen rewrote the day record
+  // and week total with an old copy, wiping the CNC/bench counts and still
+  // offering jobs Harry and Jon had already taken off the plan). Pointing the
+  // new code at new names means a stale screen can only scribble on the
+  // archive; its taps just won't show on the TV, which is how it gets noticed.
+  const dayKeyFor = (d) => "floor2:" + iso(d);
+  const weekKeyFor = (d) => "floor2:wtd:" + iso(mondayOf(d));
   // Harry/Jon's own weekly plan — a target cabinet count per job per stage
   // per day, keyed by the Monday of that week. Read as an override on top
   // of the auto-computed suggestion (see jobsAt below); never required —
   // an un-set job/day just keeps showing the auto number.
-  const weekPlanKeyFor = (d) => "floor:plan:" + iso(mondayOf(d));
-  const drawersKey = "floor:drawers";
+  const weekPlanKeyFor = (d) => "floor2:plan:" + iso(mondayOf(d));
+  const drawersKey = "floor2:drawers";
   function mondayOf(d) {
     const m = new Date(d.getTime());
     const dow = m.getDay();
@@ -7905,7 +7929,11 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
   function renderDate() {
     const d = new Date();
     $("dateline").textContent = d.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" });
-    $("weekline").textContent = "week commencing " + mondayOf(d).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+    // The bundle's own hash: every screen should show the same one, so a
+    // screen showing a different (or no) tag is running old code.
+    const bundle = Array.from(document.scripts).map(sc => sc.src).find(u => /\/assets\/index-/.test(u)) || "";
+    const build = bundle.split("/").pop().replace(/^index-|\.js$/g, "");
+    $("weekline").textContent = "week commencing " + mondayOf(d).toLocaleDateString("en-GB", { day: "numeric", month: "short" }) + (build ? "  ·  build " + build : "");
   }
 
   function renderPipe() {
@@ -8358,7 +8386,7 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
       unsubscribe = store.subscribe((payload) => {
         // Only floor:* writes matter here — jobs/settings saves from the main
         // scheduler reach the plan through App(), not through this.
-        if (payload && payload.key && !payload.key.startsWith("floor:")) return;
+        if (payload && payload.key && !payload.key.startsWith("floor2:")) return;
         schedulePull(300);
       });
     }
