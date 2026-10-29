@@ -101,6 +101,24 @@ const STAGE_CASCADE = {
   install: [],
 };
 
+// The job-field changes for "this stage now starts on isoDate" — shared by a
+// Gantt bar drag and by typing the date into the job editor, so both do exactly
+// the same thing (pin the stage, let the stages that follow it re-chain).
+function stageDatePatch(stage, isoDate, usedFraction) {
+  const cfg = DRAGGABLE_STAGES[stage];
+  const patch = { [cfg.dateField]: isoDate };
+  if (cfg.usedField) patch[cfg.usedField] = usedFraction || 0;
+  (STAGE_CASCADE[stage] || []).forEach(s => {
+    const sCfg = DRAGGABLE_STAGES[s];
+    patch[sCfg.dateField] = "";
+    if (sCfg.usedField) patch[sCfg.usedField] = 0;
+  });
+  // Install has a second field: the date typed in the job editor is both the
+  // pin and the target, so keep the target in step with where the bar went.
+  if (stage === "install") patch.targetInstallWeek = isoDate;
+  return patch;
+}
+
 const FITTERS = ["Steve", "Thompson"];
 const NON_FITTERS = ["Callum"];
 
@@ -425,6 +443,7 @@ function newJob() {
     colour: { name: "", hex: "" }, // paint/finish colour — floor board groups booth runs by this
     boothRunId: "",          // jobs sprayed together to save a colour changeover (see booth-run warnings)
     priorityRank: null,      // manual production-priority order, set by dragging the job's name in the Gantt. null = not yet manually ordered, falls back to deadline-driven order.
+    addedAt: dayKey(new Date()), // ISO day the job was created — its production is never auto-placed before this (see scheduleSingleJob). Jobs created before this field existed have none and are unaffected.
   };
 }
 
@@ -1621,7 +1640,11 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
   // Machining start derives from the bench start (machining runs in parallel,
   // starting 3 working days before bench). Computed AFTER bench is positioned —
   // see the machining block further down. Here we just leave a placeholder.
-  let machiningStart = nextWorkingDay(parseISO(settings.startDate), holidays);
+  // A newly added job is placed from the day it was added, never back in a gap
+  // left in the past (settings.startDate sits months back, and finished jobs
+  // leave free bench days there). Older jobs have no addedAt: unchanged.
+  const jobStartISO = (job.addedAt && job.addedAt > settings.startDate) ? job.addedAt : settings.startDate;
+  let machiningStart = nextWorkingDay(parseISO(jobStartISO), holidays);
   if (job.manualStart) {
     machiningStart = nextWorkingDay(parseISO(job.manualStart), holidays);
   }
@@ -1660,7 +1683,17 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
   const benchActualDays = (job.benchDaysOverride && job.benchDaysOverride > 0)
     ? job.benchDaysOverride
     : benchDays;
-  const earliestBenchSlot = { date: parseISO(settings.startDate), used: 0 };
+  let earliestBenchSlot = { date: parseISO(settings.startDate), used: 0 };
+  if (jobStartISO !== settings.startDate) {
+    // Machining and bench prep run BEFORE bench, so bench can't start until
+    // they have fitted in after the day the job was added.
+    const cabs = totalCabinets(job);
+    const leadDays = job.machiningOverride ? 0
+      : (job.machiningDaysOverride && job.machiningDaysOverride > 0) ? job.machiningDaysOverride
+      : (cabs < 9) ? Math.max(1, Math.ceil(benchDays))
+      : Math.max(Math.ceil(benchDays), job.machiningDays || 0);
+    earliestBenchSlot = { date: workingDaysSeq(nextWorkingDay(parseISO(jobStartISO), holidays), leadDays + 1, holidays)[leadDays], used: 0 };
+  }
   const SLACK_THRESHOLD_WORKING_DAYS = 15; // ~3 working weeks before deferral kicks in
   let benchStartSlot, benchEndSlot;
   if (benchWasPinned) {
@@ -1827,7 +1860,7 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     // cutting actually land if the CNC line were a strict first-come queue?
     // Only feeds the "CNC queue is running behind" warning below.
     if (cncDays > 0) {
-      const earliestMach = nextWorkingDay(parseISO(settings.startDate), holidays);
+      const earliestMach = nextWorkingDay(parseISO(jobStartISO), holidays);
       cncStart = findFreeMachiningSlot(earliestMach, cncDays, state.machiningOccupied, holidays);
       const cncSeq = workingDaysSeq(cncStart, cncDays, holidays);
       cncEnd = addDays(cncSeq[cncSeq.length - 1], 1);
@@ -3838,20 +3871,13 @@ function App() {
             const cfg = DRAGGABLE_STAGES[stage];
             if (!cfg) return;
             freezeOtherJobs(jobId);
-            const patch = { [cfg.dateField]: isoDate };
-            if (cfg.usedField) patch[cfg.usedField] = usedFraction || 0;
             // Dragging one stage is a statement about the whole job's
             // production chain, not just that one bar — clear the OTHER
             // stages' own date pins (duration overrides stay untouched) so
             // they re-chain naturally off this new position. The row's
             // position in the Gantt follows for free: it's sorted by each
             // job's own earliest computed stage date, which just updated.
-            (STAGE_CASCADE[stage] || []).forEach(s => {
-              const sCfg = DRAGGABLE_STAGES[s];
-              patch[sCfg.dateField] = "";
-              if (sCfg.usedField) patch[sCfg.usedField] = 0;
-            });
-            dragUpdateJob(jobId, patch);
+            dragUpdateJob(jobId, stageDatePatch(stage, isoDate, usedFraction));
           }}
           onStageResize={(jobId, stage, days) => {
             const cfg = DRAGGABLE_STAGES[stage];
@@ -4711,7 +4737,32 @@ function OverridePanel({ stageLabel, job, onUpdate, dateField, daysField, usedFi
   );
 }
 
+// A native date input fires onChange per keystroke, so typing a year passes
+// through values like 0002-03-01 — ignore anything that isn't a plausible date.
+const validDateInput = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v || "") && v >= "2000-01-01" && v <= "2100-01-01";
+
+// Shows `value` (the schedule's current date) until the user types; while they
+// type, what they typed stays on screen (a half-typed date reads as "" and must
+// not be overwritten), and only a complete plausible date is committed.
+function DateField({ value, onCommit, onClear, style }) {
+  const [draft, setDraft] = useState(null);
+  return (
+    <input
+      type="date"
+      style={style}
+      value={draft !== null ? draft : value}
+      onChange={e => { setDraft(e.target.value); if (validDateInput(e.target.value)) onCommit(e.target.value); }}
+      onBlur={() => { if (draft === "" && onClear) onClear(); setDraft(null); }}
+    />
+  );
+}
+
 function JobEditor({ job, onUpdate, onDelete }) {
+  // Where the schedule currently has a stage starting ("" if it has none).
+  const stageStartISO = (stage) => {
+    const t = job.tasks?.find(x => x.stage === stage);
+    return t ? dayKey(t.start) : "";
+  };
   return (
     <div style={styles.jobEditor}>
       <div style={styles.field}>
@@ -4801,13 +4852,28 @@ function JobEditor({ job, onUpdate, onDelete }) {
                 date typed here always lands on the schedule — before, it only
                 changed the soft target, which a pinned install silently
                 overrode, so for most jobs typing a date did nothing. */}
-            <input
-              type="date"
+            <DateField
               style={styles.input}
-              value={job.installOverride || job.targetInstallWeek || ""}
-              onChange={e => onUpdate({ installOverride: e.target.value, targetInstallWeek: e.target.value })}
+              value={stageStartISO("install") || job.installOverride || job.targetInstallWeek || ""}
+              onCommit={v => onUpdate(stageDatePatch("install", v))}
+              onClear={() => onUpdate({ installOverride: "", targetInstallWeek: "" })}
             />
           </div>
+        </div>
+        {/* The dates the schedule is using right now, so a bar dragged on the
+            Gantt shows here too; typing one pins that stage the same way a
+            drag does. */}
+        <div style={styles.row2}>
+          {[["machining", "Machining starts"], ["bench", "Bench starts"], ["finishing", "Finishing starts"], ["reassembly", "Re-assembly starts"]].map(([stage, label]) => (
+            <div style={styles.field} key={stage}>
+              <label style={styles.labelSm}>{label}</label>
+              <DateField
+                style={styles.input}
+                value={stageStartISO(stage)}
+                onCommit={v => onUpdate(stageDatePatch(stage, v, 0))}
+              />
+            </div>
+          ))}
         </div>
         <OverridePanel stageLabel="Machining" job={job} onUpdate={onUpdate} dateField="machiningOverride" daysField="machiningDaysOverride" />
         <OverridePanel stageLabel="Bench" job={job} onUpdate={onUpdate} dateField="benchOverride" daysField="benchDaysOverride" usedField="benchOverrideUsed" />
