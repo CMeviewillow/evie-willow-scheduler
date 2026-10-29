@@ -7591,6 +7591,9 @@ const FLOOR_BOARD_CSS = `
   .floor-board-root .batch-toggle button{padding:6px 14px;font-size:12px;border-radius:4px;border:1px solid var(--rule);
     background:#fff;color:var(--ink2);font-family:Inter,sans-serif;cursor:pointer}
   .floor-board-root .batch-toggle button.yes[aria-pressed="true"]{background:var(--sage-bg);color:#5a6e50;border-color:var(--sage);font-weight:600}
+  .floor-board-root .wp-status{font-size:12px;color:var(--ink2);margin:0 0 14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .floor-board-root .wp-status button{border:1px solid var(--rule);background:transparent;border-radius:4px;padding:4px 10px;font-size:12px;color:var(--ink2);cursor:pointer}
+  .floor-board-root .wp-status button:hover{border-color:var(--clay);color:var(--clay)}
   .floor-board-root .wp-notice{font-size:12px;color:var(--ink3);margin:-4px 0 14px;max-width:640px}
   .floor-board-root .wp-grid{display:flex;flex-wrap:wrap;gap:12px}
   .floor-board-root .wp-day{background:var(--panel);border:1px solid var(--rule);border-radius:6px;
@@ -7710,9 +7713,18 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     for (const k of STAGE_KEYS) if (rec && rec[k]) out[k] = rec[k];
     return out;
   };
-  const parsePlan = (raw) => (raw && (raw.targets || raw.removed || raw.extra))
-    ? { targets: raw.targets || {}, removed: raw.removed || {}, extra: raw.extra || {} }
-    : { targets: raw || {}, removed: {}, extra: {} };   // old shape: the value WAS the targets map
+  // A week saved before the `frozen` flag existed counts as Harry's own once
+  // any job was picked for it (extra); the schedule's suggestions are not
+  // re-applied over it.
+  const anyExtra = (extra) => Object.keys(extra || {}).some(d => Object.keys(extra[d] || {}).some(s => (extra[d][s] || []).length));
+  const parsePlan = (raw) => {
+    if (!(raw && (raw.targets || raw.removed || raw.extra))) return { targets: raw || {}, removed: {}, extra: {}, frozen: false };   // old shape: the value WAS the targets map
+    const extra = raw.extra || {};
+    return {
+      targets: raw.targets || {}, removed: raw.removed || {}, extra,
+      frozen: typeof raw.frozen === "boolean" ? raw.frozen : anyExtra(extra),
+    };
+  };
 
   // One entry per thing we save. merge() folds the server copy into local
   // state and returns what to save plus the new baseline for either outcome.
@@ -7745,7 +7757,8 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
         weeklyTargets = mergeByDateStage(weekPlanBaseline.targets, weeklyTargets, p.targets, mergeLWW);
         weeklyRemoved = mergeByDateStage(weekPlanBaseline.removed, weeklyRemoved, p.removed, (b, m, f) => mergeSet3(b, m, f, x => x));
         weeklyExtra = mergeByDateStage(weekPlanBaseline.extra, weeklyExtra, p.extra, (b, m, f) => mergeSet3(b, m, f, x => x.jobId));
-        const payload = { targets: weeklyTargets, removed: weeklyRemoved, extra: weeklyExtra };
+        weeklyFrozen = (weeklyFrozen !== weekPlanBaseline.frozen) ? weeklyFrozen : p.frozen;
+        const payload = { targets: weeklyTargets, removed: weeklyRemoved, extra: weeklyExtra, frozen: weeklyFrozen };
         return { payload, savedBase: cloneJSON(payload, {}), serverBase: cloneJSON(p, {}) };
       },
     },
@@ -7758,7 +7771,7 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
       },
     },
   };
-  const syncSig = () => JSON.stringify([today, weekToDate, offPlan, notes, weeklyTargets, weeklyRemoved, weeklyExtra, drawerBatches]);
+  const syncSig = () => JSON.stringify([today, weekToDate, offPlan, notes, weeklyTargets, weeklyRemoved, weeklyExtra, weeklyFrozen, drawerBatches]);
 
   // Runs inside exclusive(). Returns the names that failed (read or write).
   async function syncKeys(names, save) {
@@ -7852,7 +7865,7 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
   // Baselines: the server's copy of each record as of our last sync — the
   // "base" side of the 3-way merges in the sync core above.
   let dayBaseline = {}, weekToDateBaseline = {}, drawerBaseline = [];
-  let weekPlanBaseline = { targets: {}, removed: {}, extra: {} };
+  let weekPlanBaseline = { targets: {}, removed: {}, extra: {}, frozen: false };
   // The day this board's state belongs to. Saves are keyed off THIS, not
   // the wall clock, so a tap just after midnight (before rollover has run)
   // can't write the old day's counts into the new day's record.
@@ -7866,14 +7879,55 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
   //     that the auto schedule didn't put there that day
   // This is the ONLY way to change which jobs appear — the schedule's own auto placement is just
   // the starting suggestion, never the final word, since it can drift from what's really on the floor.
-  let weeklyTargets = {}, weeklyRemoved = {}, weeklyExtra = {};
+  //   weeklyFrozen: once Harry/Jon touch the plan, the week is THEIRS: weeklyExtra holds every job
+  //     on every day and the main schedule's suggestions are never mixed back in (they drift whenever
+  //     the schedule is rearranged). Only the job NAMES (and colours) keep following the main schedule.
+  let weeklyTargets = {}, weeklyRemoved = {}, weeklyExtra = {}, weeklyFrozen = false;
 
   function saveWeeklyPlan() { markDirty("plan"); }
+
+  // Current name/colour of a job from the main schedule, so a renamed job
+  // updates on the board; the saved copy is only the fallback (job deleted).
+  function liveJob(ej) {
+    const pools = [planRef.current.allJobs || []].concat(Object.keys(weekPlanRef.current).map(d => weekPlanRef.current[d].allJobs || []));
+    for (const pool of pools) {
+      const j = pool.find(x => x.jobId === ej.jobId);
+      if (j) return { ...ej, jobName: j.jobName, colour: j.colour };   // mix stays: it's this day's batch, not the whole job
+    }
+    return ej;
+  }
+
+  // First edit to a week: copy what the board is showing for each remaining
+  // day into the plan itself, so from here on it stands on its own. Past days
+  // are left as recorded — today's schedule says nothing about what happened then.
+  function freezeWeek() {
+    if (weeklyFrozen) return;
+    const monday = mondayOf(curDate());
+    weeklyExtra = { ...weeklyExtra };
+    for (let i = 0; i < 5; i++) {
+      const dISO = iso(addDays(monday, i));
+      if (dISO < currentDay) continue;
+      const dayBrief = weekPlanRef.current[dISO] || { stages: {} };
+      const day = { ...(weeklyExtra[dISO] || {}) };
+      for (const s of FLOOR_STAGES) day[s.key] = stagePlanFor(dISO, s.key, dayBrief.stages[s.key] || []);
+      weeklyExtra[dISO] = day;
+    }
+    weeklyFrozen = true;
+  }
+
+  function resetWeekPlan() {
+    if (!window.confirm("Throw away this week's plan and go back to the main schedule's suggestions?")) return;
+    weeklyTargets = {}; weeklyRemoved = {}; weeklyExtra = {}; weeklyFrozen = false;
+    saveWeeklyPlan();
+    renderAll();
+  }
 
   // The real job list for a given day/stage: the auto suggestion, minus anything
   // Harry/Jon removed, plus anything they added — this is what every render
   // function should treat as "the plan," not the raw auto-scheduled list.
+  // Once the week is frozen it is just their list, with live names.
   function stagePlanFor(dateISO, stageKey, autoJobs) {
+    if (weeklyFrozen) return (((weeklyExtra[dateISO] || {})[stageKey]) || []).map(liveJob);
     const removed = ((weeklyRemoved[dateISO] || {})[stageKey]) || [];
     const extra = ((weeklyExtra[dateISO] || {})[stageKey]) || [];
     const kept = (autoJobs || []).filter(j => removed.indexOf(j.jobId) === -1);
@@ -7888,7 +7942,9 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
   // the override here is enough to make it take everywhere at once.
   function jobsAt(stageKey) {
     const dISO = currentDay;
-    const autoJobs = (planRef.current.stages[stageKey] || []).concat(extraJobs[stageKey] || []);
+    // A frozen week is Harry's list alone; the schedule's own suggestion for
+    // today is not consulted at all.
+    const autoJobs = (weeklyFrozen ? [] : (planRef.current.stages[stageKey] || [])).concat(extraJobs[stageKey] || []);
     // "+ another job" picks live in offPlan (saved, shared); extraJobs is
     // only this device's session. Rebuild chips from offPlan so a job added
     // on one device (or before a reload) shows its chip everywhere, not
@@ -7898,7 +7954,10 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
       const j = (planRef.current.allJobs || []).find(x => x.jobId === o.jobId);
       if (j) autoJobs.push(j);
     });
-    const base = stagePlanFor(dISO, stageKey, autoJobs);
+    let base = stagePlanFor(dISO, stageKey, autoJobs);
+    // Frozen weeks ignore autoJobs above, so add the floor's own
+    // "+ another job" picks back on top of Harry's list.
+    if (weeklyFrozen) base = base.concat(autoJobs.filter(a => base.every(b => b.jobId !== a.jobId)));
     const overrides = (weeklyTargets[dISO] || {})[stageKey] || {};
     return base.map(j => (j.jobId in overrides) ? { ...j, planned: overrides[j.jobId] } : j);
   }
@@ -8054,6 +8113,9 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     if (fromSync && ae && $("weekplan").contains(ae) && ae.matches("input,select")) return;
     const monday = mondayOf(new Date());
     const days = [0, 1, 2, 3, 4].map(i => addDays(monday, i));
+    $("wp-status").innerHTML = weeklyFrozen
+      ? `<span>Locked: this is Harry &amp; Jon's plan — the main schedule can't change it. Names still follow the main schedule.</span> <button data-wp-reset="1">Reset to schedule</button>`
+      : `<span>Not set yet: showing the main schedule's suggestion, which can change. Edit anything below to lock the week in.</span>`;
     $("weekplan").innerHTML = days.map(d => {
       const dISO = iso(d);
       const dayBrief = weekPlanRef.current[dISO] || { stages: {}, allJobs: [] };
@@ -8105,6 +8167,7 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
   function addJobToWeekPlan(dateISO, stageKey, jobId) {
     const job = availableJobsForWeekPlan(dateISO, stageKey).find(j => j.jobId === jobId);
     if (!job) return;
+    freezeWeek();
     weeklyExtra = { ...weeklyExtra };
     weeklyExtra[dateISO] = { ...(weeklyExtra[dateISO] || {}) };
     weeklyExtra[dateISO][stageKey] = (weeklyExtra[dateISO][stageKey] || []).concat(job);
@@ -8113,6 +8176,7 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
   }
 
   function removeJobFromWeekPlan(dateISO, stageKey, jobId) {
+    freezeWeek();
     const isExtra = ((weeklyExtra[dateISO] || {})[stageKey] || []).some(j => j.jobId === jobId);
     if (isExtra) {
       weeklyExtra = { ...weeklyExtra };
@@ -8138,6 +8202,7 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
   function setWeeklyTarget(dateISO, stageKey, jobId, rawValue) {
     const n = parseInt(rawValue, 10);
     const clamped = isNaN(n) || n < 0 ? 0 : n;
+    freezeWeek();
     weeklyTargets = { ...weeklyTargets };
     weeklyTargets[dateISO] = { ...(weeklyTargets[dateISO] || {}) };
     weeklyTargets[dateISO][stageKey] = { ...(weeklyTargets[dateISO][stageKey] || {}), [jobId]: clamped };
@@ -8277,6 +8342,7 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     if (b.dataset.tab) { setTab(b.dataset.tab); return; }
     if (b.dataset.job) { selected[b.dataset.stage] = b.dataset.job; renderAll(); return; }
     if (b.dataset.wpRemoveDate) { removeJobFromWeekPlan(b.dataset.wpRemoveDate, b.dataset.wpRemoveStage, b.dataset.wpRemoveJob); return; }
+    if (b.dataset.wpReset) { resetWeekPlan(); return; }
     if (b.dataset.addnote) { addNote(); return; }
     if (b.dataset.addbatch) { addDrawerBatch(); return; }
     if (b.dataset.batch) { setDrawerBatchDone(b.dataset.batch, b.dataset.done === "1"); return; }
@@ -8359,9 +8425,9 @@ function mountFloorBoard(root, planRef, weekPlanRef, holidaysSet) {
     await exclusive(async () => {
       currentDay = nowDay;
       today = {}; offPlan = []; notes = []; extraJobs = {}; selected = {};
-      weekToDate = {}; weeklyTargets = {}; weeklyRemoved = {}; weeklyExtra = {};
+      weekToDate = {}; weeklyTargets = {}; weeklyRemoved = {}; weeklyExtra = {}; weeklyFrozen = false;
       dayBaseline = {}; weekToDateBaseline = {};
-      weekPlanBaseline = { targets: {}, removed: {}, extra: {} };
+      weekPlanBaseline = { targets: {}, removed: {}, extra: {}, frozen: false };
       yesterday = {};
       try {
         const prev = await load(dayKeyFor(prevWorkingDay(curDate())));
@@ -8505,7 +8571,8 @@ function FloorBoard({ scheduled, dayLayout }) {
         </div>
         <div id="panel-weekplan" style={{ display: "none" }}>
           <h2 className="sec">This week's plan · Harry &amp; Jon set each day's real target</h2>
-          <div className="wp-notice">Job names and the suggested number come straight from the main schedule — but that's only a starting point. Type over a number to set your own target, tap × to remove a job that shouldn't be there (already finished, wrong day, etc.), or "+ add job" to bring in a different one.</div>
+          <div className="wp-notice">Job names come from the main schedule. The jobs and numbers are yours: the first time you change anything, this whole week is locked to what's shown, so later changes to the main schedule can't bring in other jobs. Type over a number, tap × to remove a job, or "+ add job" to bring one in.</div>
+          <div className="wp-status" id="wp-status" />
           <div className="wp-grid" id="weekplan" />
         </div>
         <div id="panel-drawers" style={{ display: "none" }}>
