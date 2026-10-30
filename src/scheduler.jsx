@@ -175,7 +175,7 @@ const UK_BANK_HOLIDAYS = [
 const FITTER_CONFIG = {
   Steve:    { color: "#c97540", role: "lead",    canSolo: true,  order: 1 }, // warm orange
   Thompson: { color: "#c73838", role: "second",  canSolo: true,  order: 2 }, // proper red
-  Chris:    { color: "#7a9eaa", role: "support", canSolo: false, order: 3 }, // soft slate-blue (left — historical only)
+  Chris:    { color: "#7a9eaa", role: "support", canSolo: false, order: 3 }, // soft slate-blue (left — NOT offered anywhere; kept only so installs he already did keep their colour/name)
   Luke:     { color: "#4f9a86", role: "fitter",  canSolo: true,  order: 4 }, // teal
 };
 
@@ -4919,6 +4919,8 @@ function JobEditor({ job, onUpdate, onDelete }) {
                 </option>
               ))}
               {NON_FITTERS.map(f => <option key={f} value={f}>{f} (not a fitter)</option>)}
+              {/* Chris has left: only shown on jobs he already did, so the record still reads correctly */}
+              {job.installer === "Chris" && <option value="Chris" disabled>Chris (has left)</option>}
             </select>
           </div>
           <div style={styles.field}>
@@ -4933,6 +4935,7 @@ function JobEditor({ job, onUpdate, onDelete }) {
               {FITTERS.filter(f => f !== job.installer).map(f => (
                 <option key={f} value={f}>+ {f}</option>
               ))}
+              {job.secondaryInstaller === "Chris" && <option value="Chris" disabled>+ Chris (has left)</option>}
             </select>
           </div>
         </div>
@@ -5523,10 +5526,6 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
         <div style={styles.legendItem}>
           <span style={{ ...styles.legendSwatch, background: FITTER_CONFIG.Luke.color }} />
           <span>Luke (install)</span>
-        </div>
-        <div style={styles.legendItem}>
-          <span style={{ ...styles.legendSwatch, background: FITTER_CONFIG.Chris.color }} />
-          <span>Chris (historical installs only)</span>
         </div>
       </div>
     </div>
@@ -6661,7 +6660,7 @@ function FitterHolidaySettings({ settings, setSettings }) {
   };
 
   // Group by fitter for display
-  const byFitter = { Steve: [], Thompson: [], Luke: [], Chris: [] };
+  const byFitter = { Steve: [], Thompson: [], Luke: [] };
   (settings.fitterHolidays || []).forEach(h => {
     if (byFitter[h.fitter]) byFitter[h.fitter].push(h);
   });
