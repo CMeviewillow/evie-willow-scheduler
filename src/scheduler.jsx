@@ -110,8 +110,25 @@ function stageDatePatch(stage, isoDate, usedFraction) {
   return patch;
 }
 
-const FITTERS = ["Steve", "Thompson"];
+// Steve and Thompson first (their order is the auto-assign preference), Luke
+// joined to replace Chris. Chris stays in FITTER_CONFIG for historical installs only.
+const FITTERS = ["Steve", "Thompson", "Luke"];
 const NON_FITTERS = ["Callum"];
+
+// First day a fitter is available. Before it they are treated as unavailable (the
+// same way as a holiday), so a new starter can never be put on an install that
+// already happened or falls before they join. Add new fitters here as they start.
+const FITTER_START_DATES = { Luke: "2026-11-02" };
+
+// settings.fitterHolidays plus a synthetic "not started yet" block per fitter in
+// FITTER_START_DATES. Only ever used inside the scheduler — never saved, never
+// shown in Settings. Ids start with "start_" so warnings can tell them apart.
+function withFitterStarts(fitterHolidays) {
+  const blocks = Object.entries(FITTER_START_DATES).map(([fitter, start]) => ({
+    id: "start_" + fitter, fitter, start: "2000-01-01", end: fmtISO(addDays(parseISO(start), -1)), note: "not started yet",
+  }));
+  return [...(fitterHolidays || []), ...blocks];
+}
 
 // UK bank holidays for 2025-2027 (England & Wales). These are always respected
 // by the scheduler. Users can add additional closures via Settings.
@@ -149,7 +166,8 @@ const UK_BANK_HOLIDAYS = [
 const FITTER_CONFIG = {
   Steve:    { color: "#c97540", role: "lead",    canSolo: true,  order: 1 }, // warm orange
   Thompson: { color: "#c73838", role: "second",  canSolo: true,  order: 2 }, // proper red
-  Chris:    { color: "#7a9eaa", role: "support", canSolo: false, order: 3 }, // soft slate-blue
+  Chris:    { color: "#7a9eaa", role: "support", canSolo: false, order: 3 }, // soft slate-blue (left — historical only)
+  Luke:     { color: "#4f9a86", role: "fitter",  canSolo: true,  order: 4 }, // teal
 };
 
 // --- Date helpers ---
@@ -1071,6 +1089,7 @@ function scheduleJobs(jobs, holidays, settings) {
 }
 
 function scheduleJobsCore(jobs, holidays, settings) {
+  settings = { ...settings, fitterHolidays: withFitterStarts(settings.fitterHolidays) };
   const sorted = [...jobs].sort(compareJobPriority);
 
   const state = {
@@ -1369,13 +1388,13 @@ function findInstallDayInTargetWeek(targetISO, cabCount, state, holidays, prefer
   // If the user explicitly picked a fitter, ONLY search for that fitter (don't
   // silently fall back to a different one). The scheduler will stagger the date
   // forward to find a slot where their picked fitter is free.
-  // If auto / no preference, try Steve first, then Thompson.
+  // If auto / no preference, try the fitters in FITTERS order.
   const fitterOrder = [];
   if (isUserPick && preferredFitter && FITTERS.includes(preferredFitter)) {
     fitterOrder.push(preferredFitter);
   } else {
     if (preferredFitter && FITTERS.includes(preferredFitter)) fitterOrder.push(preferredFitter);
-    for (const f of ["Steve", "Thompson"]) {
+    for (const f of FITTERS) {
       if (!fitterOrder.includes(f)) fitterOrder.push(f);
     }
   }
@@ -2207,18 +2226,18 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     installer = "Team";
   } else if (userPick === "Chris" && dayKey(earliestInstallStart) >= dayKey(new Date())) {
     // Chris no longer installs. Job data may still have him from before —
-    // for anything not yet installed, reassign to Steve (same pattern as a
-    // retired non-fitter) rather than crash or silently drop the job's
+    // for anything not yet installed, reassign to Luke (his replacement)
+    // rather than crash or silently drop the job's
     // fitter, and flag it loudly so it gets a deliberate human review rather
     // than staying on Steve by accident. A job that's ALREADY been installed
     // by him is real history, not something to rewrite — see the
     // `userPick === "Chris"` pass-through below, which leaves it alone.
-    installer = "Steve";
+    installer = "Luke";
     warnings.push({
       jobId: job.id,
       jobName: job.name,
       type: "installer",
-      message: `Chris no longer installs — reassigned to Steve, please review`,
+      message: `Chris no longer installs — reassigned to Luke, please review`,
     });
   } else if (userPick === "Chris") {
     // Already installed historically — leave the record as Chris, it's fact.
@@ -2259,8 +2278,11 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     // it conflicts with the sibling.
     if (isAuto) {
       // No user pick: auto-assign whichever fitter ISN'T the sibling's.
-      const preferredOrder = ["Thompson", "Steve"].filter(f => f !== sibling.installer);
-      installer = preferredOrder[0];
+      // Prefer Thompson, then Steve, then Luke — skipping the sibling's fitter
+      // and anyone away on holiday while the pair of installs runs.
+      const preferredOrder = ["Thompson", "Steve", "Luke"].filter(f => f !== sibling.installer);
+      const sibEnd = addDays(sibling.start, Math.max(1, Math.ceil(installDays)));
+      installer = preferredOrder.find(f => !fitterOnHolidayDuring(f, sibling.start, sibEnd, settings.fitterHolidays)) || preferredOrder[0];
       warnings.push({
         jobId: job.id,
         jobName: job.name,
@@ -2288,8 +2310,8 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
     // No sibling: need to pick a primary fitter
     if (isAuto) {
       // Find the fitter who's free earliest from earliestInstallStart,
-      // preferring Steve, then Thompson.
-      const candidates = ["Steve", "Thompson"];
+      // preferring Steve, then Thompson, then Luke.
+      const candidates = FITTERS;
       let best = null;
       for (const f of candidates) {
         const earliestForThis = findEarliestInstallSlot(
@@ -2336,7 +2358,7 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
       }
       // Holiday clash?
       const onHol = fitterOnHolidayDuring(f, proposedSeq[0], propEnd, settings.fitterHolidays);
-      if (onHol) {
+      if (onHol && !String(onHol.id).startsWith("start_")) {
         warnings.push({
           jobId: job.id,
           jobName: job.name,
@@ -2393,7 +2415,7 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
         });
       } else {
         // Auto-assigned: try to find an alternative quietly
-        const alternatives = ["Steve", "Thompson"].filter(f => f !== oldInstaller);
+        const alternatives = FITTERS.filter(f => f !== oldInstaller);
         let reassigned = null;
         for (const altF of alternatives) {
           const altSlot = findEarliestInstallSlot(
@@ -2676,6 +2698,7 @@ function scheduleSingleJob(job, state, holidays, settings, impact, opts = {}) {
 // ============================================================
 
 function findBestSlot(hypoJob, existingJobs, holidays, settings, options = {}) {
+  settings = { ...settings, fitterHolidays: withFitterStarts(settings.fitterHolidays) };
   // First, build the current state by scheduling all existing jobs
   const { scheduled } = scheduleJobs(existingJobs, holidays, settings);
 
@@ -4926,12 +4949,12 @@ function JobEditor({ job, onUpdate, onDelete }) {
               style={{ cursor: "pointer" }}
             />
             <span style={{ flex: 1 }}>
-              <strong>Team install</strong> — both fitters on site (for distant jobs)
+              <strong>Team install</strong> — all fitters on site (for distant jobs)
             </span>
           </label>
           {job.teamInstall && (
             <div style={{ marginTop: 6, marginLeft: 24, fontSize: 10, color: "#7a6a55", lineHeight: 1.5 }}>
-              Steve and Thompson both blocked out for this install.
+              All fitters ({FITTERS.join(", ")}) blocked out for this install.
               Set the install length manually using the drag handle on the bar.
             </div>
           )}
@@ -5481,6 +5504,10 @@ function GanttView({ jobs, startDate, holidays, fitterHolidays, onStageDrag, onS
           <span>Thompson (install)</span>
         </div>
         <div style={styles.legendItem}>
+          <span style={{ ...styles.legendSwatch, background: FITTER_CONFIG.Luke.color }} />
+          <span>Luke (install)</span>
+        </div>
+        <div style={styles.legendItem}>
           <span style={{ ...styles.legendSwatch, background: FITTER_CONFIG.Chris.color }} />
           <span>Chris (historical installs only)</span>
         </div>
@@ -5559,7 +5586,7 @@ const GanttRow = React.memo(function GanttRow({
         const hasSecondary = isInstall && !isTeamInstall && t.secondaryInstaller && FITTER_CONFIG[t.secondaryInstaller];
         const isDraggingThis = dragState && dragState.jobId === job.id && dragState.stage === t.stage;
         const isResizingThis = resizeState && resizeState.jobId === job.id && resizeState.stage === t.stage;
-        const tooltip = `${STAGE_LABELS[t.stage]}: ${dayKey(t.start)}${t.days ? ` · ${t.days}d` : ""}${t.installer ? ` · ${t.installer === "Team" ? "Steve + Thompson" : t.installer}${hasSecondary ? " + " + t.secondaryInstaller : ""}` : ""}${t.siblingOf ? ` · parallel w/ ${t.siblingOf}` : ""}${isInstall ? " · drag to move, drag right edge to resize" : ""}`;
+        const tooltip = `${STAGE_LABELS[t.stage]}: ${dayKey(t.start)}${t.days ? ` · ${t.days}d` : ""}${t.installer ? ` · ${t.installer === "Team" ? FITTERS.join(" + ") : t.installer}${hasSecondary ? " + " + t.secondaryInstaller : ""}` : ""}${t.siblingOf ? ` · parallel w/ ${t.siblingOf}` : ""}${isInstall ? " · drag to move, drag right edge to resize" : ""}`;
         // Install bars coloured by fitter
         let barColor;
         let barBackground;
@@ -6617,7 +6644,7 @@ function FitterHolidaySettings({ settings, setSettings }) {
   };
 
   // Group by fitter for display
-  const byFitter = { Steve: [], Thompson: [], Chris: [] };
+  const byFitter = { Steve: [], Thompson: [], Luke: [], Chris: [] };
   (settings.fitterHolidays || []).forEach(h => {
     if (byFitter[h.fitter]) byFitter[h.fitter].push(h);
   });
@@ -6631,8 +6658,7 @@ function FitterHolidaySettings({ settings, setSettings }) {
           value={editFitter}
           onChange={e => setEditFitter(e.target.value)}
         >
-          <option value="Steve">Steve</option>
-          <option value="Thompson">Thompson</option>
+          {FITTERS.map(f => <option key={f} value={f}>{f}</option>)}
         </select>
         <input
           type="date"
